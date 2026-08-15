@@ -293,6 +293,184 @@ func TestIsTerminalHookEvent(t *testing.T) {
 	}
 }
 
+// isolateTestHome points HOME and the XDG base dirs at a fresh tempdir so
+// agent-deck runtime paths (hooks/) resolve off the developer's real home
+// (2026-06-04 data-loss incident). Mirrors the HOME+XDG pattern used by the
+// other cmd/agent-deck tests.
+func isolateTestHome(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+}
+
+// runHookHandlerWithPayload drives handleHookHandler end to end for a single
+// payload: it points HOME at an isolated tempdir, sets AGENTDECK_INSTANCE_ID,
+// feeds payloadJSON on stdin, and returns the decoded status file plus whether
+// one was written. It restores os.Stdin before returning.
+func runHookHandlerWithPayload(t *testing.T, instanceID, payloadJSON string) (hookStatusFile, bool) {
+	t.Helper()
+	isolateTestHome(t)
+	t.Setenv("AGENTDECK_INSTANCE_ID", instanceID)
+	// Keep the generation-locked and DSP paths out of the way: an unset
+	// generation writes plainly; unset DSP mode keeps PermissionRequest from
+	// emitting an allow decision (which is irrelevant to status retention).
+	t.Setenv("AGENTDECK_HOOK_GENERATION", "")
+	t.Setenv("AGENTDECK_DSP_MODE", "")
+
+	f, err := os.CreateTemp(t.TempDir(), "hook-stdin-*")
+	if err != nil {
+		t.Fatalf("create stdin temp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(payloadJSON); err != nil {
+		t.Fatalf("write stdin temp: %v", err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatalf("seek stdin temp: %v", err)
+	}
+	orig := os.Stdin
+	os.Stdin = f
+	defer func() { os.Stdin = orig }()
+
+	handleHookHandler()
+	_ = f.Close()
+
+	data, err := os.ReadFile(filepath.Join(getHooksDir(), instanceID+".json"))
+	if os.IsNotExist(err) {
+		return hookStatusFile{}, false
+	}
+	if err != nil {
+		t.Fatalf("read hook status file: %v", err)
+	}
+	var sf hookStatusFile
+	if err := json.Unmarshal(data, &sf); err != nil {
+		t.Fatalf("unmarshal hook status file: %v", err)
+	}
+	return sf, true
+}
+
+// TestHookHandler_RetainsMatcherAndMessage covers the human-ask-queue content
+// retention: the decoded Notification matcher and Claude's human-readable
+// message are persisted into the status file alongside status=="waiting", for
+// both the permission-prompt and elicitation-dialog matchers, and a
+// PermissionRequest (which carries a message but no matcher) retains its
+// message. A plain informational notification and an ordinary Stop are asserted
+// unchanged.
+func TestHookHandler_RetainsMatcherAndMessage(t *testing.T) {
+	tests := []struct {
+		name        string
+		payload     string
+		wantWritten bool
+		wantStatus  string
+		wantMatcher string
+		wantMessage string
+	}{
+		{
+			name:        "notification permission_prompt",
+			payload:     `{"hook_event_name":"Notification","matcher":"permission_prompt","message":"Claude wants to run: rm -rf build","session_id":"s1"}`,
+			wantWritten: true,
+			wantStatus:  "waiting",
+			wantMatcher: "permission_prompt",
+			wantMessage: "Claude wants to run: rm -rf build",
+		},
+		{
+			name:        "notification elicitation_dialog",
+			payload:     `{"hook_event_name":"Notification","matcher":"elicitation_dialog","message":"Which migration should I apply?","session_id":"s1"}`,
+			wantWritten: true,
+			wantStatus:  "waiting",
+			wantMatcher: "elicitation_dialog",
+			wantMessage: "Which migration should I apply?",
+		},
+		{
+			name:        "permissionrequest carries message but no matcher",
+			payload:     `{"hook_event_name":"PermissionRequest","message":"Approve tool use?","session_id":"s1"}`,
+			wantWritten: true,
+			wantStatus:  "waiting",
+			wantMatcher: "",
+			wantMessage: "Approve tool use?",
+		},
+		{
+			name:        "plain informational notification writes nothing",
+			payload:     `{"hook_event_name":"Notification","message":"just fyi, still working"}`,
+			wantWritten: false,
+		},
+		{
+			name:        "stop is unaffected",
+			payload:     `{"hook_event_name":"Stop","session_id":"s1"}`,
+			wantWritten: true,
+			wantStatus:  "waiting",
+			wantMatcher: "",
+			wantMessage: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sf, written := runHookHandlerWithPayload(t, "inst-ask", tt.payload)
+			if written != tt.wantWritten {
+				t.Fatalf("status file written = %v, want %v (sf=%#v)", written, tt.wantWritten, sf)
+			}
+			if !tt.wantWritten {
+				return
+			}
+			if sf.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", sf.Status, tt.wantStatus)
+			}
+			if sf.Matcher != tt.wantMatcher {
+				t.Errorf("Matcher = %q, want %q", sf.Matcher, tt.wantMatcher)
+			}
+			if sf.Message != tt.wantMessage {
+				t.Errorf("Message = %q, want %q", sf.Message, tt.wantMessage)
+			}
+		})
+	}
+}
+
+// TestHookHandler_MatcherMessageOmittedWhenEmpty verifies the omitempty
+// contract: a record with no ask content (an ordinary Stop) writes neither the
+// matcher nor the message JSON key, so pre-existing status files stay
+// byte-compatible.
+func TestHookHandler_MatcherMessageOmittedWhenEmpty(t *testing.T) {
+	isolateTestHome(t)
+	t.Setenv("AGENTDECK_INSTANCE_ID", "inst-omit")
+	t.Setenv("AGENTDECK_HOOK_GENERATION", "")
+
+	f, err := os.CreateTemp(t.TempDir(), "hook-stdin-*")
+	if err != nil {
+		t.Fatalf("create stdin temp: %v", err)
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.WriteString(`{"hook_event_name":"Stop","session_id":"s1"}`); err != nil {
+		t.Fatalf("write stdin temp: %v", err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		t.Fatalf("seek stdin temp: %v", err)
+	}
+	orig := os.Stdin
+	os.Stdin = f
+	defer func() { os.Stdin = orig }()
+
+	handleHookHandler()
+	_ = f.Close()
+
+	data, err := os.ReadFile(filepath.Join(getHooksDir(), "inst-omit.json"))
+	if err != nil {
+		t.Fatalf("read hook status file: %v", err)
+	}
+	var generic map[string]json.RawMessage
+	if err := json.Unmarshal(data, &generic); err != nil {
+		t.Fatalf("unmarshal generic: %v", err)
+	}
+	if _, ok := generic["matcher"]; ok {
+		t.Errorf("matcher key present in %s, want omitted", string(data))
+	}
+	if _, ok := generic["message"]; ok {
+		t.Errorf("message key present in %s, want omitted", string(data))
+	}
+}
+
 // TestParentIsDSP_EnvVarOverride verifies the explicit env-var path of the DSP
 // detection used by handleHookHandler to emit a PermissionRequest allow.
 // The env-var path is the cross-platform fallback when /proc is unavailable
