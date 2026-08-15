@@ -63,6 +63,22 @@ func handleNotifyDaemon(args []string) {
 		return
 	}
 
+	// Single-instance guard. The daemon has no supervisor of its own, and the
+	// TUI now auto-starts it (notifications.autostart_daemon), so several
+	// launches can race to spawn one. A non-blocking machine-wide flock makes
+	// all but the first exit cleanly here rather than double-firing every
+	// notification. A lock that cannot be attempted (unwritable locks dir) is
+	// logged and tolerated — better one daemon with a missing lock than none.
+	if release, acquired, lockErr := session.AcquireNotifyDaemonLock(); lockErr != nil {
+		logging.ForComponent(logging.CompNotif).Warn("notify_daemon_lock_unavailable",
+			"error", lockErr.Error())
+	} else if !acquired {
+		logging.ForComponent(logging.CompNotif).Info("notify_daemon_already_running")
+		return
+	} else {
+		defer release()
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
