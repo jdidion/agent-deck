@@ -35,6 +35,12 @@ type hookPayload struct {
 	ConversationID string          `json:"conversation_id"`
 	Source         string          `json:"source"`
 	Matcher        json.RawMessage `json:"matcher,omitempty"`
+	// Message is the human-readable text Claude's Notification hook carries
+	// (e.g. the permission prompt or elicitation question). agent-deck retains
+	// it for the human-ask-queue producer, which reads it off the status file /
+	// HookStatus as an ask summary without re-parsing the payload. Absent on
+	// most events; empty then, which the producer treats as "no summary".
+	Message string `json:"message,omitempty"`
 	// Cwd is the session's working directory (PROJECT_DIR) as reported by
 	// Claude Code on each hook event. Issue #1233: when a running session's
 	// registered worktree is renamed/removed, this points at a path that no
@@ -86,6 +92,15 @@ type hookStatusFile struct {
 	// (issue #1186 flush race). The daemon re-scans this path on its poll
 	// loop; the synchronous Stop hook (#1225) must not wait out the flush.
 	TranscriptPath string `json:"transcript_path,omitempty"`
+	// Matcher/Message carry the ask content already on the hook wire but
+	// otherwise dropped (human-ask-queue design). Matcher is the decoded
+	// Notification matcher string ("permission_prompt"|"elicitation_dialog");
+	// Message is Claude's human-readable Notification text. The ask-queue
+	// producer reads a kind and a summary off these without re-parsing.
+	// omitempty keeps records that carry neither (ordinary Stop/turn edges)
+	// byte-identical to before.
+	Matcher string `json:"matcher,omitempty"`
+	Message string `json:"message,omitempty"`
 	// Cwd is the working directory the hook payload reported for this event.
 	// Issue #1729: the session-binding path uses it as same-session evidence —
 	// a candidate session id whose cwd is provably outside the instance's
@@ -217,9 +232,11 @@ func handleHookHandler() {
 	status := mapEventToStatus(payload.HookEventName)
 
 	// Special handling for Notification events: only map to "waiting" if
-	// the matcher indicates a permission prompt or elicitation dialog
+	// the matcher indicates a permission prompt or elicitation dialog.
+	// The decoded matcher string is retained (not discarded) so the ask-queue
+	// producer can tell permission from question without re-parsing.
+	var matcher string
 	if normalizeHookEventKey(payload.HookEventName) == "notification" && payload.Matcher != nil {
-		var matcher string
 		if err := json.Unmarshal(payload.Matcher, &matcher); err == nil {
 			if matcher == "permission_prompt" || matcher == "elicitation_dialog" {
 				status = "waiting"
@@ -247,10 +264,11 @@ func handleHookHandler() {
 		sessionID = strings.TrimSpace(payload.ConversationID)
 	}
 
+	ask := hookAskContent{matcher: matcher, message: payload.Message}
 	if isStopHookEvent(payload.HookEventName) {
-		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, detectDoneSentinel(data))
+		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, detectDoneSentinel(data), ask)
 	} else {
-		writeHookStatus(instanceID, status, sessionID, payload.HookEventName, payload.Cwd)
+		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, doneScanResult{}, ask)
 	}
 
 	// #572: Sync agent-deck title from Claude Code's --name / /rename value.
@@ -342,11 +360,24 @@ func writeHookStatus(instanceID, status, sessionID, event, cwd string, done ...s
 	writeHookStatusWithScan(instanceID, status, sessionID, event, cwd, scan)
 }
 
+// hookAskContent carries the ask content retained for the human-ask-queue
+// producer (design doc 2026-08-14): the decoded Notification matcher and
+// Claude's human-readable message. Passed as an optional trailing arg so the
+// existing 6-arg writeHookStatusWithScan callers (e.g. the #1186 done-signal
+// path) stay source-compatible; absent means "no ask content to persist".
+type hookAskContent struct {
+	matcher string
+	message string
+}
+
 // writeHookStatusWithScan is writeHookStatus plus the full Stop-edge scan
 // outcome: a parsed sentinel persists as done_status/done_summary; an
 // unflushed tail persists as transcript_path so the daemon can finish the
-// scan (issue #1186 flush race).
-func writeHookStatusWithScan(instanceID, status, sessionID, event, cwd string, scan doneScanResult) {
+// scan (issue #1186 flush race). The optional trailing hookAskContent carries
+// the retained matcher/message (human-ask-queue); when absent — the common
+// case, including every existing 6-arg caller — omitempty keeps the written
+// JSON byte-identical to before.
+func writeHookStatusWithScan(instanceID, status, sessionID, event, cwd string, scan doneScanResult, ask ...hookAskContent) {
 	if instanceID == "" || status == "" {
 		return
 	}
@@ -369,6 +400,10 @@ func writeHookStatusWithScan(instanceID, status, sessionID, event, cwd string, s
 		Event:     event,
 		Timestamp: time.Now().Unix(),
 		Cwd:       strings.TrimSpace(cwd),
+	}
+	if len(ask) > 0 {
+		statusFile.Matcher = ask[0].matcher
+		statusFile.Message = ask[0].message
 	}
 	if scan.signal != nil {
 		statusFile.DoneStatus = scan.signal.Status

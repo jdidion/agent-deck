@@ -460,6 +460,11 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	// extra capture, no new goroutine (F3). Disabled-by-config → cheap no-op.
 	d.runSelfHealObservePass(profile, instances, statuses, hookStatuses, db, time.Now().UTC())
 
+	// Reconcile the human ask queue once per pass (level-triggered, idempotent;
+	// see ask_queue.go). Placed here so it runs on both the first-init and the
+	// steady-state paths, and sees the freshest statuses.
+	d.syncAsks(profile, db, byID, statuses, hookStatuses)
+
 	if !d.initialized[profile] {
 		// Cover fast transitions that completed before we observed a running snapshot.
 		d.emitHookTransitionCandidates(profile, byID, nil, statuses, hookCandidates)
