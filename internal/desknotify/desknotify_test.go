@@ -207,3 +207,25 @@ func TestDeflagged_LeavesOtherValuesAlone(t *testing.T) {
 		}
 	}
 }
+
+func TestCmuxNotifyArgs_TargetsWorkspaceWhenKnown(t *testing.T) {
+	got := cmuxNotifyArgs("flow", "needs input", "94F8F1FD-916A-4369-B9D2-C5E1CBCDF379")
+	joined := strings.Join(got, " ")
+	if !strings.Contains(joined, "--workspace 94F8F1FD-916A-4369-B9D2-C5E1CBCDF379") {
+		t.Errorf("args %v missing --workspace target; the headless daemon would bubble the wrong workspace", got)
+	}
+	if got[0] != "notify" || !strings.Contains(joined, "--title flow") || !strings.Contains(joined, "--body needs input") {
+		t.Errorf("args %v malformed", got)
+	}
+}
+
+func TestCmuxNotifyArgs_NoTargetWhenWorkspaceUnknown(t *testing.T) {
+	for _, ws := range []string{"", "   "} {
+		got := cmuxNotifyArgs("flow", "needs input", ws)
+		for _, a := range got {
+			if a == "--workspace" {
+				t.Errorf("ws=%q produced a --workspace flag with no value", ws)
+			}
+		}
+	}
+}
