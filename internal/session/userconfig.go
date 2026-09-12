@@ -88,6 +88,11 @@ type UserConfig struct {
 	// Default: true (nil = true)
 	SyncTitle *bool `toml:"sync_title,omitempty"`
 
+	// PushTitle passes the exact deck title via --name on supported Claude
+	// startup commands. Live renames take effect at the next start/restart.
+	// Default: true (nil = true); unreadable config disables automatic naming.
+	PushTitle *bool `toml:"push_title,omitempty"`
+
 	// GroupSort controls the order of sessions within a group.
 	//   "creation"   (default) — fixed creation order; honors K/J manual reorder.
 	//   "actionable"           — issue #857 status→recency→Order surfacing.
@@ -154,6 +159,9 @@ type UserConfig struct {
 
 	// Hermes defines Hermes Agent CLI integration settings
 	Hermes HermesSettings `toml:"hermes,omitempty"`
+
+	// DeepSeek defines DeepSeek Harness (`dsh`) integration settings
+	DeepSeek DeepSeekSettings `toml:"deepseek,omitempty"`
 
 	// Worktree defines git worktree preferences
 	Worktree WorktreeSettings `toml:"worktree,omitempty"`
@@ -230,6 +238,11 @@ type UserConfig struct {
 	// Mirrors the opt-out in ~/.agent-deck/feedback-state.json so it is visible
 	// to the user and editable without running `agent-deck feedback`.
 	Feedback FeedbackSettings `toml:"feedback,omitempty"`
+
+	// Telemetry configures the opt-in usage telemetry (see TELEMETRY.md).
+	// Consent itself lives in telemetry-state.json, never here: this section
+	// can only turn telemetry OFF or point it at a self-hosted endpoint.
+	Telemetry TelemetrySettings `toml:"telemetry,omitempty"`
 
 	// Terminal defines outer-terminal chrome settings — sequences agent-deck
 	// writes directly to the host terminal (iTerm2 badge, etc), distinct
@@ -373,7 +386,8 @@ type UISettings struct {
 	// ShellSplit controls the terminal used by the open_shell_here hotkey.
 	// Valid values:
 	//   "iterm"  — always open an iTerm2 vertical split pane (macOS only)
-	//   "tmux"   — always open a new tmux window
+	//   "tmux"   — always open an inline tmux split pane
+	//   "window" — always open a tmux window (tab) inside the session
 	//   ""       — auto: use iTerm2 split when LC_TERMINAL=iTerm2 or
 	//              TERM_PROGRAM=iTerm.app, otherwise tmux
 	// Default: "" (auto). Issue #1470.
@@ -502,8 +516,9 @@ const (
 
 // ShellSplit modes for the open_shell_here hotkey (issue #1470).
 const (
-	ShellSplitITerm = "iterm"
-	ShellSplitTmux  = "tmux"
+	ShellSplitITerm  = "iterm"
+	ShellSplitTmux   = "tmux"
+	ShellSplitWindow = "window"
 )
 
 // Preview-pane orientation modes for wide terminals (>= 80 cols).
@@ -582,6 +597,8 @@ func (u UISettings) GetShellSplit() string {
 		return ShellSplitITerm
 	case ShellSplitTmux:
 		return ShellSplitTmux
+	case ShellSplitWindow:
+		return ShellSplitWindow
 	}
 	return ""
 }
@@ -695,6 +712,17 @@ type FeedbackSettings struct {
 	Disabled bool `toml:"disabled,omitempty"`
 }
 
+// TelemetrySettings configures opt-in usage telemetry (TELEMETRY.md).
+type TelemetrySettings struct {
+	// Disabled forces telemetry off regardless of stored consent, like
+	// AGENTDECK_TELEMETRY=0. It cannot enable telemetry.
+	Disabled bool `toml:"disabled,omitempty"`
+
+	// Endpoint overrides the HTTPS receiver URL for self-hosting. Plain http
+	// is accepted only for localhost. Empty uses the compiled-in default.
+	Endpoint string `toml:"endpoint,omitempty"`
+}
+
 // OpenClawSettings configures the OpenClaw gateway connection.
 type OpenClawSettings struct {
 	// GatewayURL is the WebSocket URL of the OpenClaw gateway (default: "ws://127.0.0.1:31337")
@@ -761,6 +789,8 @@ type ProfileSettings struct {
 	Claude ProfileClaudeSettings `toml:"claude,omitempty"`
 	// Codex defines Codex CLI overrides for a specific profile.
 	Codex ProfileCodexSettings `toml:"codex,omitempty"`
+	// DeepSeek defines DeepSeek Harness overrides for a specific profile.
+	DeepSeek ProfileDeepSeekSettings `toml:"deepseek,omitempty"`
 	// Costs defines profile-specific cost-tracking overrides.
 	// Nil pointer means "no [profiles.<name>.costs] block in TOML"; the
 	// resolver falls through to global [costs] settings.
@@ -779,6 +809,17 @@ type ProfileCodexSettings struct {
 	ConfigDir string `toml:"config_dir,omitempty"`
 }
 
+// ProfileDeepSeekSettings defines profile-specific DeepSeek Harness overrides.
+//
+// A profile here is an agent-deck account slot, not a dsh profile: this block
+// selects which $DSH_HOME (and therefore which credentials, sessions, and
+// plugin set) a session bound to that account launches against. Which dsh
+// profile to boot is [deepseek].profile.
+type ProfileDeepSeekSettings struct {
+	// ConfigDir overrides [deepseek].config_dir (DSH_HOME) for this profile only.
+	ConfigDir string `toml:"config_dir,omitempty"`
+}
+
 // GroupSettings defines per-group configuration overrides.
 type GroupSettings struct {
 	// Create ensures the group exists on startup.
@@ -789,6 +830,8 @@ type GroupSettings struct {
 	Claude GroupClaudeSettings `toml:"claude,omitempty"`
 	// Hermes defines Hermes overrides for a specific group.
 	Hermes GroupHermesSettings `toml:"hermes,omitempty"`
+	// DeepSeek defines DeepSeek Harness overrides for a specific group.
+	DeepSeek GroupDeepSeekSettings `toml:"deepseek,omitempty"`
 }
 
 // GroupDefaultsSettings carries [group_defaults] — defaults stamped onto new
@@ -858,6 +901,21 @@ type GroupHermesSettings struct {
 	APITokenEnv  string `toml:"api_token_env,omitempty"`
 }
 
+// GroupDeepSeekSettings defines group-specific DeepSeek Harness overrides.
+// Mirrors GroupHermesSettings; keys use omitempty so SaveUserConfig does not
+// emit zero-value fields into every group stanza (issue #1360).
+type GroupDeepSeekSettings struct {
+	// Command overrides [deepseek].command for sessions in this group.
+	Command string `toml:"command,omitempty"`
+	// EnvFile overrides [deepseek].env_file for sessions in this group.
+	EnvFile string `toml:"env_file,omitempty"`
+	// ConfigDir overrides [deepseek].config_dir (DSH_HOME) for this group.
+	ConfigDir string `toml:"config_dir,omitempty"`
+	// Profile overrides [deepseek].profile — the $DSH_HOME/profiles/<name>
+	// this group's sessions boot.
+	Profile string `toml:"profile,omitempty"`
+}
+
 // ConductorOverrides defines per-conductor configuration overrides.
 // Mirrors GroupSettings — conductors are first-class entities keyed by
 // conductor name (derived from Instance.Title via strings.TrimPrefix at the
@@ -872,6 +930,21 @@ type ConductorOverrides struct {
 	Claude ConductorClaudeSettings `toml:"claude,omitempty"`
 	// Hermes defines Hermes overrides for a specific conductor.
 	Hermes ConductorHermesSettings `toml:"hermes,omitempty"`
+	// DeepSeek defines DeepSeek Harness overrides for a specific conductor.
+	DeepSeek ConductorDeepSeekSettings `toml:"deepseek,omitempty"`
+}
+
+// ConductorDeepSeekSettings defines conductor-specific DeepSeek Harness
+// overrides. Semantics mirror GroupDeepSeekSettings; conductor beats group.
+type ConductorDeepSeekSettings struct {
+	// Command overrides [deepseek].command for this conductor only.
+	Command string `toml:"command,omitempty"`
+	// EnvFile is sourced before dsh exec for this conductor.
+	EnvFile string `toml:"env_file,omitempty"`
+	// ConfigDir overrides [deepseek].config_dir (DSH_HOME) for this conductor.
+	ConfigDir string `toml:"config_dir,omitempty"`
+	// Profile overrides [deepseek].profile for this conductor.
+	Profile string `toml:"profile,omitempty"`
 }
 
 // ConductorClaudeSettings defines conductor-specific Claude overrides.
@@ -1045,6 +1118,14 @@ type UpdateSettings struct {
 	// Default: false
 	AutoUpdate bool `toml:"auto_update,omitempty"`
 
+	// AutoUpdateRemotes pushes the controller's version to every configured
+	// remote that reports an older agent-deck: after a successful
+	// `agent-deck update`, and in the background on startup (throttled by
+	// CheckIntervalHours). Never prompts; a remote that fails stays on its
+	// version and is logged. Default: true (nil = true); opt out with
+	// auto_update_remotes = false (issue #2164).
+	AutoUpdateRemotes *bool `toml:"auto_update_remotes,omitempty"`
+
 	// CheckEnabled enables automatic update checks on startup
 	// Default: true (nil = true)
 	CheckEnabled *bool `toml:"check_enabled,omitempty"`
@@ -1064,6 +1145,15 @@ func (u UpdateSettings) GetCheckEnabled() bool {
 		return true
 	}
 	return *u.CheckEnabled
+}
+
+// GetAutoUpdateRemotes returns whether older remotes follow the controller's
+// version on their own (default: true).
+func (u UpdateSettings) GetAutoUpdateRemotes() bool {
+	if u.AutoUpdateRemotes == nil {
+		return true
+	}
+	return *u.AutoUpdateRemotes
 }
 
 // GetNotifyInCLI returns whether CLI update notifications are enabled (default: true).
@@ -1406,6 +1496,16 @@ func (c *UserConfig) GetSyncTitle() bool {
 		return true
 	}
 	return *c.SyncTitle
+}
+
+// GetPushTitle returns whether agent-deck may tell the agent its own session
+// name. Defaults to true (nil = true); set push_title = false to leave the
+// agent's name alone and keep the sync one-directional.
+func (c *UserConfig) GetPushTitle() bool {
+	if c.PushTitle == nil {
+		return true
+	}
+	return *c.PushTitle
 }
 
 // GetGroupSort returns the normalized within-group sort mode: "actionable" only
@@ -1906,6 +2006,187 @@ func (c *UserConfig) GetProfileCodexConfigDir(profile string) string {
 		return ""
 	}
 	return ExpandPath(profileCfg.Codex.ConfigDir)
+}
+
+// GetProfileDeepSeekConfigDir returns the profile-specific DSH_HOME, if configured.
+func (c *UserConfig) GetProfileDeepSeekConfigDir(profile string) string {
+	if c == nil || profile == "" || c.Profiles == nil {
+		return ""
+	}
+	profileCfg, ok := c.Profiles[profile]
+	if !ok || profileCfg.DeepSeek.ConfigDir == "" {
+		return ""
+	}
+	return ExpandPath(profileCfg.DeepSeek.ConfigDir)
+}
+
+// GetGroupDeepSeekConfigDir returns the group-specific DSH_HOME, walking
+// ancestor groups when the exact path has no override. Mirrors
+// GetGroupClaudeConfigDir's inheritance semantics.
+func (c *UserConfig) GetGroupDeepSeekConfigDir(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.DeepSeek.ConfigDir != "" {
+			return ExpandPath(groupCfg.DeepSeek.ConfigDir)
+		}
+	}
+	return ""
+}
+
+// GetGroupDeepSeekProfile returns the group-specific dsh profile name, walking
+// ancestor groups. No path expansion — a profile is a name under
+// $DSH_HOME/profiles, not a path.
+func (c *UserConfig) GetGroupDeepSeekProfile(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.DeepSeek.Profile != "" {
+			return groupCfg.DeepSeek.Profile
+		}
+	}
+	return ""
+}
+
+// GetGroupDeepSeekEnvFile returns the group-specific dsh env_file, walking
+// ancestor groups. No expansion here; resolvePath handles it at the spawn site.
+func (c *UserConfig) GetGroupDeepSeekEnvFile(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.DeepSeek.EnvFile != "" {
+			return groupCfg.DeepSeek.EnvFile
+		}
+	}
+	return ""
+}
+
+// GetGroupDeepSeekCommand returns the group-specific dsh command, walking
+// ancestor groups. No expansion — a command may be a bare name, a wrapper, or an
+// absolute path, and the spawn builder treats a non-bare value as passthrough.
+func (c *UserConfig) GetGroupDeepSeekCommand(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.DeepSeek.Command != "" {
+			return groupCfg.DeepSeek.Command
+		}
+	}
+	return ""
+}
+
+// GetConductorDeepSeekCommand returns the conductor-specific dsh command.
+func (c *UserConfig) GetConductorDeepSeekCommand(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok {
+		return ""
+	}
+	return conductorCfg.DeepSeek.Command
+}
+
+// GetConductorDeepSeekConfigDir returns the conductor-specific DSH_HOME.
+func (c *UserConfig) GetConductorDeepSeekConfigDir(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok || conductorCfg.DeepSeek.ConfigDir == "" {
+		return ""
+	}
+	return ExpandPath(conductorCfg.DeepSeek.ConfigDir)
+}
+
+// GetConductorDeepSeekProfile returns the conductor-specific dsh profile name.
+func (c *UserConfig) GetConductorDeepSeekProfile(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok {
+		return ""
+	}
+	return conductorCfg.DeepSeek.Profile
+}
+
+// GetConductorDeepSeekEnvFile returns the conductor-specific dsh env_file.
+func (c *UserConfig) GetConductorDeepSeekEnvFile(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok {
+		return ""
+	}
+	return conductorCfg.DeepSeek.EnvFile
+}
+
+// DeepSeekSettings defines DeepSeek Harness (`dsh`) integration configuration.
+//
+// Binary: `dsh` from npm @deepseek-ai/dsh (github.com/deepseek-ai/deepseek-harness,
+// MIT). Verified against 0.1.0-rc.6. See internal/session/deepseek.go for the
+// full invocation grammar this block feeds.
+type DeepSeekSettings struct {
+	// Command is the dsh command or invocation to use. Supports a wrapper
+	// (e.g. "my-dsh" or an absolute path). A value other than the bare binary
+	// name is treated as a passthrough and receives no flag injection.
+	// Default: "dsh"
+	Command string `toml:"command,omitempty"`
+
+	// EnvFile is a .env file specific to DeepSeek sessions, sourced before the
+	// `dsh` command runs (like [gemini].env_file). Optional. This is where a
+	// DEEPSEEK_API_KEY belongs when it should not live in the user's shell.
+	EnvFile string `toml:"env_file,omitempty"`
+
+	// ConfigDir is the DSH_HOME exported for DeepSeek sessions — the single
+	// user-data root holding profiles, credentials, and session bodies.
+	// Default: "" (dsh resolves $DSH_HOME, then ~/.dsh, itself)
+	ConfigDir string `toml:"config_dir,omitempty"`
+
+	// Profile is the $DSH_HOME/profiles/<name> to boot. The shipped profiles
+	// are "web" (long-lived HTTP server, auto-initialized on first use) and
+	// "headless" (one-shot: answer one task, print it, exit). Any other name
+	// must be created with `dsh plugin --profile <name> add <package>`.
+	// Default: "web"
+	Profile string `toml:"profile,omitempty"`
+
+	// Patches are extra `--patch <path>` overlay files applied after the
+	// profile's own layer, in order. Repeatable upstream.
+	Patches []string `toml:"patches,omitempty"`
+
+	// Host and Port are the web profile's --host/--port. Ignored for other
+	// profiles, whose apps own their own flags. Upstream refuses
+	// --host 0.0.0.0 with a usage error; agent-deck passes the value through
+	// rather than second-guessing it, so the error surfaces in the pane.
+	//
+	// Port is a pointer because 0 is MEANINGFUL upstream ("let the OS pick a
+	// free one"), so it cannot double as "unset". nil omits --port entirely and
+	// lets the composed profile decide (3080 by default).
+	Host string `toml:"host,omitempty"`
+	Port *int   `toml:"port,omitempty"`
+
+	// TrustedHosts are repeatable `--trusted-host` authorities accepted by the
+	// web profile's /api browser-trust fence.
+	TrustedHosts []string `toml:"trusted_hosts,omitempty"`
+
+	// ResumeFlag is the app-owned flag used to reopen a previous conversation
+	// on restart, e.g. "--resume". Empty (the default) disables resume: NEITHER
+	// shipped profile accepts a resume flag in 0.1.0-rc.6, and emitting one
+	// would make dsh exit with a usage error instead of booting. Set this only
+	// when the configured profile installs an app that documents such a flag;
+	// agent-deck then discovers the session ID from $DSH_HOME's workspace index
+	// and appends `<resume_flag> <id>` as an app argument.
+	ResumeFlag string `toml:"resume_flag,omitempty"`
+
+	// ExtraArgs are appended verbatim after every flag agent-deck derives, for
+	// app flag families agent-deck does not model.
+	ExtraArgs []string `toml:"extra_args,omitempty"`
 }
 
 // CursorSettings defines Cursor Agent CLI integration configuration (Issue #1672).
@@ -2422,9 +2703,10 @@ type TmuxSettings struct {
 
 	// LaunchAs selects the spawn form for new tmux servers (v1.7.21+).
 	// Valid values (case-insensitive, whitespace-trimmed):
-	//   "scope"   — systemd-run --user --scope (PR #467 legacy behavior)
+	//   "scope"   — systemd-run --user --scope with KillMode=none, so
+	//               stopping one per-session scope cannot kill a shared server.
 	//   "service" — systemd-run --user --unit <NAME>.service with
-	//               Type=forking + Restart=on-failure. Adds auto-restart
+	//               Type=forking + Restart=on-failure + KillMode=none. Adds auto-restart
 	//               if the tmux daemon dies unexpectedly (OOM, SIGKILL,
 	//               kernel signal). Opt-in defense-in-depth.
 	//   "direct"  — plain `tmux new-session` (no systemd isolation).
@@ -2437,8 +2719,9 @@ type TmuxSettings struct {
 	// LaunchInUserScope) so a config typo doesn't silently opt the user
 	// onto an unintended spawn path.
 	//
-	// This is additive — v1.7.20 users get zero behavior change until
-	// they explicitly set launch_as.
+	// Both systemd forms preserve SSH/logout isolation while avoiding a
+	// control-group teardown of a shared tmux server. This changes only units
+	// spawned after #2219; existing transient units are never migrated.
 	LaunchAs *string `toml:"launch_as,omitempty"`
 
 	// WindowStyleOverride sets the tmux window-style (and window-active-style) for
@@ -2855,8 +3138,19 @@ type DisplaySettings struct {
 	// IncludeCwdPrefix controls whether the terminal/pane title is prefixed
 	// with "[<cwd-basename>]" (e.g. "[my-project] feature work"). Default true
 	// preserves the historical format; set false to show only the session
-	// title. Consumed by the tmux set-titles-string builder.
+	// title. Consumed by the tmux set-titles-string builder. Ignored when
+	// TitleFormat is set.
 	IncludeCwdPrefix *bool `toml:"include_cwd_prefix,omitempty"`
+
+	// TitleFormat is a custom template for the outer terminal title. When
+	// non-empty it overrides the default "[<project>] <name>" format (and the
+	// IncludeCwdPrefix toggle). Supported placeholders, substituted live by
+	// tmux on rename/regroup:
+	//   {group}   — the agent-deck group/tree path (e.g. "projects/devops")
+	//   {project} — the working-directory basename
+	//   {name}    — the session title
+	// Example: "{group}/{name}" or "[{project}] {group} · {name}".
+	TitleFormat string `toml:"title_format,omitempty"`
 
 	// ShowSessionTimestamps appends a dim "Nm ago" badge to every session row.
 	// Default: false — opt-in to avoid crowding existing badges. See
@@ -2930,6 +3224,18 @@ func (d DisplaySettings) GetIncludeCwdPrefix() bool {
 		return true
 	}
 	return *d.IncludeCwdPrefix
+}
+
+// GetTitleFormat returns the trimmed custom terminal title template, or "" when
+// unset (in which case the default format and GetIncludeCwdPrefix apply).
+func (d DisplaySettings) GetTitleFormat() string {
+	return strings.TrimSpace(d.TitleFormat)
+}
+
+// ConfigureTmuxDisplay applies the shared CLI, TUI and headless-web title policy.
+func ConfigureTmuxDisplay(display DisplaySettings) {
+	tmux.SetHideCwdPrefixInTitle(!display.GetIncludeCwdPrefix())
+	tmux.SetTitleFormat(display.GetTitleFormat())
 }
 
 // Default user config (empty maps)
@@ -3469,6 +3775,9 @@ func GetToolCommand(toolName string) string {
 		if toolName == "cursor" {
 			return DefaultCursorCommand()
 		}
+		if toolName == "deepseek" {
+			return deepSeekBinary
+		}
 		return toolName
 	}
 	switch toolName {
@@ -3496,6 +3805,14 @@ func GetToolCommand(toolName string) string {
 		if config.Hermes.Command != "" {
 			return config.Hermes.Command
 		}
+	case "deepseek":
+		// The tool is named for the vendor; the binary it launches is `dsh`.
+		// Returning the tool name here (the default tail of this function)
+		// would spawn a nonexistent `deepseek` command.
+		if config.DeepSeek.Command != "" {
+			return config.DeepSeek.Command
+		}
+		return deepSeekBinary
 	case "cursor":
 		if config.Cursor.Command != "" {
 			return config.Cursor.Command
@@ -3534,6 +3851,8 @@ func GetToolIcon(toolName string) string {
 		return "📝"
 	case "hermes":
 		return "☤"
+	case "deepseek":
+		return "🐋"
 	case "pi":
 		return "π"
 	case "shell":
@@ -4264,6 +4583,44 @@ func CreateExampleConfig() error {
 # config_dir = "~/.codex-work"
 # Enable --yolo (bypass approvals and sandbox) by default (default: false)
 # yolo_mode = true
+
+# DeepSeek Harness settings — the dsh binary from npm @deepseek-ai/dsh
+# (github.com/deepseek-ai/deepseek-harness). Install: npm install -g @deepseek-ai/dsh
+# Full guide: docs/tools/deepseek.md
+# [deepseek]
+# The dsh command or a wrapper/absolute path (default: "dsh" — NOT "deepseek")
+# Overridable per group/conductor, like profile/config_dir/env_file
+# command = "dsh"
+# DSH_HOME: the single user-data root holding profiles, credentials, and sessions
+# Default: "" (dsh resolves $DSH_HOME, then ~/.dsh, itself)
+# config_dir = "~/.dsh"
+# Which $DSH_HOME/profiles/<name> to boot. Shipped: "web" (browser UI served from
+# the pane) and "headless" (answer one task, print it, exit). Others are installed
+# with: dsh plugin --profile <name> add <package>   (default: "web")
+# profile = "web"
+# A .env sourced before dsh runs — where a DEEPSEEK_API_KEY belongs if it should
+# not live in your shell
+# env_file = "~/.config/deepseek.env"
+# Extra --patch overlay files applied after the profile's own layer, in order
+# patches = ["~/.dsh/extra.cordis.yml"]
+# web profile only: --host / --port / repeatable --trusted-host
+# host = "127.0.0.1"
+# port = 3080          # 0 means "let the OS pick a free port"; omit to use the profile default
+# trusted_hosts = ["deck.local:8080"]
+# Resume flag used on restart. EMPTY BY DEFAULT and deliberately so: neither
+# shipped profile accepts one in 0.1.0-rc.6, and emitting it would make dsh exit
+# with a usage error. Set it only for a profile whose app documents one; agent-deck
+# then discovers the session id from $DSH_HOME's workspace index.
+# resume_flag = "--resume"
+# Appended verbatim after every flag agent-deck derives
+# extra_args = []
+# Optional per-account override — one DSH_HOME per account slot
+# [profiles.work.deepseek]
+# config_dir = "~/.dsh-work"
+# Per-group / per-conductor overrides resolve conductor -> group -> global:
+# [groups."clients/acme".deepseek]
+# command = "/opt/acme/bin/dsh-wrapper"
+# profile = "headless"
 
 # Log file management
 # Agent-deck logs session output to ~/.agent-deck/logs/ for status detection

@@ -99,6 +99,7 @@ agent-deck web                    # Start web UI on http://127.0.0.1:8420
 | Key | Action |
 |-----|--------|
 | `Enter` | Attach to session |
+| `Ctrl+Q` | Detach from session |
 | `n` | New session |
 | `f` / `F` | Fork (quick / dialog) |
 | `A` / `Shift+U` | Archive / unarchive session |
@@ -228,7 +229,20 @@ Closes [issue #602](https://github.com/asheshgoplani/agent-deck/issues/602).
 
 #### Switch a session's account on the fly
 
+For a new one-shot session, use `agent-deck launch . -c claude --account <name>`.
+Run `agent-deck accounts` (or `agent-deck accounts --json`) to list named slots
+configured under `[profiles.<name>.claude].config_dir`.
+
 `agent-deck session switch-account <session> <account>` moves an existing session to another Claude account — **conversation included**. The session stops, its conversation file is migrated into the target account's config dir (copy-only, with a destination backup and size verification), the account is set, and the session restarts with `--resume`. `session set <session> account <name>` auto-migrates too.
+
+The TUI exposes the same two moments. The **New Session** dialog's Claude options
+carry an `Account` row (`←`/`→` or `Space` to cycle, `inherit` = today's
+conductor/group/env chain), so a session can be created straight onto the right
+login. The **Edit Session** dialog (`e`) carries a `Claude account` row for a
+session that already exists; committing it runs the same
+migrate-and-resume flow as `session switch-account`, and the session card's
+`[account:"…"]` badge follows. Both rows are hidden when no
+`[profiles.<name>.claude].config_dir` blocks are configured.
 
 ### Session naming
 
@@ -242,6 +256,7 @@ By default, agent-deck syncs a session's displayed title from the tool's own ses
 | --- | --- |
 | This one session keeps the title I gave it | `--title-lock` (alias `--no-title-sync`) on `agent-deck add` / `agent-deck launch`, or `agent-deck session set-title-lock <id> on` at runtime |
 | No session in this installation ever gets renamed by its agent | `sync_title = false` in `config.toml` |
+| Claude should receive the exact deck title at startup | supported Claude launch/restart/resume commands get `--name`; `push_title = false` opts out. A deck rename takes effect on the next start, not immediately. |
 | A throwaway session where the live task description matters more than a fixed name | `agent-deck add --quick` (`-Q` short flag) — the list shows the session's current Claude task in place of the generated handle |
 
 An explicit `-t/--title` locks the title automatically, the same as passing `--title-lock` — there's no separate opt-in needed. There's also no create-time opt-out: if you want a session with an explicit title to still pick up the agent's renames, unlock it afterward with `agent-deck session set-title-lock <id> off`. A locked title is never silently overwritten by the sync path — it only changes via an explicit rename or `session set-title-lock <id> off`.
@@ -262,7 +277,7 @@ Running many sessions? Socket pooling shares MCP processes across all sessions v
 
 ### Search
 
-Press `/` to fuzzy-search across all sessions. Filter by status with `!` (running), `@` (waiting), `#` (idle), `$` (error). Press `G` for global search across all Claude conversations.
+Press `/` to fuzzy-search across all sessions. Filter by status with `!` (running), `@` (waiting), `#` (idle), `&` (error). Press `$` for the Cost Dashboard and `G` for global search across all Claude conversations.
 
 ### Keyboard navigation (v1.7.60)
 
@@ -720,6 +735,7 @@ Agent Deck works with any terminal-based AI tool:
 | **Crush** (charmbracelet/crush) | Status detection, organization, launch |
 | **Cursor** (terminal) | Status detection, organization |
 | **Hermes Agent** | Organization, launch |
+| **DeepSeek Harness** (`dsh`) | Status detection, organization, launch, restart, per-account `DSH_HOME` |
 | **Custom tools** | Configurable via `[tools.*]` in config.toml |
 
 Codex status detection uses Codex's notify hook. Install and verify it once for each Codex home:
@@ -730,6 +746,15 @@ agent-deck codex-hooks status
 ```
 
 If you set `CODEX_HOME`, use the same environment here and when launching Codex. Without the hook, turn-level running/waiting status cannot converge reliably.
+
+DeepSeek Harness is the `dsh` binary from [`@deepseek-ai/dsh`](https://github.com/deepseek-ai/deepseek-harness)
+(`npm install -g @deepseek-ai/dsh`). It boots *profiles*: `web` (a browser UI served
+from the pane) and `headless` (answer one task, print it, exit) ship in the box, and
+`dsh plugin --profile <name> add <package>` installs others. Pick the profile with
+`[deepseek].profile`, give each account its own `DSH_HOME` with
+`[profiles.<account>.deepseek].config_dir`, and run `agent-deck deepseek status --json`
+to see exactly what agent-deck resolved. dsh has no fork command, and neither shipped
+profile takes a resume flag — see [docs/tools/deepseek.md](docs/tools/deepseek.md).
 
 Hide tools you don't use from the new-session picker with `[ui].hidden_tools` (applies to TUI and web; `shell` is always available).
 
@@ -848,6 +873,16 @@ Feedback posts to a public GitHub Discussion at [Feedback Hub](https://github.co
 
 **Feedback prompt frequency** (v1.7.41+): the TUI's auto-prompt is paced so brand-new users aren't asked on their first few launches. The first prompt appears only after **7 launches or 3 days** of use, whichever comes later. If you dismiss it, agent-deck waits **14 days** before asking again. You'll see at most **3 prompts per version**, and pressing `n` at any step opts you out permanently — use `agent-deck feedback` or `Ctrl+E` to re-enable on demand. Opt-out always wins over every pacing gate.
 
+### Usage telemetry (opt-in, off by default)
+
+agent-deck can send one small anonymous usage report per day (random install id, version, OS/arch, feature counters) so the maintainer can see which features are used. **It is off until you explicitly say yes** in the one-time TUI prompt or with `agent-deck telemetry enable`; declining is remembered and nothing is ever sent or counted without consent. `AGENTDECK_TELEMETRY=0` or `DO_NOT_TRACK=1` hard-disable it regardless. Full details, the exact payload, and every control: [TELEMETRY.md](TELEMETRY.md).
+
+```bash
+agent-deck telemetry status      # on/off and why
+agent-deck telemetry show-last   # the exact JSON that was last sent
+agent-deck telemetry disable     # off, install id deleted
+```
+
 ### Remote Instances
 
 Manage agent-deck instances running on remote SSH servers from your local terminal. Remote sessions report coarse live status and use the same nested group layout as local sessions; remote groups can be collapsed, and `K`/`J` reorder sessions within a remote group. Session identity includes its location, so the same title can safely exist locally and on different remote host/path pairs.
@@ -869,12 +904,20 @@ agent-deck remote sessions dev
 # Attach to a remote session
 agent-deck remote attach dev my-session
 
+# Pull finished/stalled reports from a remote into this machine's inbox
+agent-deck remote drain dev
+
 # Keep remote binaries up to date
-agent-deck remote update          # all remotes
+agent-deck remote update --all    # every remote older than this controller
 agent-deck remote update dev      # specific remote
+agent-deck remote list            # includes each remote's version, ↑ when behind
 ```
 
-Remote configuration is stored under `[remotes]` in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`). `remote list` and `remote sessions` support `--json` output for scripting. See the [Remote Commands reference](skills/agent-deck/references/cli-reference.md#remote-commands) for flags, security behavior, and examples.
+By default the controller pushes its version to older remotes on its own: after `agent-deck update`, and in the background on startup (`[updates] auto_update_remotes = false` in `config.toml` opts out). The TUI shows `v1.15.0 ↑` on a remote header that is behind; `u` on that header updates it after a confirmation. A remote whose binary lives in a directory its user cannot write (a root-owned `/usr/local/bin`) is updated through passwordless `sudo -n` when the remote grants it; otherwise the update reports `install path <path> is not writable by <user>` and the fix: move the binary to `~/.local/bin` behind a symlink at the old path, or run the update with sudo.
+
+A conductor that launches workers on another host does not get their completions for free: transition notifications are parent-linked, and a `parent_session_id` cannot point across machines. `remote drain <name>` closes that gap by pulling — it reads the remote's records over the same SSH path (consuming nothing there) and writes them into the local inbox, safe to run on every heartbeat and safe to repeat.
+
+Remote configuration is stored under `[remotes]` in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`). `remote list`, `remote sessions` and `remote drain` support `--json` output for scripting. See the [Remote Commands reference](skills/agent-deck/references/cli-reference.md#remote-commands) for flags, security behavior, and examples.
 
 Pressing `n` on a remote group or session opens the full new-session dialog in **remote mode**: path suggestions come from the remote host, the remote session's group is pre-filled, and the create routes over SSH with your chosen tool — sessions are never accidentally created on localhost.
 
@@ -904,6 +947,23 @@ Protect API + WebSocket access with a bearer token:
 agent-deck web --token my-secret
 # then open: http://127.0.0.1:8420/?token=my-secret
 ```
+
+For headless deployments, read the token from a file instead so it never
+appears in the process arguments, where any local user can read it from
+`/proc`. The file must be a regular file that is not group- or world-readable,
+and must hold the token on a single line:
+
+```bash
+install -m 600 /dev/null ~/.config/agent-deck/web-token
+printf '%s' "$(openssl rand -hex 32)" > ~/.config/agent-deck/web-token
+agent-deck web --no-tui --listen 0.0.0.0:8420 --token-file ~/.config/agent-deck/web-token
+```
+
+`--token` and `--token-file` are mutually exclusive. Binding a non-loopback
+address without one of them is refused, because it would expose an
+unauthenticated remote-code-execution surface. MCP administration over the
+HTTP API is only available when a token is configured; without one those
+routes stay unavailable.
 
 The browser UI includes the live Command Center, session terminal, costs, archive, and settings views. See [Command Center](docs/COMMAND-CENTER.md) for the fleet view; use `--read-only` when browser clients should not mutate sessions.
 

@@ -2,10 +2,16 @@ package ui
 
 import (
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"unicode"
 
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
+
+	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	tea "github.com/charmbracelet/bubbletea"
@@ -427,8 +433,8 @@ func TestDisplayCommandPreset(t *testing.T) {
 func TestDialogPresetCommands(t *testing.T) {
 	d := NewNewDialog()
 
-	// Should have shell (empty), claude, gemini, opencode, codex, pi, copilot, crush, cursor, hermes
-	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes"}
+	// Should have shell (empty), claude, gemini, opencode, codex, pi, copilot, crush, cursor, hermes, deepseek
+	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek"}
 
 	if len(d.presetCommands) != len(expectedCommands) {
 		t.Errorf("Expected %d preset commands, got %d", len(expectedCommands), len(d.presetCommands))
@@ -602,6 +608,125 @@ func TestNewDialog_MalformedPathFix(t *testing.T) {
 				t.Errorf("GetValues() path = %q, want %q", path, tt.expected)
 			}
 		})
+	}
+}
+
+// TestNewDialog_TabShowsCompletionMatches: when Tab autocompletes a partial
+// path with multiple matches, the matches must be listed in the dropdown
+// (terminal-style menu completion) with the current one highlighted, and
+// repeated Tab must move the highlight through the list.
+func TestNewDialog_TabShowsCompletionMatches(t *testing.T) {
+	d := NewNewDialog()
+	d.SetSize(200, 50)
+	d.Show()
+
+	tmpDir := t.TempDir()
+	subdirs := []string{"alpha", "amber", "apple"}
+	for _, sub := range subdirs {
+		if err := os.MkdirAll(filepath.Join(tmpDir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Focus the path field.
+	d.focusIndex = 2
+	d.updateFocus()
+	if d.currentTarget() != focusPath {
+		t.Fatalf("expected focusPath, got %v", d.currentTarget())
+	}
+
+	d.pathInput.SetValue(filepath.Join(tmpDir, "a"))
+	d.pathInput.SetCursor(len(d.pathInput.Value()))
+
+	// First Tab: completes to the first match and shows the match list.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+
+	if !d.pathCycler.IsActive() {
+		t.Fatal("expected completion cycler to be active after Tab on partial path")
+	}
+	view := d.View()
+	for _, sub := range subdirs {
+		if !strings.Contains(view, sub) {
+			t.Errorf("completion list should show %q, view:\n%s", sub, view)
+		}
+	}
+	first := d.pathCycler.Matches()[0]
+	if !strings.Contains(view, "▶ "+first) {
+		t.Errorf("current match %q should be highlighted with ▶", first)
+	}
+
+	// Second Tab: cycles to the next match and moves the highlight.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	second := d.pathCycler.Matches()[1]
+	if got := d.pathInput.Value(); got != second {
+		t.Errorf("second Tab should complete to %q, got %q", second, got)
+	}
+	view = d.View()
+	if !strings.Contains(view, "▶ "+second) {
+		t.Errorf("after second Tab, %q should be highlighted with ▶", second)
+	}
+	if strings.Contains(view, "▶ "+first) {
+		t.Errorf("after second Tab, %q should no longer be highlighted", first)
+	}
+}
+
+// TestNewDialog_CompletionDropdown_SanitizesControlBytes: directory names can
+// carry ESC/BEL/OSC sequences and newlines (repo checkouts, extracted
+// archives). The dropdown renders filesystem-derived names, so control bytes
+// must be neutralized at the render boundary — while the raw names stay
+// intact in the match set so selection still targets the real directory.
+func TestNewDialog_CompletionDropdown_SanitizesControlBytes(t *testing.T) {
+	// Pin the global lipgloss profile to Ascii so the render carries no
+	// style-generated escapes (issue391 tests force TrueColor binary-wide);
+	// any control byte left in the output can then only come from a filename.
+	oldProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.Ascii)
+	t.Cleanup(func() { lipgloss.SetColorProfile(oldProfile) })
+
+	d := NewNewDialog()
+	d.SetSize(200, 50)
+	d.Show()
+
+	tmpDir := t.TempDir()
+	oscName := "evil\x1b]52;c;cGF5bG9hZA==\x07osc"
+	nlName := "evil\nnewline"
+	for _, sub := range []string{oscName, nlName, "evilclean"} {
+		if err := os.Mkdir(filepath.Join(tmpDir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Focus the path field and Tab on a prefix matching all three.
+	d.focusIndex = 2
+	d.updateFocus()
+	d.pathInput.SetValue(filepath.Join(tmpDir, "evil"))
+	d.pathInput.SetCursor(len(d.pathInput.Value()))
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if !d.pathCycler.IsActive() {
+		t.Fatal("expected completion cycler to be active after Tab on partial path")
+	}
+
+	// Raw bytes must survive in the match set used for selection.
+	var rawOSC, rawNL bool
+	for _, m := range d.pathCycler.Matches() {
+		if strings.HasSuffix(m, oscName) {
+			rawOSC = true
+		}
+		if strings.HasSuffix(m, nlName) {
+			rawNL = true
+		}
+	}
+	if !rawOSC || !rawNL {
+		t.Errorf("raw control-byte names must remain selectable, matches: %q", d.pathCycler.Matches())
+	}
+
+	// The rendered menu must carry no control bytes (newlines between menu
+	// rows are layout, not payload).
+	menu := d.renderCompletionDropdown()
+	for _, r := range menu {
+		if r != '\n' && unicode.IsControl(r) {
+			t.Fatalf("rendered dropdown contains control rune %q:\n%q", r, menu)
+		}
 	}
 }
 
@@ -1524,6 +1649,96 @@ func TestNewDialog_ToggleWorktree_AutoPopulatesBranch(t *testing.T) {
 	}
 	if !d.branchAutoSet {
 		t.Error("branchAutoSet should be true after auto-population")
+	}
+}
+
+func TestNewDialog_ToggleWorktree_SanitizesBranchFromName(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessionName string
+		wantBranch  string
+	}{
+		{"spaces", "my new feature", "feature/my-new-feature"},
+		{"colon and question mark", "fix: why?", "feature/fix-why"},
+		{"tabs and repeated spaces", "add\tretry  logic", "feature/add-retry-logic"},
+		{"already clean", "amber-falcon", "feature/amber-falcon"},
+		// The sanitizer alone leaves ".lock", "/x" and ".foo" here, which either
+		// the dialog's own validator or git itself would then reject.
+		{"sanitizes to a .lock suffix", "*.lock*", "feature/lock"},
+		{"sanitizes to a leading slash", "~/x", "feature/x"},
+		{"sanitizes to a leading dot", "*.foo", "feature/foo"},
+		// An interior component the sanitizer leaves invalid: git rejects
+		// "feature/a-/.b", so the prefill must be dropped rather than handed to
+		// `worktree add`.
+		{"interior dot-leading component", "a?/.b", ""},
+		{"interior empty component", "a//b", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewNewDialog()
+			d.nameInput.SetValue(tt.sessionName)
+
+			d.ToggleWorktree()
+
+			got := d.branchInput.Value()
+			if got != tt.wantBranch {
+				t.Errorf("branch = %q, want %q", got, tt.wantBranch)
+			}
+			// An empty want means the name yields nothing git would accept, so
+			// the field must be left empty and the refusal must be the dialog's
+			// own "branch required" rather than a late `worktree add` failure.
+			if tt.wantBranch == "" {
+				if msg := d.Validate(); msg != "Branch name required for worktree" {
+					t.Errorf("Validate() = %q, want the branch-required refusal", msg)
+				}
+				return
+			}
+			if err := git.ValidateBranchName(got); err != nil {
+				t.Errorf("prefilled branch %q is invalid: %v", got, err)
+			}
+			if msg := d.Validate(); msg != "" {
+				t.Errorf("dialog refused its own prefill: %s", msg)
+			}
+		})
+	}
+}
+
+// A name that sanitizes to nothing must not prefill a bare "feature/" that git
+// would reject.
+func TestNewDialog_ToggleWorktree_UnsanitizableName_NoBranch(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("***")
+
+	d.ToggleWorktree()
+
+	if got := d.branchInput.Value(); got != "" {
+		t.Errorf("branch = %q, want empty", got)
+	}
+	if msg := d.Validate(); msg != "Branch name required for worktree" {
+		t.Errorf("Validate() = %q, want the branch-required refusal", msg)
+	}
+}
+
+// Editing the name to something unsanitizable must clear the auto-derived
+// branch, not leave the one derived from the previous name. Otherwise submit
+// silently creates (or checks out) a branch belonging to unrelated work.
+func TestNewDialog_AutoBranch_NameEditedToUnsanitizable_ClearsStaleBranch(t *testing.T) {
+	d := NewNewDialog()
+	d.nameInput.SetValue("hi")
+	d.ToggleWorktree()
+
+	if got := d.branchInput.Value(); got != "feature/hi" {
+		t.Fatalf("setup: branch = %q, want %q", got, "feature/hi")
+	}
+
+	// Mirrors the name-input handler, which re-derives on every keystroke
+	// while branchAutoSet is true.
+	d.nameInput.SetValue("***")
+	d.autoBranchFromName()
+
+	if got := d.branchInput.Value(); got != "" {
+		t.Errorf("branch = %q, want empty; stale branch from the previous name was kept", got)
 	}
 }
 

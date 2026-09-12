@@ -121,6 +121,7 @@ func handleLaunch(profile string, args []string) {
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume")
 	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
+	account := fs.String("account", "", "Named account slot (uses its per-tool config_dir; overrides AGENTDECK_ACCOUNT)")
 
 	// Socket isolation (v1.7.50+, issue #687). Same semantics as
 	// `agent-deck add --tmux-socket`: overrides `[tmux].socket_name` for
@@ -157,6 +158,15 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println("  agent-deck launch . -c \"codex --dangerously-bypass-approvals-and-sandbox\"")
 		fmt.Println("  agent-deck launch . -g ard --no-parent -c claude -m \"Run review\"")
 		fmt.Println("  agent-deck launch . -c claude -w feature/new -b -m \"Start work\"")
+	}
+
+	// Reject an omitted --account value before either reordering pass can bind
+	// the following flag as the account name. Besides swallowing that flag, an
+	// unknown account silently falls through to another credential source, so
+	// this check must happen before any launch or fallback resolution begins.
+	if err := checkFlagValueNotFlag(fs, args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Reorder args: move path to end so flags are parsed correctly
@@ -196,6 +206,11 @@ func handleLaunch(profile string, args []string) {
 	sessionCommandTool, sessionCommandResolved, sessionWrapperResolved, sessionCommandNote, sessionCommandIsPassthrough, cmdErr := resolveSessionCommand(sessionCommandInput, *wrapper)
 	if cmdErr != nil {
 		out.Error(cmdErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	selectedAccount, accountErr := resolveCLIAccountSlot(*account, sessionCommandTool, sessionCommandResolved, sessionCommandIsPassthrough)
+	if accountErr != nil {
+		out.Error(accountErr.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 	sessionParent := mergeFlags(*parent, *parentShort)
@@ -360,7 +375,12 @@ func handleLaunch(profile string, args []string) {
 		}
 		sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided, inheritParentGroup)
 	} else if !*noParent {
-		parentInstance = resolveAutoParentInstance(instances)
+		var unresolvedParent string
+		parentInstance, unresolvedParent = resolveAutoParentInstanceChecked(instances)
+		if parentInstance == nil && unresolvedParent != "" {
+			out.Error(fmt.Sprintf("automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session", unresolvedParent), ErrCodeNotFound)
+			os.Exit(1)
+		}
 		if parentInstance != nil && !parentInstance.IsSubSession() {
 			sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided, inheritParentGroup)
 		} else {
@@ -432,6 +452,9 @@ func handleLaunch(profile string, args []string) {
 		}
 	}
 
+	// Preserve the slot validated before any worktree setup effects.
+	newInstance.Account = selectedAccount
+
 	if parentInstance != nil {
 		newInstance.SetParentWithPath(parentInstance.ID, parentInstance.ProjectPath)
 	}
@@ -461,6 +484,10 @@ func handleLaunch(profile string, args []string) {
 		newInstance.Tool = firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 		newInstance.Command = sessionCommandResolved
 		newInstance.SubcommandPassthrough = sessionCommandIsPassthrough
+	}
+	if err := newInstance.ValidateAccount(); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
 	}
 
 	// Apply --channel flags (claude only — channels is a Claude Code CLI flag).
@@ -640,7 +667,26 @@ func handleLaunch(profile string, args []string) {
 	throttle.Acquire()
 	defer throttle.Release()
 
-	if initialMessage != "" && !*noWait {
+	// PR #1942 review (P1a): refuse a message the target has no way to receive
+	// BEFORE spawning anything. The DeepSeek web profile serves a browser UI and
+	// has no terminal prompt, so the pane-send paths below would type the prompt
+	// into a server's stdin and report success. Every other tool returns nil.
+	if initialMessage != "" {
+		if err := newInstance.PromptDeliveryError(); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	}
+
+	// PR #1942 review (P1b): when the prompt rides the command line, --no-wait's
+	// "start now, send asynchronously" shape cannot work — the task IS the
+	// invocation, so a Start() without it launches something the tool rejects
+	// outright. Embed it instead. There is nothing to wait for in that case
+	// either: the process is already answering by the time it exists, so
+	// --no-wait loses nothing.
+	promptRidesArgv := initialMessage != "" && newInstance.PromptRidesCommandLine()
+
+	if initialMessage != "" && (!*noWait || promptRidesArgv) {
 		if err := newInstance.StartWithMessage(initialMessage); err != nil {
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
@@ -682,7 +728,7 @@ func handleLaunch(profile string, args []string) {
 	// sendWithRetryTarget pass, run verifyPromptConsumedAfterLaunch to catch
 	// the welcome-screen race where claude eats the first Enter. 10s budget
 	// per window + single retry + stderr warning on persistent no-op.
-	if initialMessage != "" && *noWait {
+	if initialMessage != "" && *noWait && !promptRidesArgv {
 		tmuxSess := newInstance.GetTmuxSession()
 		if tmuxSess != nil {
 			// #1777 provenance probe: a freshly launched session has an
@@ -698,6 +744,7 @@ func handleLaunch(profile string, args []string) {
 			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
 				maxRetries:                  8,
 				checkDelay:                  150 * time.Millisecond,
+				tool:                        newInstance.Tool,
 				composerPasteFreeBeforeSend: pasteFreeBeforeSend,
 			}); err != nil {
 				out.Error(fmt.Sprintf("failed to send initial message: %v", err), ErrCodeInvalidOperation)

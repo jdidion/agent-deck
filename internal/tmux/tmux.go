@@ -28,6 +28,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/platform"
+	"github.com/asheshgoplani/agent-deck/internal/shellwords"
 	dark "github.com/thiagokokada/dark-mode-go"
 )
 
@@ -44,11 +45,6 @@ var (
 // the default. See TestStartCommandSpec_FallsBackToDirect in
 // tmux_fallback_test.go for the contract.
 var execCommand = exec.Command
-
-// execCommandContext is the deadline-carrying counterpart to execCommand, kept
-// as its own seam so a bounded call site stays overridable by the same tests.
-// Use it for any tmux invocation that must terminate — see tmuxMutationTimeout.
-var execCommandContext = exec.CommandContext
 
 type tmuxThemeStyle struct {
 	windowStyle       string
@@ -173,6 +169,57 @@ func (s *Session) projectDisplayName() string {
 // ErrCaptureTimeout is returned when CapturePane exceeds its timeout.
 // Callers should preserve previous state rather than transitioning to error/inactive.
 var ErrCaptureTimeout = errors.New("capture-pane timed out")
+
+// ErrCaptureGone means a history capture failed because its target or server
+// disappeared. Best-effort response readers can return an empty response;
+// this sentinel does not change session status classification.
+var ErrCaptureGone = errors.New("capture-pane target is gone")
+
+// captureGoneMarkers are the lower-cased tmux stderr fragments that mean the
+// capture target no longer exists. Detection is deliberately conservative:
+// capture-pane exits non-zero for many reasons (bad flags, malformed target,
+// permissions), so only an explicit "absent" message counts as gone; any
+// unrecognized stderr surfaces as a real error. tmux wording varies across
+// versions, so the list covers the session/pane/window/server-absence phrasings
+// observed across tmux 2.x–3.x.
+var captureGoneMarkers = []string{
+	"can't find session",
+	"can't find pane",
+	"can't find window",
+	"can't find client",
+	"no such session",
+	"no server running",
+	"lost server",
+	"server exited unexpectedly",
+}
+
+// captureGoneFromErr reports whether a capture-pane failure was caused by the
+// target being gone, by matching tmux's stderr against captureGoneMarkers.
+// exec.Cmd.Output() populates (*exec.ExitError).Stderr, so the message is
+// available without a separate stderr pipe. Unrecognized stderr (or a
+// non-ExitError such as a context kill) returns false so real failures and
+// timeouts keep their existing handling.
+func captureGoneFromErr(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	stderr := strings.ToLower(strings.TrimSpace(string(exitErr.Stderr)))
+	// Connection errors also cover permissions and malformed sockets. Only an
+	// explicitly missing socket is benign; never match markers inside its path.
+	if strings.HasPrefix(stderr, "error connecting to ") {
+		return strings.HasSuffix(stderr, " (no such file or directory)")
+	}
+	if stderr == "" {
+		return false
+	}
+	for _, marker := range captureGoneMarkers {
+		if strings.Contains(stderr, marker) {
+			return true
+		}
+	}
+	return false
+}
 
 const SessionPrefix = "agentdeck_"
 
@@ -747,7 +794,7 @@ func SupportsHyperlinks() bool {
 }
 
 // Tool detection patterns (used by DetectTool for initial tool identification)
-var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "pi"}
+var toolDetectionOrder = []string{"claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "deepseek", "pi"}
 
 var toolDetectionPatterns = map[string][]*regexp.Regexp{
 	"claude": {
@@ -786,6 +833,20 @@ var toolDetectionPatterns = map[string][]*regexp.Regexp{
 		regexp.MustCompile(`(?i)\bhermes\s+agent\b`),
 		regexp.MustCompile(`(?i)\bnous\s*research\b`),
 	},
+	"deepseek": {
+		// DeepSeek Harness (`dsh`, npm @deepseek-ai/dsh). Captured live from
+		// 0.1.0-rc.6 in a sandboxed HOME:
+		//   web ready banner: "dsh web: http://127.0.0.1:39949"
+		//   launcher help:    "dsh: boot a DeepSeek Harness profile"
+		//   headless usage:   "Usage: dsh --profile headless [options] [task...]"
+		//   credential error: "dsh: MISSING_CREDENTIAL: llm-deepseek: ..."
+		// Every pattern anchors on the "dsh" prefix or the product name, so the
+		// bare word "deepseek" in a model name (a codex pane running a DeepSeek
+		// model, say) cannot claim the pane.
+		regexp.MustCompile(`(?i)\bdeepseek\s+harness\b`),
+		regexp.MustCompile(`(?mi)^dsh(\s+web)?:\s`),
+		regexp.MustCompile(`(?i)\bdsh\s+--profile\b`),
+	},
 	"pi": {
 		regexp.MustCompile(`(?mi)^\s*pi>\s*`),
 		regexp.MustCompile(`(?i)\bpi\s+cli\b`),
@@ -804,9 +865,9 @@ func detectToolFromCommand(command string) string {
 		return ""
 	}
 
-	fields := strings.Fields(cmdLower)
-	if len(fields) > 0 {
-		base := filepath.Base(fields[0])
+	fields, valid := shellwords.Split(cmdLower)
+	if valid {
+		base := shellwords.ExecutableBase(fields)
 		switch base {
 		case "claude":
 			return "claude"
@@ -827,6 +888,10 @@ func detectToolFromCommand(command string) string {
 			return "cursor"
 		case "hermes":
 			return "hermes"
+		case "dsh":
+			// DeepSeek Harness. The binary is `dsh`; the agent-deck tool is
+			// named for the vendor.
+			return "deepseek"
 		case "pi":
 			return "pi"
 		}
@@ -849,11 +914,62 @@ func detectToolFromCommand(command string) string {
 		return "cursor"
 	case strings.Contains(cmdLower, "hermes"):
 		return "hermes"
+	case isDeepSeekCommand(fields) ||
+		strings.Contains(cmdLower, "@deepseek-ai/dsh") ||
+		strings.Contains(cmdLower, "dsh --profile") ||
+		strings.Contains(cmdLower, "dsh web") ||
+		strings.Contains(cmdLower, "dsh plugin"):
+		// Deliberately NOT a bare Contains on "dsh": those three letters appear
+		// in "dshell", "dshboard", and any path containing them, and — unlike
+		// the permissive arms above — `grep dsh README.md` is an entirely
+		// ordinary thing to see in a pane. Detection therefore needs the token
+		// in COMMAND position (isDeepSeekCommand, which sees through the
+		// `DSH_HOME=… dsh` env prefix agent-deck itself emits), the documented
+		// npx spelling, or a dsh subcommand/launcher flag right after it.
+		return "deepseek"
 	case strings.Contains(cmdLower, " pi ") || strings.HasPrefix(cmdLower, "pi "):
 		return "pi"
 	default:
 		return ""
 	}
+}
+
+// isDeepSeekCommand reports whether the first COMMAND-position token of a
+// command line is the dsh binary. Leading `VAR=value` assignments are skipped:
+// agent-deck's own launch string is `DSH_HOME=… AGENTDECK_…=… dsh --profile …`,
+// so fields[0] is an assignment, not the program.
+//
+// This is the precise half of DeepSeek detection; the substring arms beside it
+// cover the npx spelling and subcommand forms.
+func isDeepSeekCommand(fields []string) bool {
+	for _, field := range fields {
+		if isShellAssignmentToken(field) {
+			continue
+		}
+		base := filepath.Base(strings.Trim(field, `"'`))
+		base = strings.TrimSuffix(strings.TrimSuffix(base, ".exe"), ".cmd")
+		return base == "dsh"
+	}
+	return false
+}
+
+// isShellAssignmentToken reports whether a token is a `NAME=value` environment
+// assignment rather than a program name.
+func isShellAssignmentToken(token string) bool {
+	idx := strings.IndexByte(token, '=')
+	if idx <= 0 {
+		return false
+	}
+	for i, r := range token[:idx] {
+		isAlpha := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_'
+		if i == 0 && !isAlpha {
+			return false
+		}
+		if i > 0 && !isAlpha && !(r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func detectToolFromContent(cleanContent string) string {
@@ -972,10 +1088,17 @@ type Session struct {
 	Name        string
 	DisplayName string
 	WorkDir     string
-	Command     string
-	Created     time.Time
-	InstanceID  string // Agent-deck instance ID for hook callbacks
-	startupAt   time.Time
+	// GroupPath is the agent-deck group/tree path this session belongs to
+	// (e.g. "projects/devops"). It feeds the @agentdeck_group_path tmux user
+	// option so a custom [display] title_format can render the group hierarchy
+	// in the outer terminal title. Empty when the session has no group. Kept in
+	// sync by the session layer (construction, reconnect, rename, regroup).
+	GroupPath    string
+	groupTitleMu sync.Mutex
+	Command      string
+	Created      time.Time
+	InstanceID   string // Agent-deck instance ID for hook callbacks
+	startupAt    time.Time
 
 	// WorkDirIsPlaceholder marks a session whose local WorkDir is not where the
 	// work happens — today that means an SSH session, whose pane only runs an
@@ -1342,7 +1465,10 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 			"--property=RestartSec=5s",
 			"--property=StartLimitBurst=10",
 			"--property=StartLimitIntervalSec=60",
-			"--property=KillMode=control-group",
+			// A tmux server is shared by every session on its socket. A
+			// per-session unit must never kill that shared server (and its
+			// sibling panes) when the unit is stopped.
+			"--property=KillMode=none",
 			"--property=TimeoutStopSec=15s",
 			"tmux",
 		}
@@ -1350,10 +1476,13 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		return "systemd-run", svcArgs
 
 	case launchModeScope:
-		// Legacy PR #467 shape — unchanged so existing users opting out
-		// of service mode with launch_as="scope" get identical semantics.
+		// The scope remains the SSH/logout-isolation compatibility path, but
+		// its cgroup can host the shared tmux server. KillMode=none prevents
+		// stopping this per-session scope from taking that server (and all
+		// sibling sessions) with it.
 		scopeArgs := []string{
-			"--user", "--scope", "--quiet", "--collect", "--unit", unitBase, "tmux",
+			"--user", "--scope", "--quiet", "--collect", "--unit", unitBase,
+			"--property=KillMode=none", "tmux",
 		}
 		scopeArgs = append(scopeArgs, tmuxArgs...)
 		return "systemd-run", scopeArgs
@@ -1369,7 +1498,11 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 // falling all the way back to direct tmux.
 func buildScopeArgsFromTmuxArgs(sessionName string, tmuxArgs []string) []string {
 	unitBase := serviceUnitBase(sessionName)
-	scopeArgs := []string{"--user", "--scope", "--quiet", "--collect", "--unit", unitBase, "tmux"}
+	// Keep the service → scope fallback just as safe as an explicitly
+	// selected scope. Otherwise a transient service failure would silently
+	// reintroduce a per-session cgroup that can kill a shared server.
+	scopeArgs := []string{"--user", "--scope", "--quiet", "--collect", "--unit", unitBase,
+		"--property=KillMode=none", "tmux"}
 	return append(scopeArgs, tmuxArgs...)
 }
 
@@ -2124,11 +2257,17 @@ func isSocketAcceptingConnections(socketPath string) bool {
 // them unconditionally on every spawn overrode a deliberate
 // `set -s extended-keys off` in the user's ~/.tmux.conf server-wide, which on
 // some terminals (e.g. Windows Terminal + WSL2) stops Enter from submitting in
-// the pane. terminal-features uses -a (append), so re-emitting it every spawn
-// also grew that server-wide option unbounded. Gating each key through
-// OptionOverrides lets config.toml [tmux] options — and by extension the user's
-// own tmux config — take effect instead of being silently clobbered.
-func gatedTmuxKeyOptionArgs(name string, overrides map[string]string) []string {
+// the pane. Gating each key through OptionOverrides lets config.toml [tmux]
+// options — and by extension the user's own tmux config — take effect instead of
+// being silently clobbered.
+//
+// terminal-features is a server-wide ARRAY, so it gets its own treatment: the
+// `-a` (append) form grew it by one item on every pass and never shrank
+// (#2061). terminalFeatures performs guarded cleanup and verified no-overwrite
+// insertion, subject to the collision limits documented in terminal_features.go.
+// It can read and mutate server options, so the override gate must come first.
+// A nil func emits nothing.
+func gatedTmuxKeyOptionArgs(name string, overrides map[string]string, terminalFeatures func()) []string {
 	args := make([]string, 0, 20)
 	if _, ok := overrides["escape-time"]; !ok {
 		args = append(args, ";", "set-option", "-t", name, "escape-time", "10")
@@ -2143,8 +2282,8 @@ func gatedTmuxKeyOptionArgs(name string, overrides map[string]string) []string {
 		// otherwise Shift+Enter collapses to a bare Enter and submits.
 		args = append(args, ";", "set", "-sq", "extended-keys-format", "csi-u")
 	}
-	if _, ok := overrides["terminal-features"]; !ok {
-		args = append(args, ";", "set", "-asq", "terminal-features", ",*:hyperlinks:extkeys")
+	if _, ok := overrides["terminal-features"]; !ok && terminalFeatures != nil {
+		terminalFeatures()
 	}
 	return args
 }
@@ -2377,7 +2516,7 @@ func (s *Session) Start(command string) error {
 		"set-option", "-t", s.Name, "set-clipboard", "on")
 	// #1625: the key-handling defaults are gated through OptionOverrides so an
 	// explicit user tmux setting wins (see gatedTmuxKeyOptionArgs).
-	startArgs = append(startArgs, gatedTmuxKeyOptionArgs(s.Name, s.OptionOverrides)...)
+	startArgs = append(startArgs, gatedTmuxKeyOptionArgs(s.Name, s.OptionOverrides, s.configureTerminalFeatures)...)
 	// Multi-client size negotiation. Web's xterm.js connects via a tmux -C
 	// control client (controlpipe.go) at the same time as native `tmux attach`
 	// clients (Ghostty, iTerm). Default `window-size latest` makes the window
@@ -2936,6 +3075,38 @@ func SetHideCwdPrefixInTitle(hide bool) {
 	hideCwdPrefixInTitle.Store(hide)
 }
 
+// titleFormat, when non-empty, overrides the default set-titles-string with a
+// user-supplied template (config [display] title_format). It takes precedence
+// over hideCwdPrefixInTitle. Set once at startup from SetTitleFormat.
+var titleFormat atomic.Value // holds string
+
+// titleFormatReplacer translates the user-facing title template placeholders
+// into tmux format references to the @agentdeck_* user options. Using tmux
+// references (rather than baking literal values) means tmux re-renders the
+// title live whenever an option changes — e.g. on rename or regroup.
+var titleFormatReplacer = strings.NewReplacer(
+	"{group}", "#{@agentdeck_group_path}",
+	"{project}", "#{@agentdeck_project_name}",
+	"{name}", "#{@agentdeck_display_name}",
+)
+
+// SetTitleFormat configures a custom terminal title template. Supported
+// placeholders: {group}, {project}, {name}. An empty string (the default)
+// preserves the historical "[<project>] <name>" format and the
+// include_cwd_prefix toggle. Safe to call concurrently; intended to run once at
+// startup from [display] title_format via SetTitleFormat.
+func SetTitleFormat(format string) {
+	titleFormat.Store(format)
+}
+
+// getTitleFormat returns the configured custom title template, or "" if unset.
+func getTitleFormat() string {
+	if v := titleFormat.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
+}
+
 // buildTerminalTitleArgs returns the tmux command args for configuring the outer
 // terminal title shown by clients such as iTerm2. Session metadata user options
 // are always refreshed so custom title formats can reuse them.
@@ -2948,13 +3119,16 @@ func (s *Session) buildTerminalTitleArgs() []string {
 	defaults := []option{
 		{"@agentdeck_project_name", s.projectDisplayName()},
 		{"@agentdeck_display_name", s.DisplayName},
+		{"@agentdeck_group_path", s.GetGroupPath()},
 	}
 	if _, overridden := s.OptionOverrides["set-titles"]; !overridden {
 		defaults = append(defaults, option{key: "set-titles", value: "on"})
 	}
 	if _, overridden := s.OptionOverrides["set-titles-string"]; !overridden {
 		titleStr := "[#{@agentdeck_project_name}] #{@agentdeck_display_name}"
-		if hideCwdPrefixInTitle.Load() {
+		if custom := getTitleFormat(); custom != "" {
+			titleStr = titleFormatReplacer.Replace(custom)
+		} else if hideCwdPrefixInTitle.Load() {
 			titleStr = "#{@agentdeck_display_name}"
 		}
 		defaults = append(defaults, option{key: "set-titles-string", value: titleStr})
@@ -2977,7 +3151,27 @@ func (s *Session) ConfigureTerminalTitle() {
 	if len(args) == 0 {
 		return
 	}
-	_ = s.tmuxCmd(args...).Run()
+	_ = s.runBoundedRun(args...)
+}
+
+// GetGroupPath and SetGroupPath synchronize the cached title metadata without
+// contending with the tmux status/capture lock.
+func (s *Session) GetGroupPath() string {
+	s.groupTitleMu.Lock()
+	defer s.groupTitleMu.Unlock()
+	return s.GroupPath
+}
+
+func (s *Session) SetGroupPath(path string) {
+	s.groupTitleMu.Lock()
+	s.GroupPath = path
+	s.groupTitleMu.Unlock()
+}
+
+// SetGroupTitleMetadata refreshes only the committed group option. It leaves
+// per-session title formats and other user overrides intact.
+func (s *Session) SetGroupTitleMetadata(groupPath string) error {
+	return s.runBoundedRun("set-option", "-t", s.Name, "@agentdeck_group_path", groupPath)
 }
 
 // ConfigureStatusBar sets up the tmux status bar with session info.
@@ -3044,7 +3238,7 @@ func (s *Session) EnableMouseMode() error {
 	}
 	// #1625: gate the key-handling defaults through OptionOverrides so an explicit
 	// user tmux setting wins (mirrors Start; see gatedTmuxKeyOptionArgs).
-	enhanceArgs = append(enhanceArgs, gatedTmuxKeyOptionArgs(s.Name, s.OptionOverrides)...)
+	enhanceArgs = append(enhanceArgs, gatedTmuxKeyOptionArgs(s.Name, s.OptionOverrides, s.configureTerminalFeatures)...)
 	enhanceCmd := s.tmuxCmd(enhanceArgs...)
 	// Ignore errors - all these are non-fatal enhancements
 	// Older tmux versions may not support some options
@@ -3618,6 +3812,9 @@ func (s *Session) CaptureFullHistory() (string, error) {
 	// concurrent `capture-pane -S -2000` clients, each spinning >20 minutes.
 	output, err := s.runBoundedOutput("capture-pane", "-t", s.Name, "-p", "-e", "-S", "-2000")
 	if err != nil {
+		if captureGoneFromErr(err) {
+			return "", ErrCaptureGone
+		}
 		return "", fmt.Errorf("failed to capture history: %w", err)
 	}
 	return string(output), nil
@@ -3643,6 +3840,9 @@ func (s *Session) CaptureHistoryLines(n int) (string, error) {
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return "", ErrCaptureTimeout
+		}
+		if captureGoneFromErr(err) {
+			return "", ErrCaptureGone
 		}
 		return "", fmt.Errorf("failed to capture history: %w", err)
 	}
@@ -5933,6 +6133,22 @@ func (s *Session) SplitShellPane(workdir string) error {
 		shell = "/bin/sh"
 	}
 	args := []string{"split-window", "-h", "-t", s.Name}
+	if workdir != "" {
+		args = append(args, "-c", workdir)
+	}
+	args = append(args, shell)
+	return tmuxExec(s.SocketName, args...).Run()
+}
+
+// NewShellWindow adds a new window (tab) to this session running shell in
+// workdir, instead of splitting the current window. If workdir is empty the
+// window inherits the session's current working directory.
+func (s *Session) NewShellWindow(workdir string) error {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	args := []string{"new-window", "-t", s.Name}
 	if workdir != "" {
 		args = append(args, "-c", workdir)
 	}

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -21,11 +23,17 @@ const (
 	ConfirmInstallHooks
 	ConfirmDeleteRemoteSession
 	ConfirmCloseRemoteSession
+	ConfirmArchiveRemoteSession
+	ConfirmUnarchiveRemoteSession
 	ConfirmRemoveSession     // status-gated registry-only remove (TUI 'X')
 	ConfirmBulkRemoveErrored // bulk remove of all errored sessions (TUI Ctrl+X)
 	ConfirmArchiveSession
 	ConfirmUnarchiveSession
 	ConfirmNotice // acknowledge-only message (single OK button), e.g. protected-action blocks
+	ConfirmInstallHermesHooks
+	ConfirmDeleteRemoteGroup // delete a group on a remote deck (TUI 'd' on a remote group header)
+	ConfirmUpdateRemote      // push this controller's release to an older remote (TUI 'u' on its header, #2164)
+	ConfirmCrossHarnessTransfer
 )
 
 // ConfirmDialog handles confirmation for destructive actions
@@ -39,8 +47,15 @@ type ConfirmDialog struct {
 	mcpCount    int  // Number of running MCPs (for quit confirmation)
 	sandboxed   bool // Whether the session uses a Docker sandbox.
 	worktree    bool // Whether the session has an associated git worktree.
+	hookEvents  []string
 
 	remoteName string // Remote name for remote session confirmations.
+
+	// Cross-harness transfer carries the explicit target selected in the edit
+	// dialog. The source remains in targetID and is not rewritten on confirm.
+	targetHarness  string
+	targetAccount  string
+	sourceSnapshot crossHarnessConfirmationSource
 
 	// Notice (ConfirmNotice) carries an acknowledge-only title/body.
 	noticeTitle string
@@ -61,6 +76,7 @@ type ConfirmDialog struct {
 	pendingToolOptionsJSON   json.RawMessage // Generic tool options (claude, codex, etc.)
 	pendingClaudeExtraArgs   []string        // User-supplied claude CLI tokens
 	pendingClaudeStartQuery  string          // Per-session claude startup query (v1.7.67, #725)
+	pendingClaudeAccount     string          // Per-session named account slot (#924)
 	pendingLaunchModelID     string          // Optional per-session model/version override.
 	pendingParentSessionID   string
 	pendingParentProjectPath string
@@ -125,10 +141,59 @@ func (c *ConfirmDialog) ShowDeleteRemoteSession(remoteName, sessionID, sessionNa
 	c.focusedButton = 1
 }
 
+// ShowDeleteRemoteGroup shows the delete confirmation for one of a remote's
+// own groups. targetID carries the remote-relative group path the remote's
+// `group delete` expects.
+func (c *ConfirmDialog) ShowDeleteRemoteGroup(remoteName, groupPath, groupName string) {
+	c.visible = true
+	c.confirmType = ConfirmDeleteRemoteGroup
+	c.targetID = groupPath
+	c.targetName = groupName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowUpdateRemote asks before deploying this controller's release (to) onto a
+// remote that reported an older one (from). targetID carries the target
+// version and targetName the current one.
+func (c *ConfirmDialog) ShowUpdateRemote(remoteName, from, to string) {
+	c.visible = true
+	c.confirmType = ConfirmUpdateRemote
+	c.targetID = to
+	c.targetName = from
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
 // ShowCloseRemoteSession shows confirmation for closing a remote session.
 func (c *ConfirmDialog) ShowCloseRemoteSession(remoteName, sessionID, sessionName string) {
 	c.visible = true
 	c.confirmType = ConfirmCloseRemoteSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowArchiveRemoteSession shows the archive confirmation for a remote session.
+// Same wording and keys as the local archive dialog, plus the remote name.
+func (c *ConfirmDialog) ShowArchiveRemoteSession(remoteName, sessionID, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmArchiveRemoteSession
+	c.targetID = sessionID
+	c.targetName = sessionName
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// ShowUnarchiveRemoteSession shows the unarchive confirmation for a remote session.
+func (c *ConfirmDialog) ShowUnarchiveRemoteSession(remoteName, sessionID, sessionName string) {
+	c.visible = true
+	c.confirmType = ConfirmUnarchiveRemoteSession
 	c.targetID = sessionID
 	c.targetName = sessionName
 	c.remoteName = remoteName
@@ -176,6 +241,65 @@ func (c *ConfirmDialog) ShowDeleteGroup(groupPath, groupName string) {
 // final viewport clamp can truncate when the panel fills the height), this dialog
 // replaces the whole view while visible, so the message is always seen. Dismissed
 // with Enter/Esc/o.
+// crossHarnessConfirmationSource is the complete mutable source identity
+// which participates in a transfer. It is captured before the disclosure is
+// shown, so accepting the modal cannot silently transfer a later incarnation.
+type crossHarnessConfirmationSource struct {
+	id, tool, account, project, title, group, command string
+	status                                            session.Status
+	claudeID, codexID, workingDir                     string
+	lastStartedAt                                     time.Time
+}
+
+func snapshotCrossHarnessConfirmationSource(inst *session.Instance) crossHarnessConfirmationSource {
+	if inst == nil {
+		return crossHarnessConfirmationSource{}
+	}
+	return crossHarnessConfirmationSource{
+		id: inst.ID, tool: inst.Tool, account: inst.Account, project: inst.ProjectPath,
+		title: inst.Title, group: inst.GroupPath, command: inst.Command, status: inst.Status,
+		claudeID: inst.ClaudeSessionID, codexID: inst.CodexSessionID,
+		workingDir: inst.EffectiveWorkingDir(), lastStartedAt: inst.LastStartedAt,
+	}
+}
+
+func (s crossHarnessConfirmationSource) matches(inst *session.Instance) bool {
+	return inst != nil && s.id == inst.ID && s.tool == inst.Tool && s.account == inst.Account &&
+		s.project == inst.ProjectPath && s.title == inst.Title && s.group == inst.GroupPath &&
+		s.command == inst.Command && s.status == inst.Status && s.claudeID == inst.ClaudeSessionID &&
+		s.codexID == inst.CodexSessionID && s.workingDir == inst.EffectiveWorkingDir() &&
+		s.lastStartedAt.Equal(inst.LastStartedAt)
+}
+
+func displayConfirmAccount(account string) string {
+	if strings.TrimSpace(account) == "" {
+		return "default"
+	}
+	return account
+}
+
+// ShowCrossHarnessTransfer presents the lossy-context disclosure before a
+// fresh target can be created. Cancel is the default safe choice.
+func (c *ConfirmDialog) ShowCrossHarnessTransfer(source *session.Instance, harness, account string, losses []string) {
+	c.visible = true
+	c.confirmType = ConfirmCrossHarnessTransfer
+	c.sourceSnapshot = snapshotCrossHarnessConfirmationSource(source)
+	c.targetID, c.targetName = c.sourceSnapshot.id, c.sourceSnapshot.title
+	c.targetHarness, c.targetAccount = harness, account
+	c.noticeBody = strings.Join(losses, "\n• ")
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
+// CrossHarnessSourceMatches validates the modal-time snapshot at acceptance,
+// before the asynchronous switch captures its own execution-time snapshot.
+func (c *ConfirmDialog) CrossHarnessSourceMatches(inst *session.Instance) bool {
+	return c.sourceSnapshot.matches(inst)
+}
+
+func (c *ConfirmDialog) TargetHarness() string { return c.targetHarness }
+func (c *ConfirmDialog) TargetAccount() string { return c.targetAccount }
+
 func (c *ConfirmDialog) ShowNotice(title, body string) {
 	c.visible = true
 	c.confirmType = ConfirmNotice
@@ -207,6 +331,7 @@ func (c *ConfirmDialog) ShowCreateDirectory(
 	toolOptionsJSON json.RawMessage,
 	claudeExtraArgs []string,
 	claudeStartQuery string,
+	claudeAccount string,
 	launchModelID string,
 	parentSessionID string,
 	parentProjectPath string,
@@ -222,6 +347,7 @@ func (c *ConfirmDialog) ShowCreateDirectory(
 	c.pendingToolOptionsJSON = toolOptionsJSON
 	c.pendingClaudeExtraArgs = claudeExtraArgs
 	c.pendingClaudeStartQuery = claudeStartQuery
+	c.pendingClaudeAccount = claudeAccount
 	c.pendingLaunchModelID = launchModelID
 	c.pendingParentSessionID = parentSessionID
 	c.pendingParentProjectPath = parentProjectPath
@@ -239,9 +365,33 @@ func (c *ConfirmDialog) ShowInstallHooks() {
 	c.focusedButton = 1
 }
 
+// ShowInstallHermesHooks shows the Hermes-specific hook consent boundary.
+func (c *ConfirmDialog) ShowInstallHermesHooks(configPath string, events []string) {
+	c.visible = true
+	c.confirmType = ConfirmInstallHermesHooks
+	c.targetID = configPath
+	c.targetName = ""
+	c.hookEvents = append(c.hookEvents[:0], events...)
+	c.buttonCount = 2
+	c.focusedButton = 1
+}
+
 // GetPendingSession returns the pending session creation data
-func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath string, toolOptionsJSON json.RawMessage, claudeExtraArgs []string, claudeStartQuery, launchModelID string, parentSessionID, parentProjectPath string) {
-	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingClaudeExtraArgs, c.pendingClaudeStartQuery, c.pendingLaunchModelID, c.pendingParentSessionID, c.pendingParentProjectPath
+func (c *ConfirmDialog) GetPendingSession() (name, path, command, groupPath string, toolOptionsJSON json.RawMessage, claudeExtraArgs []string, claudeStartQuery, claudeAccount, launchModelID string, parentSessionID, parentProjectPath string) {
+	return c.pendingSessionName, c.pendingSessionPath, c.pendingSessionCommand, c.pendingSessionGroupPath, c.pendingToolOptionsJSON, c.pendingClaudeExtraArgs, c.pendingClaudeStartQuery, c.pendingClaudeAccount, c.pendingLaunchModelID, c.pendingParentSessionID, c.pendingParentProjectPath
+}
+
+// ShowCreateRemoteDirectory asks whether to create a directory the remote
+// reported missing (see session.IsRemotePathMissing) and retry the create
+// there with --create-dir. The pending dialog values stay on Home.
+func (c *ConfirmDialog) ShowCreateRemoteDirectory(remoteName, path string) {
+	c.visible = true
+	c.confirmType = ConfirmCreateDirectory
+	c.targetID = path
+	c.targetName = path
+	c.remoteName = remoteName
+	c.buttonCount = 2
+	c.focusedButton = 1
 }
 
 // Hide hides the dialog.
@@ -253,6 +403,7 @@ func (c *ConfirmDialog) Hide() {
 	c.remoteName = ""
 	c.noticeTitle = ""
 	c.noticeBody = ""
+	c.hookEvents = nil
 }
 
 // IsVisible returns whether the dialog is visible
@@ -355,10 +506,15 @@ func (c *ConfirmDialog) View() string {
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
 
-	case ConfirmArchiveSession:
+	case ConfirmArchiveSession, ConfirmArchiveRemoteSession:
 		title = "Archive Session?"
 		warning = fmt.Sprintf("Archive this session:\n\n  \"%s\"", c.targetName)
 		details = "• The tmux process will be stopped\n• The session will move to the archived list\n• You can unarchive later (^ view, Shift+U restore)"
+		if c.confirmType == ConfirmArchiveRemoteSession {
+			title = "Archive Remote Session?"
+			warning = fmt.Sprintf("Archive this session:\n\n  \"%s\" on %s", c.targetName, c.remoteName)
+			details = "• The remote tmux process will be stopped\n• The session will move to the remote's archived list\n• You can unarchive later (^ view, Shift+U restore)"
+		}
 		borderColor = ColorYellow
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
 			renderButton("Archive", ColorYellow, c.focusedButton == 0), "  ",
@@ -366,9 +522,13 @@ func (c *ConfirmDialog) View() string {
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y archive · n cancel · ←/→ navigate · Enter select · Esc"))
 
-	case ConfirmUnarchiveSession:
+	case ConfirmUnarchiveSession, ConfirmUnarchiveRemoteSession:
 		title = "Unarchive Session?"
 		warning = fmt.Sprintf("Restore this session to the active list:\n\n  \"%s\"", c.targetName)
+		if c.confirmType == ConfirmUnarchiveRemoteSession {
+			title = "Unarchive Remote Session?"
+			warning = fmt.Sprintf("Restore this session to the active list:\n\n  \"%s\" on %s", c.targetName, c.remoteName)
+		}
 		details = "• Metadata returns to the main session list\n• The process is not started automatically"
 		borderColor = ColorGreen
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
@@ -401,6 +561,27 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+
+	case ConfirmDeleteRemoteGroup:
+		title = "⚠  Delete Remote Group?"
+		warning = fmt.Sprintf("This will delete the group on the remote:\n\n  \"%s\" on %s", c.targetID, c.remoteName)
+		details = "• Only an empty group is deleted\n• A group that still holds sessions is refused by the\n  remote; move them out first (M)"
+		borderColor = ColorRed
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Delete", ColorRed, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y delete · n cancel · ←/→ navigate · Enter select · Esc"))
+	case ConfirmUpdateRemote:
+		title = "Update Remote?"
+		warning = fmt.Sprintf("Update remote %s from v%s to v%s?", c.remoteName, c.targetName, c.targetID)
+		details = "• The release archive is checksum-verified before deploy\n• The remote is re-checked afterwards; a failure leaves its current binary\n• Running sessions on the remote keep running"
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Update", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y update · n cancel · ←/→ navigate · Enter select · Esc"))
 
 	case ConfirmCloseRemoteSession:
 		title = "Close Remote Session?"
@@ -460,6 +641,9 @@ func (c *ConfirmDialog) View() string {
 	case ConfirmCreateDirectory:
 		title = "📁  Directory Not Found"
 		warning = fmt.Sprintf("The path does not exist:\n\n  %s", c.targetName)
+		if c.remoteName != "" {
+			warning = fmt.Sprintf("The path does not exist on remote %s:\n\n  %s", c.remoteName, c.targetName)
+		}
 		details = "Create this directory and start the session?"
 		borderColor = ColorAccent
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
@@ -467,6 +651,17 @@ func (c *ConfirmDialog) View() string {
 			renderButton("Cancel", ColorRed, c.focusedButton == 1))
 		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
 			hintStyle.Render("y create · n cancel · ←/→ navigate · Enter select · Esc"))
+
+	case ConfirmCrossHarnessTransfer:
+		title = "Transfer Context to Fresh Target?"
+		warning = fmt.Sprintf("%s → NEW %s target (account %s).\n\nThe original source session is kept unchanged.", c.sourceSnapshot.tool, c.targetHarness, displayConfirmAccount(c.targetAccount))
+		details = "Not transferred:\n• " + c.noticeBody + "\n\nTarget readiness is pending until a target-native identity and ready event are observed."
+		borderColor = ColorYellow
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Transfer", ColorYellow, c.focusedButton == 0), "  ",
+			renderButton("Cancel", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y transfer · n cancel · ←/→ navigate · Enter select · Esc"))
 
 	case ConfirmNotice:
 		title = c.noticeTitle
@@ -480,6 +675,17 @@ func (c *ConfirmDialog) View() string {
 		title = "Claude Code Hooks"
 		warning = "Agent-deck can install Claude Code lifecycle hooks\nfor real-time status detection (instant green/yellow/gray)."
 		details = "This writes to your Claude settings.json (preserves existing settings).\nNew/restarted sessions will use hooks; existing sessions continue unchanged.\nYou can disable later with: hooks_enabled = false in config.toml"
+		borderColor = ColorAccent
+		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
+			renderButton("Install", ColorGreen, c.focusedButton == 0), "  ",
+			renderButton("Skip", ColorAccent, c.focusedButton == 1))
+		buttons = lipgloss.JoinVertical(lipgloss.Left, buttonRow,
+			hintStyle.Render("y install · n skip · ←/→ navigate · Enter select · Esc"))
+
+	case ConfirmInstallHermesHooks:
+		title = "Hermes Agent Hooks"
+		warning = "Agent-deck can install Hermes lifecycle hooks\nfor real-time status detection (instant green/yellow/gray)."
+		details = fmt.Sprintf("Config: %s\nCommand: agent-deck hook-handler\nEvents: %s\nHermes runs this command with your user permissions and sends each event as JSON on stdin.\nExisting settings and hooks are preserved.", c.targetID, strings.Join(c.hookEvents, ", "))
 		borderColor = ColorAccent
 		buttonRow := lipgloss.JoinHorizontal(lipgloss.Center,
 			renderButton("Install", ColorGreen, c.focusedButton == 0), "  ",

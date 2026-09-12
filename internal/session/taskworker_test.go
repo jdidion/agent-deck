@@ -70,16 +70,11 @@ func addParentRow(t *testing.T, profile, parentID, childID string) {
 		Status:      StatusIdle,
 		CreatedAt:   time.Now(),
 	}
-	child := &Instance{
-		ID:              childID,
-		Title:           "worker",
-		ProjectPath:     "/tmp/c1214",
-		GroupPath:       DefaultGroupPath,
-		ParentSessionID: parentID,
-		Tool:            "claude",
-		Status:          StatusWaiting,
-		CreatedAt:       time.Now(),
+	children, err := storage.Load()
+	if err != nil || len(children) != 1 || children[0].ID != childID {
+		t.Fatalf("load existing child: instances=%v err=%v", children, err)
 	}
+	child := children[0]
 	if err := storage.SaveWithGroups([]*Instance{parent, child}, nil); err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -227,6 +222,118 @@ func TestTaskWorker_ReplayUnacked_DeliversOncePerChildAcrossRestart(t *testing.T
 	d.notifier.Flush()
 	if got := readInboxLines(t, parentID); len(got) != 1 {
 		t.Fatalf("no-double-wake: inbox has %d records after re-replay, want 1", len(got))
+	}
+}
+
+func TestTaskWorker_UnownedDiscoveryCopyDoesNotAckCompletion(t *testing.T) {
+	profile := "_test-2007-unowned-not-ack"
+	parentID := "parent-missing-2007"
+	childID := seedChildOnly(t, profile, parentID)
+	if err := WriteCompletionRecord(CompletionRecord{
+		ChildID: childID, Profile: profile, Title: "worker", Status: "ok",
+		Summary: "discoverable but not delivered", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewTransitionDaemon()
+	t.Cleanup(d.notifier.Close)
+	d.ReplayUnackedCompletions(profile)
+	d.notifier.Flush()
+
+	recs, err := LoadCompletionRecords(profile)
+	if err != nil || len(recs) != 1 || recs[0].Acked {
+		t.Fatalf("discovery copy acknowledged replay record: records=%+v err=%v", recs, err)
+	}
+	unowned, err := ReadAndTruncateInbox(UnownedInboxID)
+	if err != nil || len(unowned) != 1 || unowned[0].ChildSessionID != childID {
+		t.Fatalf("missing discovery copy: events=%+v err=%v", unowned, err)
+	}
+}
+
+func TestTaskWorker_ReplayUnacked_MissingParentKeepsOneFlatUnownedRecord(t *testing.T) {
+	profile := "_test-2007-unowned-retry-stable"
+	parentID := "parent-missing-2007-retry-stable"
+	childID := seedChildOnly(t, profile, parentID)
+	if err := WriteCompletionRecord(CompletionRecord{
+		ChildID: childID, Profile: profile, Title: "worker", Status: "ok",
+		Summary: "stuck completion must park once", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewTransitionDaemon()
+	t.Cleanup(d.notifier.Close)
+	var firstSize int64
+	for attempt := 0; attempt < 16; attempt++ {
+		d.ReplayUnackedCompletions(profile)
+		d.notifier.Flush()
+
+		info, err := os.Stat(InboxPathFor(UnownedInboxID))
+		if err != nil {
+			t.Fatalf("attempt %d: stat _unowned: %v", attempt+1, err)
+		}
+		if attempt == 0 {
+			firstSize = info.Size()
+		} else if info.Size() != firstSize {
+			t.Fatalf("attempt %d grew _unowned from %d to %d bytes", attempt+1, firstSize, info.Size())
+		}
+	}
+
+	unowned := readInboxLines(t, UnownedInboxID)
+	if len(unowned) != 1 || unowned[0].ChildSessionID != childID {
+		t.Fatalf("retries parked %d records, want exactly one for %q: %+v", len(unowned), childID, unowned)
+	}
+}
+
+func TestTaskWorker_ReplayUnacked_CrossRestartDeadLetterAndMissedStayFlat(t *testing.T) {
+	profile := "_test-2007-cross-restart-terminal-dedup"
+	parentID := "parent-missing-2007-cross-restart"
+	childID := seedChildOnly(t, profile, parentID)
+	if err := WriteCompletionRecord(CompletionRecord{
+		ChildID: childID, Profile: profile, Title: "worker", Status: "ok",
+		Summary: "same parked completion across processes", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	replayFreshDaemon := func() {
+		d := NewTransitionDaemon()
+		d.ReplayUnackedCompletions(profile)
+		d.notifier.Flush()
+		d.notifier.Close()
+	}
+	replayFreshDaemon()
+
+	deadPath := DeadLetterPathFor(childID)
+	missedPath := transitionNotifierMissedPath()
+	firstDead, err := os.Stat(deadPath)
+	if err != nil {
+		t.Fatalf("first process did not persist dead-letter: %v", err)
+	}
+	firstMissed, err := os.Stat(missedPath)
+	if err != nil {
+		t.Fatalf("first process did not persist missed log: %v", err)
+	}
+
+	// A new daemon has empty process-local terminalSeen/missedSeen maps. The
+	// durable dead-letter fingerprint must nevertheless suppress both appends.
+	replayFreshDaemon()
+	secondDead, err := os.Stat(deadPath)
+	if err != nil {
+		t.Fatalf("second process lost dead-letter: %v", err)
+	}
+	secondMissed, err := os.Stat(missedPath)
+	if err != nil {
+		t.Fatalf("second process lost missed log: %v", err)
+	}
+	if secondDead.Size() != firstDead.Size() || secondMissed.Size() != firstMissed.Size() {
+		t.Fatalf("cross-restart replay grew durable files: dead %d->%d, missed %d->%d",
+			firstDead.Size(), secondDead.Size(), firstMissed.Size(), secondMissed.Size())
+	}
+	recs, err := ReadDeadLetter(childID)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("cross-restart dead-letter records=%d, want 1 (err=%v)", len(recs), err)
 	}
 }
 

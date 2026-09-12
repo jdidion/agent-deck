@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/shellwords"
 )
 
 // Registry is the unified, in-memory view of every tool agent-deck knows about:
@@ -154,10 +155,21 @@ func (r *Registry) runInstalledProbe() {
 		// Built-in probe uses the bare tool name, except Cursor: honor an
 		// explicit [cursor].command override, otherwise accept either stock
 		// entrypoint (`agent` or `cursor`).
+		//
+		// DeepSeek is the same shape of exception, twice over. The tool is named
+		// for the vendor and the binary it launches is `dsh`, so probing the
+		// bare name would hide it on a host that has it — and `dsh` is ALSO a
+		// long-standing Debian/Ubuntu command ("dancer's shell", a distributed
+		// shell), so merely finding one on PATH is not evidence of DeepSeek
+		// Harness. DeepSeekInstalled resolves the configured command and, for
+		// the bare default name, confirms the binary identifies itself.
 		ok := false
-		if name == "cursor" {
+		switch name {
+		case "cursor":
 			ok = cursorCommandInstalled()
-		} else {
+		case "deepseek":
+			ok = DeepSeekInstalled(GetToolCommand("deepseek"))
+		default:
 			ok = probeInstalled(name)
 		}
 		r.installed[name] = ok
@@ -229,7 +241,11 @@ func (r *Registry) Match(cmd string) string {
 	}
 
 	lower := strings.ToLower(cmd)
-	fields := strings.Fields(lower)
+	fields, valid := shellwords.Split(lower)
+	exe := ""
+	if valid {
+		exe = shellwords.ExecutableBase(fields)
+	}
 	for _, name := range r.order {
 		bt := r.builtins[name]
 		for _, sub := range bt.detectSubstrings {
@@ -237,8 +253,13 @@ func (r *Registry) Match(cmd string) string {
 				return name
 			}
 		}
+		// Token match: every field is compared whole, and the executable field
+		// is additionally compared by basename so "/usr/local/bin/dsh" and
+		// "./pi" match like the bare command (#2024). Only the executable
+		// position gets basename treatment — argument paths such as
+		// "copilot --cwd /home/pi" must not flip detection.
 		for _, tok := range bt.detectTokens {
-			if slices.Contains(fields, tok) {
+			if slices.Contains(fields, tok) || exe == tok {
 				return name
 			}
 		}
@@ -442,7 +463,7 @@ func ConfiguredHiddenToolNames() []string {
 }
 
 // pickerPresetOrder matches buildPresetCommands in internal/ui/newdialog.go.
-var pickerPresetOrder = []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes"}
+var pickerPresetOrder = []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek"}
 
 // PickerToolNames returns tool names for the new-session picker after applying
 // hidden_tools and show_only_installed_tools. The empty command "" is mapped

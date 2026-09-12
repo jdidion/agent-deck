@@ -57,13 +57,19 @@ type MenuGroup struct {
 
 // MenuSession contains metadata for a session item.
 type MenuSession struct {
-	ID           string         `json:"id"`
-	Title        string         `json:"title"`
-	Tool         string         `json:"tool"`
-	ModelID      string         `json:"modelId,omitempty"`
-	Model        string         `json:"model,omitempty"`
-	ModelVersion string         `json:"modelVersion,omitempty"`
-	CanFork      bool           `json:"canFork"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	Tool         string `json:"tool"`
+	ModelID      string `json:"modelId,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ModelVersion string `json:"modelVersion,omitempty"`
+	CanFork      bool   `json:"canFork"`
+	// MCPSupported mirrors session.ToolSupportsMCPManager for this session's
+	// tool. It is computed server-side on purpose: the predicate is
+	// config-driven (a user tool can declare compatible_with = "claude"), so a
+	// duplicated client-side list would be wrong for custom tools and would
+	// drift. The web MCP pane reads this instead of guessing from the name.
+	MCPSupported bool           `json:"mcpSupported"`
 	Status       session.Status `json:"status"`
 	// Substate is the additive Honest-Status-v2 refinement of Status
 	// (e.g. "model-unavailable", "auth-401", "idle-at-empty-prompt"). It
@@ -135,6 +141,7 @@ type MenuSession struct {
 
 type storageLoader interface {
 	LoadWithGroups() ([]*session.Instance, []*session.GroupData, error)
+	GetUpdatedAt() (time.Time, error)
 	Close() error
 	// Profile returns the profile name actually opened — which, per the
 	// #1790 guard inside NewStorageWithProfile, may differ from the raw
@@ -259,6 +266,31 @@ func (s *SessionDataService) LoadMenuSnapshot() (*MenuSnapshot, error) {
 	return BuildMenuSnapshot(profile, active, groupsData, s.now()), nil
 }
 
+// MenuDataRevision returns the storage revision that changes after a persisted mutation.
+func (s *SessionDataService) MenuDataRevision() (int64, error) {
+	if s == nil {
+		return 0, fmt.Errorf("session data service is nil")
+	}
+	if s.openStorage == nil {
+		return 0, fmt.Errorf("storage opener is not configured")
+	}
+
+	storage, profile, err := s.resolveAndOpenStorage()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = storage.Close() }()
+
+	updatedAt, err := storage.GetUpdatedAt()
+	if err != nil {
+		return 0, fmt.Errorf("load menu data revision for profile %q: %w", profile, err)
+	}
+	if updatedAt.IsZero() {
+		return 0, nil
+	}
+	return updatedAt.UnixNano(), nil
+}
+
 // LoadArchivedMenuSnapshot returns a menu containing only archived sessions.
 func (s *SessionDataService) LoadArchivedMenuSnapshot() (*MenuSnapshot, error) {
 	if s == nil {
@@ -300,6 +332,7 @@ func toMenuSession(inst *session.Instance) *MenuSession {
 		Model:              modelInfo.Model,
 		ModelVersion:       modelInfo.Version,
 		CanFork:            inst.CanFork(),
+		MCPSupported:       session.ToolSupportsMCPManager(inst.GetToolThreadSafe()),
 		Status:             inst.GetStatusThreadSafe(),
 		Substate:           string(inst.CachedSubstate()),
 		GroupPath:          inst.GroupPath,

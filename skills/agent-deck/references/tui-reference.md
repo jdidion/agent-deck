@@ -32,11 +32,11 @@ Complete reference for agent-deck Terminal UI features.
 | `A` | Archive session (stops tmux, hides from default list; conversations/metadata untouched) |
 | `Shift+U` | Unarchive session (restores to list; does NOT auto-start tmux) |
 | `b` | Re-run worktree setup script (`.agent-deck/worktree-setup.sh`) |
-| `u` | Mark unread (idle -> waiting) |
+| `u` | Mark unread (idle -> waiting); on a remote host header showing `v<old> ↑`, update that remote after confirmation |
 | `f` | Quick fork (Claude/OpenCode/Pi/Codex) |
 | `F` | Fork with options (Claude/OpenCode/Pi/Codex) |
 
-For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses or moves to the parent. Remote-session reorder keys move only within the current remote group; the order is saved on the viewing machine, while remote group headers remain name-sorted.
+For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses or moves to the parent. A remote host header shows `v1.15.0 ↑` after its count when the remote runs an older agent-deck than this controller (the version is asked once per hour per remote on the session poll); `u` on that header opens "Update remote <name> from v<old> to v<new>?" and runs the same verified deploy as `agent-deck remote update <name>`. Remote-session reorder keys move only within the current remote group; the order is saved on the viewing machine, while remote group headers remain name-sorted.
 
 ### Group Actions
 
@@ -56,7 +56,7 @@ For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses 
 | `!` | Filter: running only (toggle) |
 | `@` | Filter: waiting only (toggle) |
 | `#` | Filter: idle only (toggle) |
-| `$` | Filter: error only (toggle) |
+| `&` | Filter: error only (toggle) |
 | `^` | Filter: view archived sessions (toggle) |
 
 ### Global
@@ -67,6 +67,7 @@ For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses 
 | `i` | Import existing tmux sessions |
 | `Ctrl+R` | Manual refresh |
 | `Ctrl+Q` | Detach (keep tmux running) |
+| `$` | Cost Dashboard |
 | `q` / `Ctrl+C` | Quit |
 
 ## Local Status Indicators

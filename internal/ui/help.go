@@ -50,6 +50,18 @@ type HelpOverlay struct {
 	height       int
 	scrollOffset int // Current scroll position for small screens
 	hotkeys      map[string]string
+	// hasAgents gates the Agents row. The feature is opt-in by presence, and
+	// this overlay is part of the TUI: a user who has adopted nothing must not
+	// find a key here for a surface that does not exist for them.
+	hasAgents bool
+}
+
+// SetHasAgents records whether anything has been adopted.
+func (h *HelpOverlay) SetHasAgents(has bool) {
+	if h == nil {
+		return
+	}
+	h.hasAgents = has
 }
 
 // NewHelpOverlay creates a new help overlay
@@ -187,6 +199,7 @@ func (h *HelpOverlay) View() string {
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")
 	groupViewKey := h.key(hotkeyCycleGroupView, "t")
+	timeFilterKey := h.key(hotkeyCycleTimeFilter, "*")
 	// Opt-in: empty when switch_session is unbound, so the filter drops the row.
 	switchKey := h.key(hotkeySwitchSession, "")
 	// In-attach scrollback pager (#1491). Its trigger is resolved directly (it is
@@ -209,16 +222,27 @@ func (h *HelpOverlay) View() string {
 	worktreeSetupKey := h.key(hotkeyWorktreeSetup, "b")
 	worktreeKey := h.key(hotkeyWorktreeFinish, "W")
 	watcherPanelKey := h.key(hotkeyWatcherPanel, "w")
+	agentsPanelKey := h.key(hotkeyAgentsPanel, "alt+a")
 	groupKey := h.key(hotkeyCreateGroup, "g")
 	undoKey := h.key(hotkeyUndoDelete, "Ctrl+Z")
 	archiveKey := h.key(hotkeyArchiveSession, "A")
 	unarchiveKey := h.key(hotkeyUnarchiveSession, "Shift+U")
 	viewArchivedKey := h.key(hotkeyViewArchived, "^")
+	detachKey := DetachByteLabel(DetachByteFromBinding(h.key(hotkeyDetach, "ctrl+q")))
 
 	sections := []struct {
 		title string
 		items [][2]string // [key, description]
 	}{
+		{
+			title: "QUICK START",
+			items: [][2]string{
+				{"Enter", "Attach to selected session"},
+				{restartKey, "Restart selected session"},
+				{detachKey, "Detach from session"},
+				{helpKey, "Open this help"},
+			},
+		},
 		{
 			title: "NAVIGATION",
 			items: [][2]string{
@@ -263,7 +287,7 @@ func (h *HelpOverlay) View() string {
 				{mcpKey, "MCP Manager (Claude/Gemini/Cursor)"},
 				{pluginKey, "Plugin Manager (Claude — RFC PLUGIN_ATTACH.md)"},
 				{skillsKey, "Skills Manager"},
-				{"$", "Cost Dashboard"},
+				{CostDashboardKey, "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
 				{"O", "Toggle preview orientation (right / below — portrait monitors)"},
 				{"< / >", "Shrink / grow preview pane by 5% (drag divider with mouse; vertical in below-orientation)"},
@@ -281,7 +305,7 @@ func (h *HelpOverlay) View() string {
 				{copyPaneKey, "Copy visible terminal text, including links"},
 				{sendKey, "Send output to session"},
 				{execShellKey, "Exec shell in sandbox container"},
-				{openShellHereKey, "Open shell in session's worktree (split pane / tmux)"},
+				{openShellHereKey, "Open shell in session's worktree (split pane / window)"},
 				{editPathsKey, "Edit multi-repo paths"},
 				{editSessionKey, "Edit session settings (title/color/...)"},
 				{notesKey, "Edit notes"},
@@ -314,11 +338,13 @@ func (h *HelpOverlay) View() string {
 			title: "SEARCH & FILTER",
 			items: [][2]string{
 				{searchKey, "Open search"},
+				{FilterKeyError, "Filter errors"},
 				{FilterKeyActive, "Filter open (hide errors)"},
 				{"/waiting", "Filter waiting"},
 				{"/running", "Filter running"},
 				{"/idle", "Filter idle"},
 				{groupViewKey, "Cycle view: active-on-top / populated-on-top"},
+				{timeFilterKey, "Cycle time filter: today / 3 days / 7 days / all"},
 			},
 		},
 		{
@@ -327,7 +353,6 @@ func (h *HelpOverlay) View() string {
 				{settingsKey, "Settings"},
 				{reloadKey, "Reload from disk"},
 				{importKey, "Import tmux sessions"},
-				{"Ctrl+Q", "Detach from session"},
 				{switchKey, "Switch session (here or attached)"},
 				{scrollbackKey, "Scrollback pager (while attached)"},
 				{quitKey, "Quit"},
@@ -341,6 +366,19 @@ func (h *HelpOverlay) View() string {
 				{"--profile <name>", "Use specific profile"},
 			},
 		},
+	}
+
+	// The Agents row appears only once something has been adopted. The whole
+	// feature is opt-in by presence, and the help overlay is part of the TUI:
+	// a user with no agents must not find a key here for a surface that does
+	// not exist for them.
+	if h.hasAgents {
+		for i := range sections {
+			if sections[i].title == "WATCHERS" {
+				sections[i].items = append(sections[i].items, [2]string{agentsPanelKey, "Agents"})
+				break
+			}
+		}
 	}
 
 	for i := range sections {

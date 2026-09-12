@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 	"github.com/asheshgoplani/agent-deck/internal/update"
@@ -39,7 +41,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.12.0" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.16.6" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -52,15 +54,64 @@ const (
 // init sets up color profile for consistent terminal colors across environments
 func init() {
 	initColorProfile()
-	initUpdateSettings()
 }
 
-// initUpdateSettings configures update checking from user config
+// initUpdateSettings configures update checking from user config.
+//
+// Called from main(), NOT from package init(): it loads the user config,
+// which resolves an agent-deck path. Under `go test`, package init runs
+// before TestMain gets to call testutil.IsolateHome(), so an init-time load
+// resolved the developer's REAL config and tripped the agentpaths
+// unsandboxed-test warning on every run of this package (issue #2012).
 func initUpdateSettings() {
 	settings := session.GetUpdateSettings()
 	update.SetCheckInterval(settings.CheckIntervalHours)
 	update.SetBridgeScriptInstaller(session.InstallBridgeScript)
 	update.SetConductorDirResolver(session.ConductorDir)
+}
+
+// initTelemetrySettings passes the config.toml [telemetry] section to the
+// telemetry package. Config can only turn telemetry OFF or change the
+// receiver URL; consent itself lives in telemetry-state.json (TELEMETRY.md).
+func initTelemetrySettings() {
+	cfg, err := session.LoadUserConfig()
+	if err != nil || cfg == nil {
+		// Fail closed: the user may have written [telemetry].disabled = true
+		// in a file we cannot parse right now.
+		telemetry.SetConfigUnreadable()
+		return
+	}
+	telemetry.SetConfigDisabled(cfg.Telemetry.Disabled)
+	telemetry.SetEndpoint(cfg.Telemetry.Endpoint)
+}
+
+// recordCLITelemetry bumps the opt-in usage counters for a CLI subcommand.
+// No-op unless the user has consented (telemetry.Record checks). Hook
+// handlers and daemons are excluded: they fire on every agent turn and
+// would swamp the human-driven counts.
+func recordCLITelemetry(subcommand string, rest []string) {
+	for _, a := range rest {
+		if a == "-h" || a == "--help" || a == "help" {
+			return
+		}
+	}
+	switch subcommand {
+	case "add", "list", "ls", "remove", "rm", "rename", "mv", "status", "profile", "update",
+		"session", "fleet", "mcp", "plugin", "skill", "mcp-proxy", "group", "try", "launch",
+		"accounts", "conductor", "agents", "agent", "telegram-doctor", "watcher", "openclaw", "oc",
+		"remote", "worktree", "wt", "costs", "web", "uninstall", "migrate-paths", "hooks",
+		"codex-hooks", "gemini-hooks", "hermes-hooks", "cursor-hooks", "deepseek", "feedback", "creds-refresh":
+	default:
+		return
+	}
+	telemetry.Record(telemetry.CounterCLIInvocations)
+	switch subcommand {
+	case "remote":
+		telemetry.Record(telemetry.CounterRemoteUsed)
+	case "conductor":
+		telemetry.Record(telemetry.CounterConductorUsed)
+
+	}
 }
 
 // writeVersionOutput prints `Agent Deck vX.Y.Z` to `w`, appending
@@ -216,6 +267,11 @@ func main() {
 	// tmux probe below. No-op when tmux is already on PATH.
 	ensureTmuxOnPath()
 
+	// Configure update checking before any command path can reach an update
+	// check (printUpdateNotice, `update`, `version`). See the doc comment.
+	initUpdateSettings()
+	initTelemetrySettings()
+
 	// Extract global -p/--profile flag before subcommand dispatch
 	profile, args := extractProfileFlag(os.Args[1:])
 	if profile != "" {
@@ -223,11 +279,16 @@ func main() {
 		// resolve consistently across all command paths in this process.
 		_ = os.Setenv("AGENTDECK_PROFILE", profile)
 	}
-
 	// Extract global --allow-repo-scripts before subcommand dispatch (mirrors
 	// -p/--profile above). One-shot, non-persisted bypass of the worktree
 	// script consent gate for non-interactive callers (CI) that can't answer
 	// a prompt and would otherwise fail closed under the "prompt" default.
+	// Remote arguments belong to the server, including its script-consent flag.
+	if len(args) > 0 && args[0] == "remote" {
+		recordCLITelemetry(args[0], args[1:])
+		handleRemote(profile, args[1:])
+		return
+	}
 	allowRepoScripts, args2 := extractAllowRepoScriptsFlag(args)
 	args = args2
 	if envVal := strings.TrimSpace(os.Getenv("AGENT_DECK_ALLOW_REPO_SCRIPTS")); envVal != "" {
@@ -252,6 +313,9 @@ func main() {
 	// calls use Instance.TmuxSocketName directly — this default is only
 	// the installation-wide fallback for callers without a session handle.
 	tmux.SetDefaultSocketName(session.GetTmuxSettings().GetSocketName())
+	if cfg, err := session.LoadUserConfig(); err == nil && cfg != nil {
+		session.ConfigureTmuxDisplay(cfg.Display)
+	}
 
 	// Nudge macOS users whose tmux predates the upstream fix for the
 	// control-mode NULL-deref (tmux #4980, issue #737). Once per process,
@@ -266,7 +330,11 @@ func main() {
 
 	// Handle subcommands
 	if len(args) > 0 {
+		recordCLITelemetry(args[0], args[1:])
 		switch args[0] {
+		case "telemetry":
+			handleTelemetry(args[1:])
+			return
 		case "version", "--version", "-v":
 			writeVersionOutput(os.Stdout, Version)
 			return
@@ -310,6 +378,10 @@ func main() {
 			handleSkill(profile, args[1:])
 			return
 		case "mcp-proxy":
+			if helpRequested(args[1:]) {
+				fmt.Println("Usage: agent-deck mcp-proxy <socket-path>")
+				return
+			}
 			if len(args) < 2 {
 				fmt.Fprintln(os.Stderr, "Usage: agent-deck mcp-proxy <socket-path>")
 				os.Exit(1)
@@ -325,8 +397,20 @@ func main() {
 		case "launch":
 			handleLaunch(profile, args[1:])
 			return
+		case "doctor":
+			handleDoctor(args[1:])
+			return
+		case "accounts":
+			handleAccounts(args[1:])
+			return
 		case "conductor":
 			handleConductor(profile, args[1:])
+			return
+		case "agents":
+			handleAgents(profile, args[1:])
+			return
+		case "agent":
+			handleAgent(profile, args[1:])
 			return
 		case "telegram-doctor":
 			handleTelegramDoctor(profile, args[1:])
@@ -339,6 +423,9 @@ func main() {
 			return
 		case "remote":
 			handleRemote(profile, args[1:])
+			return
+		case "remote-agent":
+			handleRemoteAgent(profile, args[1:])
 			return
 		case "worktree", "wt":
 			handleWorktree(profile, args[1:])
@@ -387,6 +474,9 @@ func main() {
 		case "cursor-hooks":
 			handleCursorHooks(args[1:])
 			return
+		case "deepseek":
+			handleDeepSeek(args[1:])
+			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
 			return
@@ -394,7 +484,7 @@ func main() {
 			handleRunTask(args[1:])
 			return
 		case "inbox":
-			handleInbox(args[1:])
+			handleInbox(profile, args[1:])
 			return
 		case "feedback":
 			handleFeedback(args[1:])
@@ -403,6 +493,10 @@ func main() {
 			handleCredsRefresh(args[1:])
 			return
 		case "debug-dump":
+			if helpRequested(args[1:]) {
+				fmt.Println("Usage: agent-deck debug-dump")
+				return
+			}
 			handleDebugDump()
 			return
 		}
@@ -486,6 +580,11 @@ func main() {
 			return
 		}
 	}
+
+	// [updates] auto_update_remotes: bring older remotes up to this version
+	// in the background. On by default (auto_update_remotes = false opts
+	// out); never prompts, never blocks (#2164).
+	startRemoteAutoUpdate()
 
 	// Web parses its own flags and preflights during subcommand dispatch so
 	// help remains tmux-free and startup probes see the repaired PATH.
@@ -648,6 +747,12 @@ func main() {
 	// min-launches threshold for new users. Non-TUI subcommands (add, list,
 	// feedback, etc.) deliberately skip this so scripted usage doesn't
 	// inflate the counter.
+	// Opt-in usage telemetry: count the TUI launch (no-op without consent).
+	// Headless `web --no-tui` never boots the TUI and is not counted.
+	if !webHeadless {
+		telemetry.Record(telemetry.CounterTUILaunches)
+	}
+
 	if fbSt, _ := feedback.LoadState(); fbSt != nil {
 		feedback.RecordLaunch(fbSt, time.Now())
 		// #967: migrate pre-existing forever-opt-outs to per-release-series.
@@ -959,23 +1064,25 @@ func main() {
 	}
 }
 
-// globalFlagSubcommands lists every token that main()'s dispatch switch treats
+// commandRegistry lists every token that main()'s dispatch switch treats
 // as a subcommand. extractProfileFlag stops honoring the global -p/--profile
 // flag once it reaches one of these, so a subcommand that defines its own -p
 // (launch/add --parent, group move --position) is not shadowed by the global
 // profile flag. KEEP IN SYNC with the switch in main().
-var globalFlagSubcommands = map[string]bool{
-	"add": true, "list": true, "ls": true, "remove": true, "rm": true,
+var commandRegistry = map[string]bool{
+	"add": true, "accounts": true, "doctor": true, "list": true, "ls": true, "remove": true, "rm": true,
 	"rename": true, "mv": true, "status": true, "profile": true, "update": true,
-	"session": true, "mcp": true, "plugin": true, "skill": true, "mcp-proxy": true,
+	"session": true, "fleet": true, "mcp": true, "plugin": true, "skill": true, "mcp-proxy": true,
 	"group": true, "try": true, "launch": true, "conductor": true,
+	"agents": true, "agent": true,
 	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
-	"remote": true, "worktree": true, "wt": true, "costs": true, "web": true,
+	"remote": true, "remote-agent": true, "worktree": true, "wt": true, "costs": true, "web": true,
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
-	"hermes-hooks": true, "cursor-hooks": true, "notify-daemon": true,
-	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true,
-	"debug-dump": true, "version": true, "help": true,
+	"hermes-hooks": true, "cursor-hooks": true, "deepseek": true, "notify-daemon": true,
+	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true, "telemetry": true,
+	"debug-dump": true, "version": true, "--version": true, "-v": true,
+	"help": true, "--help": true, "-h": true,
 }
 
 // extractProfileFlag extracts the global -p or --profile flag from args,
@@ -997,7 +1104,7 @@ func extractProfileFlag(args []string) (string, []string) {
 
 		// Reached the subcommand: global flag parsing is over. Everything from
 		// here belongs to the subcommand, which may define its own -p.
-		if globalFlagSubcommands[arg] {
+		if commandRegistry[arg] {
 			remaining = append(remaining, args[i:]...)
 			return profile, remaining
 		}
@@ -1203,10 +1310,21 @@ func isWorktreeAlreadyExistsError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "already exists")
 }
 
-func resolveAutoParentInstance(instances []*session.Instance) *session.Instance {
+// resolveAutoParentInstanceChecked distinguishes a top-level invocation (no
+// managed caller identity) from a child creation whose authoritative injected
+// identity is stale. The latter must fail at creation instead of silently
+// producing an orphan that can only be discovered in delivery dead-letter.
+func resolveAutoParentInstanceChecked(instances []*session.Instance) (*session.Instance, string) {
 	candidates := []string{
 		strings.TrimSpace(os.Getenv("AGENT_DECK_SESSION_ID")),
 		strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")),
+	}
+	authoritative := ""
+	for _, candidate := range candidates {
+		if candidate != "" {
+			authoritative = candidate
+			break
+		}
 	}
 
 	if tmuxCurrent := strings.TrimSpace(GetCurrentSessionID()); tmuxCurrent != "" {
@@ -1220,10 +1338,10 @@ func resolveAutoParentInstance(instances []*session.Instance) *session.Instance 
 		}
 		seen[candidate] = true
 		if inst, _, _ := ResolveSession(candidate, instances); inst != nil {
-			return inst
+			return inst, ""
 		}
 	}
-	return nil
+	return nil, authoritative
 }
 
 // resolveGroupPathForAdd resolves a user-provided group selector to a stored group path.
@@ -1336,6 +1454,11 @@ func handleAdd(profile string, args []string) {
 		return nil
 	})
 
+	// --create-dir is what the TUI's remote new-session dialog forwards after
+	// the user confirms creating a missing directory on the server; the local
+	// dialog asks the same question and calls os.MkdirAll itself.
+	createDir := fs.Bool("create-dir", false, "Create the project directory when it does not exist (like mkdir -p)")
+
 	// Sandbox flags
 	sandbox := fs.Bool("sandbox", false, "Run session in Docker sandbox")
 	sandboxImage := fs.String("sandbox-image", "", "Docker image for sandbox (overrides config default)")
@@ -1360,7 +1483,7 @@ func handleAdd(profile string, args []string) {
 	// [profiles.<account>.claude].config_dir in ~/.agent-deck/config.toml
 	// and becomes the most-specific level of CLAUDE_CONFIG_DIR resolution.
 	// Empty = fall through to conductor/group/env/profile/global/default.
-	account := fs.String("account", "", "Named account slot (resolves via [profiles.<account>.claude].config_dir; #924)")
+	account := fs.String("account", "", "Named account slot (uses its per-tool config_dir; overrides AGENTDECK_ACCOUNT)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck add [path] [options]")
@@ -1453,6 +1576,11 @@ func handleAdd(profile string, args []string) {
 		fmt.Printf("Error: %v\n", cmdErr)
 		os.Exit(1)
 	}
+	selectedAccount, accountErr := resolveCLIAccountSlot(*account, sessionCommandTool, sessionCommandResolved, sessionCommandIsPassthrough)
+	if accountErr != nil {
+		NewCLIOutput(*jsonOutput, *quiet || *quietShort).Error(accountErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 	sessionParent := mergeFlags(*parent, *parentShort)
 	if sessionParent != "" && *noParent {
 		fmt.Println("Error: --parent and --no-parent cannot be used together")
@@ -1526,7 +1654,12 @@ func handleAdd(profile string, args []string) {
 		// is wired into `launch` where path is already known at this point.
 		sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 	} else if !*noParent {
-		parentInstance = resolveAutoParentInstance(instances)
+		var unresolvedParent string
+		parentInstance, unresolvedParent = resolveAutoParentInstanceChecked(instances)
+		if parentInstance == nil && unresolvedParent != "" {
+			fmt.Printf("Error: automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session\n", unresolvedParent)
+			os.Exit(1)
+		}
 		if parentInstance != nil && !parentInstance.IsSubSession() {
 			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
 		} else {
@@ -1611,6 +1744,13 @@ func handleAdd(profile string, args []string) {
 		path = localPlaceholder
 	} else {
 		info, err := os.Stat(path)
+		if err != nil && *createDir {
+			if mkErr := os.MkdirAll(path, 0o755); mkErr != nil {
+				fmt.Printf("Error: failed to create directory %s: %v\n", path, mkErr)
+				os.Exit(1)
+			}
+			info, err = os.Stat(path)
+		}
 		if err != nil {
 			fmt.Printf("Error: path does not exist: %s\n", path)
 			os.Exit(1)
@@ -1718,7 +1858,9 @@ func handleAdd(profile string, args []string) {
 				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
 			}
 
-			fmt.Printf("Created worktree at: %s\n", worktreePath)
+			if !*jsonOutput {
+				fmt.Printf("Created worktree at: %s\n", worktreePath)
+			}
 		}
 		worktreeRepoRoot = repoRoot
 		// Update path to point to worktree so session uses worktree as working directory
@@ -1899,11 +2041,11 @@ func handleAdd(profile string, args []string) {
 		newInstance.Wrapper = sessionWrapperResolved
 	}
 
-	// #924 per-session named account slot — captured verbatim. The
-	// resolver silently falls through when no matching [profiles.<account>]
-	// block exists, so unknown names are never an error here.
-	if trimmed := strings.TrimSpace(*account); trimmed != "" {
-		newInstance.Account = trimmed
+	// Validate the selected slot before account-dependent loadout or registration.
+	newInstance.Account = selectedAccount
+	if err := newInstance.ValidateAccount(); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
 	}
 
 	// Apply per-session model override after command/tool resolution so the
@@ -2172,11 +2314,14 @@ func handleList(profile string, args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	allProfiles := fs.Bool("all", false, "List sessions from all profiles")
+	includeSuperseded := fs.Bool("include-superseded", false, "Include archived source rows retained for cross-harness recovery")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck list [options]")
 		fmt.Println()
 		fmt.Println("List all sessions.")
+		fmt.Println("ACCOUNT shows the quoted stored account slot, not a resolved account or login identity.")
+		fmt.Println(`JSON always includes the raw "account" string, including "" when no slot is stored.`)
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -2192,7 +2337,7 @@ func handleList(profile string, args []string) {
 	}
 
 	if *allProfiles {
-		handleListAllProfiles(*jsonOutput)
+		handleListAllProfiles(*jsonOutput, *includeSuperseded)
 		return
 	}
 	ensureTmuxInPathOrExit()
@@ -2209,83 +2354,31 @@ func handleList(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	if !*includeSuperseded {
+		instances = defaultListInstances(instances)
+	}
+
 	if len(instances) == 0 {
 		fmt.Printf("No sessions found in profile '%s'.\n", storage.Profile())
 		return
 	}
 
 	if *jsonOutput {
-		// JSON output for scripting
-		type sessionJSON struct {
-			ID            string    `json:"id"`
-			Title         string    `json:"title"`
-			Path          string    `json:"path"`
-			Group         string    `json:"group"`
-			Tool          string    `json:"tool"`
-			Command       string    `json:"command,omitempty"`
-			ModelID       string    `json:"model_id,omitempty"`
-			Model         string    `json:"model,omitempty"`
-			ModelVersion  string    `json:"model_version,omitempty"`
-			Status        string    `json:"status"`
-			Substate      string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
-			TmuxSession   string    `json:"tmux_session,omitempty"`
-			Profile       string    `json:"profile"`
-			CreatedAt     time.Time `json:"created_at"`
-			SSHHost       string    `json:"ssh_host,omitempty"`
-			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
-			Channels      []string  `json:"channels,omitempty"`
-			ExtraArgs     []string  `json:"extra_args,omitempty"`
-			Color         string    `json:"color,omitempty"` // issue #391
-			Archived      bool      `json:"archived"`
-			ArchivedAt    time.Time `json:"archived_at,omitempty"`
-		}
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
 		session.RefreshInstancesForCLIStatus(instances)
-		sessions := make([]sessionJSON, len(instances))
-		for i, inst := range instances {
-			_ = inst.UpdateStatus()
-			sj := sessionJSON{
-				ID:            inst.ID,
-				Title:         inst.Title,
-				Path:          inst.ProjectPath,
-				Group:         inst.GroupPath,
-				Tool:          inst.Tool,
-				Command:       inst.Command,
-				Status:        StatusString(inst.Status),
-				Substate:      string(inst.Substate()),
-				Profile:       storage.Profile(),
-				CreatedAt:     inst.CreatedAt,
-				SSHHost:       inst.SSHHost,
-				SSHRemotePath: inst.SSHRemotePath,
-				Channels:      inst.Channels,
-				ExtraArgs:     inst.ExtraArgs,
-				Color:         inst.Color,
-				Archived:      inst.IsArchived(),
-				ArchivedAt:    inst.ArchivedAt,
-			}
-			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
-				sj.TmuxSession = tmuxSess.Name
-			}
-			if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
-				sj.ModelID = modelInfo.ModelID
-				sj.Model = modelInfo.Model
-				sj.ModelVersion = modelInfo.Version
-			}
-			sessions[i] = sj
-		}
-		output, err := json.MarshalIndent(sessions, "", "  ")
+		output, err := buildListJSON(storage.Profile(), instances)
 		if err != nil {
 			fmt.Printf("Error: failed to format JSON output: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Println(string(output))
+		fmt.Print(string(output))
 		return
 	}
 
 	// Table output
 	fmt.Printf("Profile: %s\n\n", storage.Profile())
-	fmt.Printf("%-*s %-*s %-*s %s\n", tableColTitle, "TITLE", tableColGroup, "GROUP", tableColPath, "PATH", "ID")
+	fmt.Printf("%-*s %-*s %-*s %-*s %s\n", tableColTitle, "TITLE", tableColGroup, "GROUP", tableColPath, "PATH", tableColIDDisplay, "ID", "ACCOUNT")
 	fmt.Println(strings.Repeat("-", tableColTitle+tableColGroup+tableColPath+tableColIDDisplay+5))
 	for _, inst := range instances {
 		title := truncate(inst.Title, tableColTitle)
@@ -2296,7 +2389,7 @@ func handleList(profile string, args []string) {
 		if len(idDisplay) > tableColIDDisplay {
 			idDisplay = idDisplay[:tableColIDDisplay]
 		}
-		fmt.Printf("%-*s %-*s %-*s %s\n", tableColTitle, title, tableColGroup, group, tableColPath, path, idDisplay)
+		fmt.Printf("%-*s %-*s %-*s %-*s %s\n", tableColTitle, title, tableColGroup, group, tableColPath, path, tableColIDDisplay, idDisplay, strconv.Quote(inst.Account))
 	}
 	fmt.Printf("\nTotal: %d sessions\n", len(instances))
 
@@ -2304,8 +2397,106 @@ func handleList(profile string, args []string) {
 	printUpdateNotice()
 }
 
+// defaultListInstances hides only archived cross-harness sources. Clearing the
+// normal archive flag (via `session unarchive`) intentionally restores a source
+// row to the default list without replaying or deleting its retained lineage.
+func defaultListInstances(instances []*session.Instance) []*session.Instance {
+	visible := make([]*session.Instance, 0, len(instances))
+	for _, inst := range instances {
+		if inst != nil && !(inst.IsArchived() && inst.SupersededBy != "") {
+			visible = append(visible, inst)
+		}
+	}
+	return visible
+}
+
+// buildListJSON is the body of `list --json`: every session with its status
+// refreshed, as the indented array the CLI prints, trailing newline included.
+// handleList prints it and the remote agent's change probe (#2177) pushes it,
+// so a listing that arrives by push is byte-identical to one that was
+// fetched. Callers warm the status caches first
+// (session.RefreshInstancesForCLIStatus); an empty profile yields "[]".
+func buildListJSON(profileName string, instances []*session.Instance) ([]byte, error) {
+	type sessionJSON struct {
+		ID                string    `json:"id"`
+		ParentSessionID   string    `json:"parent_session_id,omitempty"`
+		ParentProjectPath string    `json:"parent_project_path,omitempty"`
+		Title             string    `json:"title"`
+		Path              string    `json:"path"`
+		Group             string    `json:"group"`
+		Tool              string    `json:"tool"`
+		Account           string    `json:"account"`
+		Command           string    `json:"command,omitempty"`
+		ModelID           string    `json:"model_id,omitempty"`
+		Model             string    `json:"model,omitempty"`
+		ModelVersion      string    `json:"model_version,omitempty"`
+		Status            string    `json:"status"`
+		Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
+		TmuxSession       string    `json:"tmux_session,omitempty"`
+		Profile           string    `json:"profile"`
+		CreatedAt         time.Time `json:"created_at"`
+		SSHHost           string    `json:"ssh_host,omitempty"`
+		SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+		Channels          []string  `json:"channels,omitempty"`
+		ExtraArgs         []string  `json:"extra_args,omitempty"`
+		Color             string    `json:"color,omitempty"` // issue #391
+		Archived          bool      `json:"archived"`
+		ArchivedAt        time.Time `json:"archived_at,omitempty"`
+		SupersededBy      string    `json:"superseded_by,omitempty"`
+		Supersedes        string    `json:"supersedes,omitempty"`
+		// LastActivityAt lets a remote caller (session.RemoteSessionInfo)
+		// apply the local recency filter (session.TimeFilterMode) to this
+		// session, the same way it applies to a local one.
+		LastActivityAt string `json:"last_activity_at,omitempty"`
+	}
+	sessions := make([]sessionJSON, len(instances))
+	for i, inst := range instances {
+		_ = inst.UpdateStatus()
+		parentProjectPath := listParentProjectPath(inst, instances)
+		sj := sessionJSON{
+			ID:                inst.ID,
+			ParentSessionID:   inst.ParentSessionID,
+			ParentProjectPath: parentProjectPath,
+			Title:             inst.Title,
+			Path:              inst.ProjectPath,
+			Group:             inst.GroupPath,
+			Tool:              inst.Tool,
+			Account:           inst.Account,
+			Command:           inst.Command,
+			Status:            StatusString(inst.Status),
+			Substate:          string(inst.Substate()),
+			Profile:           profileName,
+			CreatedAt:         inst.CreatedAt,
+			SSHHost:           inst.SSHHost,
+			SSHRemotePath:     inst.SSHRemotePath,
+			Channels:          inst.Channels,
+			ExtraArgs:         inst.ExtraArgs,
+			Color:             inst.Color,
+			Archived:          inst.IsArchived(),
+			ArchivedAt:        inst.ArchivedAt,
+			SupersededBy:      inst.SupersededBy,
+			Supersedes:        inst.Supersedes,
+			LastActivityAt:    inst.DisplayLastActivityTime().Format(time.RFC3339Nano),
+		}
+		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
+			sj.TmuxSession = tmuxSess.Name
+		}
+		if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+			sj.ModelID = modelInfo.ModelID
+			sj.Model = modelInfo.ModelID
+			sj.ModelVersion = modelInfo.Version
+		}
+		sessions[i] = sj
+	}
+	output, err := json.MarshalIndent(sessions, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(output, '\n'), nil
+}
+
 // handleListAllProfiles lists sessions from all profiles
-func handleListAllProfiles(jsonOutput bool) {
+func handleListAllProfiles(jsonOutput, includeSuperseded bool) {
 	profiles, err := session.ListProfiles()
 	if err != nil {
 		fmt.Printf("Error: failed to list profiles: %v\n", err)
@@ -2319,16 +2510,19 @@ func handleListAllProfiles(jsonOutput bool) {
 
 	if jsonOutput {
 		type sessionJSON struct {
-			ID            string    `json:"id"`
-			Title         string    `json:"title"`
-			Path          string    `json:"path"`
-			Group         string    `json:"group"`
-			Tool          string    `json:"tool"`
-			Command       string    `json:"command,omitempty"`
-			Profile       string    `json:"profile"`
-			CreatedAt     time.Time `json:"created_at"`
-			SSHHost       string    `json:"ssh_host,omitempty"`
-			SSHRemotePath string    `json:"ssh_remote_path,omitempty"`
+			ID                string    `json:"id"`
+			ParentSessionID   string    `json:"parent_session_id,omitempty"`
+			ParentProjectPath string    `json:"parent_project_path,omitempty"`
+			Title             string    `json:"title"`
+			Path              string    `json:"path"`
+			Group             string    `json:"group"`
+			Tool              string    `json:"tool"`
+			Account           string    `json:"account"`
+			Command           string    `json:"command,omitempty"`
+			Profile           string    `json:"profile"`
+			CreatedAt         time.Time `json:"created_at"`
+			SSHHost           string    `json:"ssh_host,omitempty"`
+			SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
 		}
 		var allSessions []sessionJSON
 
@@ -2341,18 +2535,24 @@ func handleListAllProfiles(jsonOutput bool) {
 			if err != nil {
 				continue
 			}
+			if !includeSuperseded {
+				instances = defaultListInstances(instances)
+			}
 			for _, inst := range instances {
 				allSessions = append(allSessions, sessionJSON{
-					ID:            inst.ID,
-					Title:         inst.Title,
-					Path:          inst.ProjectPath,
-					Group:         inst.GroupPath,
-					Tool:          inst.Tool,
-					Command:       inst.Command,
-					Profile:       profileName,
-					CreatedAt:     inst.CreatedAt,
-					SSHHost:       inst.SSHHost,
-					SSHRemotePath: inst.SSHRemotePath,
+					ID:                inst.ID,
+					ParentSessionID:   inst.ParentSessionID,
+					ParentProjectPath: listParentProjectPath(inst, instances),
+					Title:             inst.Title,
+					Path:              inst.ProjectPath,
+					Group:             inst.GroupPath,
+					Tool:              inst.Tool,
+					Account:           inst.Account,
+					Command:           inst.Command,
+					Profile:           profileName,
+					CreatedAt:         inst.CreatedAt,
+					SSHHost:           inst.SSHHost,
+					SSHRemotePath:     inst.SSHRemotePath,
 				})
 			}
 		}
@@ -2377,13 +2577,16 @@ func handleListAllProfiles(jsonOutput bool) {
 		if err != nil {
 			continue
 		}
+		if !includeSuperseded {
+			instances = defaultListInstances(instances)
+		}
 
 		if len(instances) == 0 {
 			continue
 		}
 
 		fmt.Printf("\n═══ Profile: %s ═══\n\n", profileName)
-		fmt.Printf("%-*s %-*s %-*s %s\n", tableColTitle, "TITLE", tableColGroup, "GROUP", tableColPath, "PATH", "ID")
+		fmt.Printf("%-*s %-*s %-*s %-*s %s\n", tableColTitle, "TITLE", tableColGroup, "GROUP", tableColPath, "PATH", tableColIDDisplay, "ID", "ACCOUNT")
 		fmt.Println(strings.Repeat("-", tableColTitle+tableColGroup+tableColPath+tableColIDDisplay+5))
 
 		for _, inst := range instances {
@@ -2394,7 +2597,7 @@ func handleListAllProfiles(jsonOutput bool) {
 			if len(idDisplay) > tableColIDDisplay {
 				idDisplay = idDisplay[:tableColIDDisplay]
 			}
-			fmt.Printf("%-*s %-*s %-*s %s\n", tableColTitle, title, tableColGroup, group, tableColPath, path, idDisplay)
+			fmt.Printf("%-*s %-*s %-*s %-*s %s\n", tableColTitle, title, tableColGroup, group, tableColPath, path, tableColIDDisplay, idDisplay, strconv.Quote(inst.Account))
 		}
 		fmt.Printf("(%d sessions)\n", len(instances))
 		totalSessions += len(instances)
@@ -2402,6 +2605,24 @@ func handleListAllProfiles(jsonOutput bool) {
 
 	fmt.Printf("\n═══════════════════════════════════════\n")
 	fmt.Printf("Total: %d sessions across %d profiles\n", totalSessions, len(profiles))
+}
+
+// listParentProjectPath reports the parent path represented by the stored
+// parent id. Older SQLite rows did not persist the denormalized path field, so
+// recover it from the parent row instead of falsely reporting no relationship.
+func listParentProjectPath(inst *session.Instance, instances []*session.Instance) string {
+	if inst == nil || inst.ParentSessionID == "" {
+		return ""
+	}
+	if inst.ParentProjectPath != "" {
+		return inst.ParentProjectPath
+	}
+	for _, candidate := range instances {
+		if candidate.ID == inst.ParentSessionID {
+			return candidate.ProjectPath
+		}
+	}
+	return ""
 }
 
 // handleRemove removes a session by ID or title
@@ -2825,7 +3046,7 @@ func handleStatus(profile string, args []string) {
 				}
 				if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
 					sj.ModelID = modelInfo.ModelID
-					sj.Model = modelInfo.Model
+					sj.Model = modelInfo.ModelID
 					sj.ModelVersion = modelInfo.Version
 				}
 				resp.Sessions = append(resp.Sessions, sj)
@@ -3486,6 +3707,8 @@ func printHelp() {
 	fmt.Println("  (none)           Start the TUI")
 	fmt.Println("  add <path>       Add a new session")
 	fmt.Println("  launch [path]    Add, start, and optionally send a message in one step")
+	fmt.Println("  accounts         List configured named account slots")
+	fmt.Println("  doctor           Check named Claude account directory sharing")
 	fmt.Println("  try <name>       Quick experiment (create/find dated folder + session)")
 	fmt.Println("  list, ls         List all sessions")
 	fmt.Println("  remove, rm       Remove a session")
@@ -3499,14 +3722,18 @@ func printHelp() {
 	fmt.Println("  gemini-hooks     Manage Gemini hook integration")
 	fmt.Println("  hermes-hooks     Manage Hermes Agent hook integration")
 	fmt.Println("  cursor-hooks     Manage Cursor Agent CLI hook integration")
+	fmt.Println("  deepseek         Inspect the DeepSeek Harness (dsh) integration")
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
+	fmt.Println("  agents           List adopted agents, grouped by machine")
+	fmt.Println("  agent            Adopt and inspect agent definitions")
 	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
+	fmt.Println("  telemetry        Opt-in anonymous usage reports: status|enable|disable|preview|show-last|reset-id (see TELEMETRY.md)")
 	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
 	fmt.Println("  migrate-paths    Copy legacy ~/.agent-deck files into XDG paths")
 	fmt.Println("  uninstall        Uninstall Agent Deck")
@@ -3551,6 +3778,9 @@ func printHelp() {
 	fmt.Println("  cursor-hooks install      Install Cursor hooks")
 	fmt.Println("  cursor-hooks uninstall    Remove Cursor hooks")
 	fmt.Println("  cursor-hooks status       Show Cursor hooks install status")
+	fmt.Println("  deepseek status           Show resolved dsh binary, DSH_HOME, profile")
+	fmt.Println("  deepseek profiles         List profiles under $DSH_HOME/profiles")
+	fmt.Println("  deepseek sessions [path]  List dsh sessions recorded for a workspace")
 	fmt.Println()
 	fmt.Println("Group Commands:")
 	fmt.Println("  group list                List all groups")

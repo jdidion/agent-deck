@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,6 +80,10 @@ func handleSession(profile string, args []string) {
 		handleSessionSet(profile, args[1:])
 	case "switch-account":
 		handleSessionSwitchAccount(profile, args[1:])
+	case "switch":
+		handleSessionSwitch(profile, args[1:])
+	case "switch-preview":
+		handleSessionSwitchPreview(profile, args[1:])
 	case "move", "mv":
 		handleSessionMove(profile, args[1:])
 	case "send":
@@ -119,11 +124,13 @@ func printSessionHelp() {
 	fmt.Println("  revive [--all|--name]   Rebuild dead control pipes for errored sessions")
 	fmt.Println("  fork <id>               Fork Claude, OpenCode, Pi, or Codex session with context")
 	fmt.Println("  handoff <id>            Build a cross-tool handoff prompt from the session's conversation (read-only)")
+	fmt.Println("  switch-preview <id>     Preview switch capability, fidelity and refusals (read-only, no mutation)")
 	fmt.Println("  attach <id>             Attach to session interactively")
 	fmt.Println("  focus <id> [--attach]   Signal the running TUI to select (or --attach) a session")
 	fmt.Println("  show [id]               Show session details (auto-detect current if no id)")
 	fmt.Println("  current                 Show current session and profile (auto-detect)")
 	fmt.Println("  set <id> <field> <value>  Update session property")
+	fmt.Println("  switch <id> --to-harness <harness> [--to-account <account>]  Switch account or create a confirmed fresh cross-harness target")
 	fmt.Println("  switch-account <id> <account>  Switch Claude account and migrate the conversation")
 	fmt.Println("  move <id> <path>        Move session to a new path (migrates Claude history)")
 	fmt.Println("  send <id> <message>     Send a message to a running session")
@@ -171,10 +178,12 @@ func printSessionHelp() {
 	fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
 	fmt.Println("  claude-session-id  Claude conversation ID (for fork/resume)")
 	fmt.Println("  gemini-session-id  Gemini conversation ID (for resume)")
+	fmt.Println("  tool-session-id    Custom [tools.*] conversation ID (resume_flag after reboot)")
 	fmt.Println()
 	fmt.Println("Set examples:")
 	fmt.Println("  agent-deck session set my-project title \"New Title\"")
 	fmt.Println("  agent-deck session set my-project claude-session-id \"abc123-def456\"")
+	fmt.Println("  agent-deck session set my-project tool-session-id \"019f683f-...\"")
 	fmt.Println("  agent-deck session set my-project tool claude")
 	fmt.Println("  agent-deck session set my-project wrapper \"nvim +'terminal {command}'\"")
 }
@@ -190,6 +199,7 @@ func handleSessionStart(profile string, args []string) {
 	messageFile := fs.String("message-file", "", "Read the initial message from a file ('-' for stdin); avoids shell quoting of long prompts")
 	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode when starting Gemini or Codex sessions")
 	attach := fs.Bool("attach", false, "Attach to the session after starting (requires an interactive terminal)")
+	noWait := fs.Bool("no-wait", false, "Return as soon as the process is spawned instead of waiting up to 3s for the tool's session id (a caller that attaches right away; the id is still captured by hooks)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session start <id|title> [options]")
@@ -291,8 +301,13 @@ func handleSessionStart(profile string, args []string) {
 	}
 
 	// Capture session ID from tmux env before saving to JSON
-	// Claude: UUID is set by bash capture-resume pattern before exec
-	inst.PostStartSync(3 * time.Second)
+	// Claude: UUID is set by bash capture-resume pattern before exec.
+	// --no-wait skips this bounded wait for a caller that attaches at once
+	// (the remote TUI create path); hooks and the status loop capture the
+	// id shortly after.
+	if !*noWait {
+		inst.PostStartSync(3 * time.Second)
+	}
 
 	// Save updated state
 	if err := saveSessionData(storage, instances, groups); err != nil {
@@ -1572,6 +1587,8 @@ func handleSessionShow(profile string, args []string) {
 		fmt.Println("Usage: agent-deck session show [id|title] [options]")
 		fmt.Println()
 		fmt.Println("Show session details. If no ID is provided, auto-detects current session.")
+		fmt.Println("Account: shows the quoted stored account slot, not a resolved account or login identity.")
+		fmt.Println(`JSON always includes the raw "account" string, including "" when no slot is stored.`)
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -1648,6 +1665,7 @@ func handleSessionShow(profile string, args []string) {
 		"no_transition_notify": inst.NoTransitionNotify,
 		"title_locked":         inst.TitleLocked,
 		"tool":                 inst.Tool,
+		"account":              inst.Account,
 		"created_at":           inst.CreatedAt.Format(time.RFC3339),
 	}
 	// Honest Status v2: additive substate refinement (omit when none so the
@@ -1752,6 +1770,7 @@ func handleSessionShow(profile string, args []string) {
 	}
 
 	sb.WriteString(fmt.Sprintf("Tool:    %s\n", inst.Tool))
+	sb.WriteString(fmt.Sprintf("Account: %s\n", strconv.Quote(inst.Account)))
 	if modelInfo.ModelID != "" {
 		if modelInfo.Model != "" {
 			sb.WriteString(fmt.Sprintf("Model:   %s\n", modelInfo.Model))
@@ -1881,6 +1900,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  color              Optional TUI row tint: '#RRGGBB' or ANSI '0'..'255' or '' (issue #391)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
+		fmt.Println("  tool-session-id    Custom [tools.*] conversation ID (for resume_flag after reboot)")
 		fmt.Println("  account            Named account slot (#924) — resolves via [profiles.<account>.claude].config_dir; restart required")
 		fmt.Println("  idle-timeout       Auto-stop after no tmux output for this duration (#1143; Go duration: 30m, 1h, 24h; 0 disables)")
 		fmt.Println()
@@ -1989,6 +2009,16 @@ func handleSessionSet(profile string, args []string) {
 	// report what was actually stored rather than the raw argument.
 	if field == session.FieldPath {
 		value = inst.ProjectPath
+	}
+	// Custom-tool conversation id: sticky MergeToolDataExtras preserves
+	// generic_session_id when a full Save omits the key. CLI does not always
+	// register statedb.SetGlobal, so write through the open Storage DB before
+	// SaveWithGroups (set and intentional clear).
+	if field == session.FieldToolSessionID {
+		if err := session.PersistGenericSessionBinding(storage.GetDB(), inst); err != nil {
+			out.Error(fmt.Sprintf("failed to persist tool-session-id: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
 	}
 	// CLI holds no lock — run tmux side effects inline. TUI defers them
 	// until after instancesMu.Unlock.
@@ -2776,6 +2806,16 @@ func handleSessionSend(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	// PR #1942 review (P1a): refuse a send the target cannot receive. A DeepSeek
+	// web-profile pane runs an HTTP server with no terminal prompt, so keystrokes
+	// go to the server process's stdin and vanish while this command reports
+	// success. Silent message loss is the worst failure class here, so it is a
+	// hard refusal rather than a warning. Every other tool returns nil.
+	if err := inst.PromptDeliveryError(); err != nil {
+		out.Error(err.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
 	if shouldSkipConductorHeartbeatSend(inst, message) {
 		out.Success(fmt.Sprintf("Skipped heartbeat for '%s'", inst.Title), map[string]interface{}{
 			"success":       true,
@@ -3211,6 +3251,7 @@ func executeSend(target sendRetryTarget, tool, message string, noWait bool, tun 
 		tun.retry.composerPasteFreeBeforeSend = guard.ComposerPasteMarkerFree
 	}
 
+	tun.retry.tool = tool
 	delivery, err := sendWithRetryTarget(target, message, skipClaudeDeliveryVerify(tool), tun.retry)
 	res.delivery = delivery
 
@@ -3343,6 +3384,7 @@ type sendRetryOptions struct {
 	maxRetries     int
 	checkDelay     time.Duration
 	maxFullResends int // >0 overrides default (3); <0 disables Ctrl+C-then-resend; 0 uses default
+	tool           string
 
 	// verifyDelivery, when true, requires the verification loop to observe at
 	// least one positive signal that the message reached the inner agent (an
@@ -3481,6 +3523,18 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 	// Take the first run of non-whitespace content, capped, to avoid false
 	// positives from matching common short strings.
 	deliveryToken := messageDeliveryToken(message)
+	// presenceNeedle answers "is this message on screen", which is a different
+	// question from deliveryToken's "is this a distinctive enough string to
+	// treat as proof of delivery". The token is empty below 12 bytes, so
+	// without a fallback a short queued message like "OK" would read as absent
+	// forever and take the Ctrl+C-and-resend this guard exists to prevent.
+	// Falling back to the trimmed body can over-match a common short string,
+	// but the consequence is declining to interrupt a live target, which is the
+	// safe direction: such a message still surfaces via the #876 check.
+	presenceNeedle := deliveryToken
+	if presenceNeedle == "" {
+		presenceNeedle = strings.TrimSpace(message)
+	}
 	// attrib is the #1777 attribution gate. EVERY bare Enter in this loop —
 	// including the unsent-prompt branch, which used to press unconditionally
 	// whenever a "[Pasted text …]" marker appeared anywhere in the pane —
@@ -3494,6 +3548,9 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		time.Sleep(opts.checkDelay)
 
 		unsentPromptDetected := false
+		// bodyInPaneNow is this iteration's answer to "is the body on screen
+		// right now", deliberately not latched. See the resend branch below.
+		bodyInPaneNow := false
 		// paneNow is this iteration's observation (raw ANSI + whether the
 		// capture succeeded at all), and is what the attribution gate reads.
 		captured, captureErr := target.CapturePaneFresh()
@@ -3501,6 +3558,7 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 		if paneNow.OK {
 			content := tmux.StripANSI(captured)
 			unsentPromptDetected = send.ComposerHoldsPasteMarker(captured, tmux.StripANSI) || send.HasUnsentComposerPrompt(content, message)
+			bodyInPaneNow = presenceNeedle != "" && strings.Contains(content, presenceNeedle)
 			if !sawDeliveryEvidence && deliveryToken != "" && strings.Contains(content, deliveryToken) {
 				sawDeliveryEvidence = true
 			}
@@ -3544,7 +3602,44 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 				// Message may have been lost during TUI init: the prompt was
 				// visible but the input handler wasn't ready, so sent keys were
 				// discarded. Clear stale input and re-send the full message.
-				if waitingNoActivityChecks >= fullResendThreshold && fullResendCount < maxFullResends {
+				//
+				// THE GATE: fire only when the body is not on screen right now.
+				// A recovery for a body that is already there can only
+				// duplicate it, and the Ctrl+C that precedes it interrupts
+				// whatever the target is doing meanwhile. bodyInPaneNow is
+				// recomputed every iteration on purpose: "a resend would
+				// duplicate" is a claim about the present, so it needs a
+				// present-tense signal.
+				//
+				// NOT sawDeliveryEvidence, which is the obvious candidate and
+				// is wrong. It latches, and one of its sources is the composer
+				// merely HOLDING the message — the first step of the very
+				// TUI-init loss this recovery exists for. Gating on it would
+				// suppress the recovery exactly when it is needed and then,
+				// because the same flag suppresses the #876 error at the end of
+				// the budget, report the lost message as delivered. Compare
+				// sawUnsentMarker, which is tracked separately for the same
+				// provenance reason.
+				//
+				// paneNow.OK is required for a related reason one level down:
+				// bodyInPaneNow is only assigned when the capture succeeded, so
+				// without it the gate would read false by ABSENCE of an
+				// observation rather than by an observation of absence, and a
+				// failed CapturePaneFresh would re-authorize the Ctrl+C against
+				// a target that is working fine. A destructive branch should
+				// need positive evidence, not silence.
+				//
+				// History: #1979 is the busy target with the message already
+				// queued. It and a target that never received the message both
+				// fail to report "active" — they are indistinguishable BY
+				// STATUS ALONE, which is why this reaches for pane evidence
+				// instead. Ungated, the branch fired on the busy one and
+				// destroyed in-flight work at exit 0. #479 established the same
+				// double-send on the --no-wait path, which noWaitSendOptions
+				// disables outright; this keeps the recovery for the case it was
+				// written for.
+				if waitingNoActivityChecks >= fullResendThreshold && fullResendCount < maxFullResends &&
+					paneNow.OK && !bodyInPaneNow {
 					// The resend types the message and presses Enter, so it
 					// submits whatever the composer still holds. Ctrl+C is
 					// meant to empty it first — but a failed Ctrl+C, or one
@@ -3714,7 +3809,7 @@ type sendArrivalBaseline struct {
 // baseline is disabled, never guessed.
 func captureArrivalBaseline(target sendRetryTarget, message string) sendArrivalBaseline {
 	base := sendArrivalBaseline{}
-	if n, markers, ok := paneArrivalObservation(target, message); ok {
+	if n, markers, _, ok := paneArrivalObservation(target, message); ok {
 		base.occurrences, base.pasteMarkers, base.paneOK = n, markers, true
 	}
 	if status, err := target.GetStatus(); err == nil {
@@ -3801,8 +3896,11 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 			}
 		}
 		if baseline.paneOK {
-			if n, markers, ok := paneArrivalObservation(target, message); ok {
+			if n, markers, content, ok := paneArrivalObservation(target, message); ok {
 				if n > baseline.occurrences {
+					if opts.tool == "pi" && piComposerEmpty(content, message) {
+						return deliverySubmitted, nil
+					}
 					// Keep polling: the body is in, but the turn may still
 					// start within the budget and upgrade this to submitted.
 					sawBody = true
@@ -3904,7 +4002,8 @@ func maxDeliverableLineBytes(target sendRetryTarget) int {
 // paneArrivalObservation reads the pane ONCE and reports both arrival signals
 // the check compares against its baseline: how many times the message's
 // distinctive token is visible in the pane, and how many "[Pasted text …]"
-// collapse markers the COMPOSER holds. One capture serving both signals is
+// collapse markers the COMPOSER holds. It also returns stripped pane content
+// for tool-specific submission checks. One capture serving all signals is
 // deliberate — they must describe the same instant, and the scripted-capture
 // test fakes index captures by call count. The final bool reports whether the
 // pane was actually read: a failed look is not "zero occurrences", it is no
@@ -3923,18 +4022,43 @@ func maxDeliverableLineBytes(target sendRetryTarget) int {
 // composer holding one more marker than before is unsubmitted payload.
 //
 // Both counts are raw observations; the caller compares them to its baseline.
-func paneArrivalObservation(target sendRetryTarget, message string) (int, int, bool) {
+func paneArrivalObservation(target sendRetryTarget, message string) (int, int, string, bool) {
 	token := collapseWhitespace(messageDeliveryToken(message))
 	if token == "" {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 	raw, err := target.CapturePaneFresh()
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, "", false
 	}
 	content := tmux.StripANSI(raw)
 	return strings.Count(collapseWhitespace(content), token),
-		send.ComposerPasteMarkerCount(raw, tmux.StripANSI), true
+		send.ComposerPasteMarkerCount(raw, tmux.StripANSI), content, true
+}
+
+// piComposerEmpty recognizes Pi's editor between its final two horizontal
+// borders. Once this send's body is in the pane and that editor is empty, Enter
+// was accepted; an unsent message would still occupy the editor.
+func piComposerEmpty(content, message string) bool {
+	// User-provided rules can impersonate the editor's top border. A pane
+	// capture cannot distinguish those bytes from Pi's own empty editor, so
+	// these messages require an activity transition instead of visual inference.
+	if strings.Contains(tmux.StripANSI(message), strings.Repeat("─", 20)) {
+		return false
+	}
+	lines := strings.Split(content, "\n")
+	borders := make([]int, 0, 2)
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Count(line, "\u2500") >= 20 && strings.Trim(line, "\u2500") == "" {
+			borders = append(borders, i)
+		}
+	}
+	if len(borders) < 2 {
+		return false
+	}
+	top, bottom := borders[len(borders)-2], borders[len(borders)-1]
+	return strings.TrimSpace(strings.Join(lines[top+1:bottom], "\n")) == ""
 }
 
 // collapseWhitespace removes every whitespace byte, so a comparison survives
@@ -4085,12 +4209,11 @@ var freshOutputTestConfig *freshOutputConfig
 // This bridges the gap between the UI prompt reappearing (detected by
 // waitForCompletion) and the JSONL being flushed to disk.
 //
-// For non-Claude tools (Codex, Gemini, etc.) the JSONL freshness check is
-// skipped entirely to avoid an unnecessary 5s penalty, since those tools
-// don't use the same JSONL format.
+// Local Pi sessions also expose structured timestamps. Other tools and
+// nonlocal Pi sessions retain best-effort output without a freshness claim.
 //
-// Falls back to the best-effort response if the freshness timeout expires,
-// logging a warning to stderr so the caller knows the data may be stale.
+// Claude retains its best-effort response with a warning on timeout. Pi
+// returns an error instead of reporting an earlier turn as this send's reply.
 //
 // peers carries the profile snapshot for the #1400 collision guard: a
 // claude_session_id shared by multiple live instances resolves to ONE
@@ -4098,14 +4221,18 @@ var freshOutputTestConfig *freshOutputConfig
 // Fail fast (same semantics as --stream's #1352 guard) instead of polling
 // a colliding transcript until the freshness timeout.
 func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*session.Instance) (*session.ResponseOutput, error) {
-	// Non-Claude tools don't use JSONL timestamps — skip the freshness loop.
-	if !session.IsClaudeCompatible(inst.Tool) {
+	// Pi's transcript lives in the tool's HOME. Legacy SSH/sandbox instances
+	// use terminal fallback, which does not provide timestamp evidence.
+	localPi := inst.Tool == "pi" && !inst.IsSSH() && !inst.IsSandboxed()
+	if !session.IsClaudeCompatible(inst.Tool) && !localPi {
 		return inst.GetLastResponseBestEffort()
 	}
 
 	// #1400: refuse a colliding transcript before entering the poll loop.
-	if _, err := inst.GetJSONLPathChecked(peers); err != nil {
-		return nil, fmt.Errorf("refusing to read a colliding transcript: %w", err)
+	if session.IsClaudeCompatible(inst.Tool) {
+		if _, err := inst.GetJSONLPathChecked(peers); err != nil {
+			return nil, fmt.Errorf("refusing to read a colliding transcript: %w", err)
+		}
 	}
 
 	pollInterval := 250 * time.Millisecond
@@ -4120,6 +4247,11 @@ func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*sessi
 	// time.Now() can be slightly ahead of Claude's clock. Tighter than the
 	// original 2s to reduce false positives on genuinely stale output.
 	threshold := sentAt.Add(-250 * time.Millisecond)
+	if localPi {
+		// Pi records milliseconds; do not accept a previous turn under Claude's
+		// wider clock-skew allowance.
+		threshold = sentAt.Truncate(time.Millisecond)
+	}
 
 	deadline := time.Now().Add(timeout)
 	var lastResp *session.ResponseOutput
@@ -4151,7 +4283,15 @@ func waitForFreshOutput(inst *session.Instance, sentAt time.Time, peers []*sessi
 		time.Sleep(pollInterval)
 	}
 
-	// Freshness timeout: return whatever we have but warn that it may be stale
+	// Pi's send --wait result must belong to this turn. Neither stale text nor
+	// a terminal fallback without a timestamp can establish that relationship.
+	if localPi {
+		if lastErr != nil {
+			return nil, fmt.Errorf("Pi output freshness timeout (%s): %w", timeout, lastErr)
+		}
+		return nil, fmt.Errorf("Pi output freshness timeout (%s): no fresh assistant response", timeout)
+	}
+	// Preserve Claude's historical warning-and-best-effort timeout behavior.
 	if lastResp != nil {
 		fmt.Fprintf(os.Stderr, "Warning: output freshness timeout (%s) — response may be stale\n", timeout)
 		return lastResp, nil

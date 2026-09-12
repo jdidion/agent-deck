@@ -110,6 +110,8 @@ The table above is what *agent-deck* does. This one is what the *CLI inside a se
 |---------|---------|
 | `agent-deck` | Launch interactive TUI |
 | `agent-deck add -t "Name" -c claude /path` | Create session |
+| `agent-deck launch . -c claude --account <name>` | Create and start a session under a named account slot |
+| `agent-deck accounts [--json]` | List configured named account slots |
 | `agent-deck session start/stop/restart <name>` | Control session |
 | `agent-deck session send <name> "message"` | Send message |
 | `agent-deck session send <name> --message-file <file>` | Send message from file (`-` = stdin); no shell quoting. Also on `launch`/`session start` |
@@ -391,7 +393,7 @@ Key constraints:
 |-----|--------|
 | `/` | Local search |
 | `G` | Global search (all Claude conversations) |
-| `!@#$` | Filter by status (running/waiting/idle/error) |
+| `!@#&` | Filter by status (running/waiting/idle/error) |
 | `^` | View archived sessions |
 
 ### Global
@@ -815,9 +817,21 @@ Move a session — conversation included — to a different Claude account (work
   config_dir = "~/.claude-team"
 ```
 
+**In the TUI:** the New Session dialog's Claude options carry an `Account` row
+(`←`/`→` or `Space` to cycle; `inherit` keeps the conductor/group/env chain), and
+the Edit Session dialog (`e`) carries a `Claude account` row that runs the full
+switch — conversation migration and `--resume` restart included — on save. Both
+rows are hidden when no accounts are configured.
+
 **Commands:**
 
 ```bash
+# Inspect the account names available to add/launch/switch-account
+agent-deck accounts
+
+# Create and start a new session directly under one named account
+agent-deck launch . -c claude --account <account>
+
 # Full flow: stop → copy conversation into the target account → set account → restart with --resume
 agent-deck session switch-account <session> <account>
 

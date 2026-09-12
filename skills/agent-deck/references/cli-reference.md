@@ -16,6 +16,7 @@ Complete reference for all agent-deck CLI commands.
 - [Profile Commands](#profile-commands)
 - [Remote Commands](#remote-commands)
 - [Codex Hook Commands](#codex-hook-commands)
+- [DeepSeek Commands](#deepseek-commands)
 - [Conductor Commands](#conductor-commands)
 
 ## Global Options
@@ -25,6 +26,10 @@ Complete reference for all agent-deck CLI commands.
 --json                  JSON output
 -q, --quiet             Minimal output
 ```
+
+`--help` and `-h` are read-only on every human-facing command. Bare `help` is
+recognized only in a command position; in a value position it remains usable
+as a workspace, remote, session, or other identifier.
 
 ## Basic Commands
 
@@ -74,6 +79,7 @@ Examples:
 
 ```bash
 agent-deck launch . -c claude -m "Review this module"
+agent-deck launch . -c claude --account work -m "Review this module"
 agent-deck launch . -g ard -c claude -m "Review dataset"
 agent-deck launch . -c "codex --dangerously-bypass-approvals-and-sandbox"
 agent-deck launch -g book-keeper -c claude   # no path: lands on the group's default_path
@@ -81,6 +87,18 @@ agent-deck launch -g book-keeper -c claude   # no path: lands on the group's def
 
 Notes:
 - `[path]` omitted: resolves the target group's `default_path`, then the global `default_path` config key, then cwd — the same chain as `add` (#1303). An explicit `.` always means the current directory.
+- `--account <name>` selects a named slot from `[profiles.<name>.claude].config_dir` for this session, matching `add --account`.
+- `--account` requires an explicit name. If the next token is another launch flag, launch stops with an error before resolving a fallback account or creating a session; use `--account=<name>` when a name intentionally begins with a dash.
+
+### accounts - List named account slots
+
+```bash
+agent-deck accounts [--json]
+```
+
+Lists profiles that configure a Claude `config_dir`; these names are accepted by `add --account`, `launch --account`, `session set <id> account`, `session switch-account`, and the account rows in the TUI's New Session and Edit Session dialogs.
+
+Each row reports the slot name, its config dir, and whether that directory exists yet — a configured account with no directory has never been logged in (`CLAUDE_CONFIG_DIR=<dir> claude`, then `/login`). The `--json` form carries the same three fields (`name`, `config_dir`, `exists`).
 
 ### list - List sessions
 
@@ -88,6 +106,8 @@ Notes:
 agent-deck list [--json] [--all]
 agent-deck ls  # Alias
 ```
+
+Both JSON forms always include `account`: the exact stored per-session slot, including an empty string when no slot is explicitly stored. Human tables show the slot in a quoted `ACCOUNT` column, escaping controls. This is stored metadata, not a resolved account or login identity.
 
 ### remove - Remove session
 
@@ -214,6 +234,7 @@ Auto-detects current session if no ID provided.
 
 **JSON output includes:**
 - Session details (id, title, status, path, group, tool)
+- `account`: the exact stored slot, always present including an empty string. Human output shows a quoted, control-escaped `Account:` field; neither form resolves login identity.
 - Claude/Gemini session ID
 - Attached MCPs (local, global, project)
 - tmux session name
@@ -614,11 +635,11 @@ Removes a remote from configuration.
 ### remote list / ls
 
 ```bash
-agent-deck remote list [--json]
-agent-deck remote ls [--json]
+agent-deck remote list [--json] [--check]
+agent-deck remote ls [--json] [--check]
 ```
 
-Lists all configured remotes. Use `--json` for scripting.
+Lists all configured remotes. The VERSION column shows the agent-deck version each remote last reported (learned by the TUI poll, `remote update`, or `--check`), with `↑` when it is older than this controller; `-` means never checked. `--check` asks every remote now (one SSH call each) and refreshes that cache. Use `--json` for scripting (`version`, `version_checked_at`, `outdated`).
 
 ### remote sessions
 
@@ -629,6 +650,30 @@ agent-deck remote sessions [name] [--json]
 Fetches active sessions from all remotes, or from a specific remote if `name` is provided. Displays title, tool, live status, and session ID. Use `--json` for scripting.
 
 In the TUI, remote sessions use the same status indicators and nested group tree as local sessions. Remote headers and groups can be collapsed, and `K`/`J` preserve a manual order within each remote group. A session's location (local or SSH host plus remote path) is part of its identity, so identical titles at different locations do not collide.
+
+### remote drain
+
+```bash
+agent-deck remote drain <name|user@host> [--into <session-id>] [--json]
+```
+
+Pulls the completion and transition records a remote agent-deck instance holds and writes them into **this** machine's inbox, so a conductor that launched workers on another host learns they finished without tmux-scraping or file polling (issue #1948).
+
+Transition notifications are parent-linked, and a `parent_session_id` cannot point across machines — so a remote worker's completion never reaches a conductor on a different host. `remote drain` closes that gap by pulling: the conductor's own command is the delivery event, so there is no delivery handshake, no ack, and nothing to replay.
+
+| Flag | Description |
+| --- | --- |
+| `--into <session-id>` | Local session whose inbox receives the records (default: the calling session, same resolution as `inbox drain self`) |
+| `--json` | Emit `{remote, host, target_session_id, fetched, written, duplicates, records}` for a conductor heartbeat |
+
+- **What it returns.** Completions (from the completion ledger) *and* transitions — including the waiting/error/idle flips of sessions that have no parent on the remote host, which is the normal state for a worker whose conductor is on another machine. Those are kept in a reserved `_unowned` ledger beside the per-parent inboxes; a quota-stalled remote session shows up in a drain because of it. Sessions that opted out with `--no-transition-notify` are never exported.
+- **Read-only on the remote.** It runs the remote's `agent-deck inbox export`, which consumes, truncates and marks nothing. Two conductors draining the same host both receive the records, and the host's own conductor still drains its inbox normally.
+- **Safe to repeat.** Records are written through the inbox's existing fingerprint dedup, so a second drain reports `0 new` and adds no duplicate line. Across a consumption boundary the `turn_fingerprint` consumed ledger collapses a re-pulled record instead.
+- **Records are stored under `<remote>:<child-id>`.** A child id is only unique on the host that minted it — `run-task --child <ID>` takes any string — so two hosts running the same named task would otherwise produce records that destroy each other in the conductor's inbox (every identity rule downstream keys on the child id). The stored id names its host, in the same `<remote>:<session>` spelling the TUI uses for remote sessions.
+- **Honest about failure.** Exit `0` = drained (a reachable remote with nothing pending says so explicitly), `2` = unknown remote / none configured, `3` = the remote could not be reached *or could not read its own records*. Neither an ssh failure nor an unreadable record file on the remote ever reads as "nothing to report".
+- The remote must run a build that has `inbox export`; an older one is reported as a version error pointing at `agent-deck remote update`.
+
+Narrowing a drain to one conductor's children (`--parent <conductor-id>@<host>`) is deferred; it is sugar over this pull.
 
 ### remote attach
 
@@ -649,10 +694,10 @@ Renames a session on a remote instance.
 ### remote update
 
 ```bash
-agent-deck remote update [name]
+agent-deck remote update [name | --all]
 ```
 
-Downloads and installs the correct agent-deck binary (detected platform/arch) on all remotes, or on a specific remote if `name` is provided. Prompts for confirmation before updating.
+Downloads and installs the correct agent-deck binary (detected platform/arch) on a specific remote, or with `--all` (or no name) on every configured remote whose version is older than this controller's. Remotes run one at a time and each is reported as updated, already current, or failed with the reason; a remote that fails stays on its version (the archive is checksum-verified before deploy and the remote is re-checked afterwards, never a partial binary). Exit status is 1 when any remote failed. Remotes follow the controller's version automatically unless `[updates] auto_update_remotes = false` is set (see the config reference). When the remote user cannot write the install directory (a root-owned `/usr/local/bin`), the deploy runs through `sudo -n` if the remote allows passwordless sudo; otherwise it fails with `install path <path> is not writable by <user>` and the remedy (move the binary to `~/.local/bin` behind a symlink at the old path, or run the update with sudo). `agent-deck update` on the remote itself reports the same error for that case. The deploy stages to a temp file unique to that run, takes a lock directory next to the binary (`<path>.lock`, treated as abandoned after 15 minutes) so two controllers cannot interleave writes, and installs with mode 0755 regardless of umask; a second deploy that meets the lock is refused as busy and can simply be retried.
 
 ### Examples
 
@@ -663,7 +708,7 @@ agent-deck remote list
 agent-deck remote sessions dev
 agent-deck remote attach dev my-session
 agent-deck remote rename dev my-session new-name
-agent-deck remote update          # update all remotes
+agent-deck remote update --all    # update every remote older than this controller
 agent-deck remote update dev      # update specific remote
 ```
 
@@ -678,6 +723,29 @@ agent-deck codex-hooks uninstall
 ```
 
 Codex turn-level status uses its notify hook. Install it once per Codex home; if `CODEX_HOME` is set, use the same environment for installation and Codex sessions.
+
+## DeepSeek Commands
+
+Inspect the DeepSeek Harness (`dsh`) integration. Read-only; every subcommand takes `--json`.
+
+```bash
+agent-deck deepseek status              # resolved binary, version, DSH_HOME, profile, resume/fork support
+agent-deck deepseek profiles            # profiles under $DSH_HOME/profiles, with their bundle layers
+agent-deck deepseek sessions [path]     # dsh sessions recorded for a workspace (default: cwd)
+```
+
+The tool is named for the vendor; the binary it launches is `dsh`
+(`npm install -g @deepseek-ai/dsh`). Launch a session with
+`agent-deck launch -c deepseek`.
+
+`status --json` reports `resume_supported` and `fork_supported` as explicit booleans:
+`dsh` has no fork command, and neither shipped profile (`web`, `headless`) accepts a
+resume flag, so both are false on a default install. Configure with `[deepseek]`
+(`command`, `config_dir` → `DSH_HOME`, `profile`, `patches`, `host`/`port`/
+`trusted_hosts`, `resume_flag`, `extra_args`, `env_file`) and give each account its own
+harness home with `[profiles.<account>.deepseek].config_dir`.
+
+See [docs/tools/deepseek.md](../../../docs/tools/deepseek.md) for the full guide.
 
 ## Session Resolution
 
