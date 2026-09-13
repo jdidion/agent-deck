@@ -83,17 +83,27 @@ func isAttentionStatus(status string) bool {
 // syncAsks reconciles the ask_items store with the live state of one profile,
 // once per poll pass.
 //
-// It is LEVEL-triggered, not edge-triggered, and that is the whole reason it is
-// a self-contained pass rather than a hook into the transition-notifier edge
-// machinery. The store keys each ask on (instance, content signal) and upserts
-// ON CONFLICT DO NOTHING, so simply asserting "this ask exists" every pass is
-// idempotent: the first pass inserts, every later pass while the ask is pending
-// is a no-op. No transition edge, no from/to bookkeeping, and no dependence on
-// the daemon having observed the running snapshot that preceded the ask.
+// It is LEVEL-triggered and STATUS-driven: an ask is open for exactly as long as
+// its instance sits in an attention status (waiting/error), and there is at most
+// one open ask per instance. The lifecycle does NOT key on the transcript size.
+// An earlier design did, on the assumption that a waiting session appends nothing
+// so its content signal is stable across polls. That assumption is false — a
+// long-lived managed agent keeps appending to its JSONL even while it blocks on a
+// permission prompt, so the signal moved every poll and one unanswered prompt
+// churned into hundreds of create-then-resolve rows, leaving the open-only panel
+// almost always empty. ContentSig is kept as metadata but no longer gates open or
+// resolve.
 //
-// Best-effort throughout: a store error is logged, never fatal, and never
-// stalls the poll loop. The calls are local SQLite writes behind withBusyRetry,
-// so unlike the desktop notifier (which shells out) they need no goroutine.
+// Resolve runs before open so that an instance whose ask just closed (it left the
+// attention status) is eligible to open a fresh one in the same pass only when it
+// is still asking — which, by definition of "left the attention status", it is
+// not. A genuine second prompt after the human answers re-alerts: answering moves
+// the status out of waiting, resolving the first ask, so the next waiting finds no
+// open ask and opens a new one.
+//
+// Best-effort throughout: a store error is logged, never fatal, and never stalls
+// the poll loop. The calls are local SQLite writes behind withBusyRetry, so
+// unlike the desktop notifier (which shells out) they need no goroutine.
 func (d *TransitionDaemon) syncAsks(
 	profile string,
 	db *statedb.StateDB,
@@ -105,11 +115,31 @@ func (d *TransitionDaemon) syncAsks(
 		return
 	}
 
-	// Open (idempotent). A pending ask appends nothing to the transcript, so
-	// its content signal — and thus its id — is stable across polls, and the
-	// upsert is a no-op after the first observation.
+	open, err := db.ListOpenAskItems()
+	if err != nil {
+		askLog.Debug("ask_list_open_failed", slog.String("error", err.Error()))
+		return
+	}
+	now := time.Now()
+
+	// Resolve. An open item closes when its session is gone from the live set,
+	// or is no longer in an attention status (the ask was answered and the agent
+	// moved on). hasOpen tracks which instances still hold an open ask after this
+	// pass, so the open phase below does not create a duplicate for them.
+	hasOpen := make(map[string]bool, len(open))
+	for _, item := range open {
+		if _, live := byID[item.InstanceID]; !live || !isAttentionStatus(statuses[item.InstanceID]) {
+			d.resolveAsk(db, item.ID, now)
+			continue
+		}
+		hasOpen[item.InstanceID] = true
+	}
+
+	// Open. One ask per instance: skip any that already has one open. A pending
+	// ask is re-derived every pass, so this gate — not the transcript signal — is
+	// what makes a sustained wait collapse to a single row.
 	for id, inst := range byID {
-		if inst == nil {
+		if inst == nil || hasOpen[id] {
 			continue
 		}
 		kind, summary, ok := deriveAsk(hookStatuses[id], statuses[id])
@@ -125,40 +155,13 @@ func (d *TransitionDaemon) syncAsks(
 			Summary:    summary,
 			ContentSig: sig,
 			Event:      hookEventOf(hookStatuses[id]),
-			CreatedAt:  time.Now(),
+			CreatedAt:  now,
 		}
 		if err := db.UpsertAskItem(row); err != nil {
 			askLog.Debug("ask_upsert_failed",
 				slog.String("instance_id", id), slog.String("error", err.Error()))
 		}
-	}
-
-	// Resolve. An open item closes when its session has moved on: deleted, no
-	// longer in an attention status, or its transcript advanced past the signal
-	// the ask opened at (the ask was answered and the agent resumed).
-	//
-	// Keying resolution on the content signal, not on an observed running
-	// snapshot, is what makes a waiting -> idle -> waiting fast turn resolve
-	// correctly: the answered turn always appends to the transcript, so the
-	// signal moves even when the daemon never sampled a running status in
-	// between. The status check is the fallback for sessions with no resolvable
-	// transcript (whose signal never moves), so an errored shell still clears.
-	open, err := db.ListOpenAskItems()
-	if err != nil {
-		askLog.Debug("ask_list_open_failed", slog.String("error", err.Error()))
-		return
-	}
-	now := time.Now()
-	for _, item := range open {
-		inst, live := byID[item.InstanceID]
-		switch {
-		case !live:
-			d.resolveAsk(db, item.ID, now)
-		case transitionEventOutputHash(inst) != item.ContentSig:
-			d.resolveAsk(db, item.ID, now)
-		case !isAttentionStatus(statuses[item.InstanceID]):
-			d.resolveAsk(db, item.ID, now)
-		}
+		hasOpen[id] = true
 	}
 }
 
