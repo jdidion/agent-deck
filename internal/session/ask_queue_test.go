@@ -136,14 +136,20 @@ func TestSyncAsks_ResolvesWhenInstanceGone(t *testing.T) {
 	}
 }
 
-// The content-signal branch, isolated: a seeded item whose stored signal no
-// longer matches the live instance's must resolve, and a matching one while
-// still waiting must stay open.
-func TestSyncAsks_ResolvesOnContentSigChange(t *testing.T) {
+// The content-signal branch, isolated: the lifecycle no longer keys open/
+// resolve on ContentSig at all, so a seeded item whose stored signal no
+// longer matches what a live re-derive would compute must STAY open as long
+// as the instance is still in an attention status. This is the inverse of
+// the old (buggy) expectation: under the previous content-sig-gated design a
+// mismatched signal resolved the item every poll, which is exactly the
+// churn this rewrite guards against.
+func TestSyncAsks_ContentSigMismatchStaysOpenWhileWaiting(t *testing.T) {
 	d, db, profile := newAskDaemon(t)
 
-	// Seed one open item whose signal is stale, one whose signal still matches.
-	// The live instances have no transcript, so their current signal is "".
+	// Seed two open items. The live instances have no transcript, so a live
+	// re-derive of the signal is always "". "stale" was seeded with a signal
+	// that no longer matches; "fresh" was seeded with a signal that still
+	// does. Neither fact may matter to the lifecycle now.
 	seed := func(id, sig string) {
 		row := &statedb.AskItemRow{
 			ID:         askItemID(id, sig),
@@ -159,26 +165,28 @@ func TestSyncAsks_ResolvesOnContentSigChange(t *testing.T) {
 		}
 	}
 	seed("stale", "jsonl:500")
-	seed("fresh", "") // matches the live "" signal
+	seed("fresh", "")
 
 	byID := map[string]*Instance{"stale": {ID: "stale"}, "fresh": {ID: "fresh"}}
 	statuses := map[string]string{"stale": "waiting", "fresh": "waiting"}
 
-	d.syncAsks(profile, db, byID, statuses, nil) // no hooks -> open phase adds nothing
+	d.syncAsks(profile, db, byID, statuses, nil)
 
 	open, err := db.ListOpenAskItems()
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(open) != 1 || open[0].InstanceID != "fresh" {
-		t.Fatalf("open items = %+v, want only the still-matching 'fresh' one; the stale-signal item must resolve", open)
+	if len(open) != 2 {
+		t.Fatalf("open items = %+v, want both still open: a ContentSig mismatch must not resolve an ask while its instance is still waiting", open)
 	}
 }
 
-// End-to-end with a REAL growing transcript, proving the two behaviours that
-// were hard for the desktop notifier: an answered ask resolves on transcript
-// advance (no running snapshot required), and a genuine second prompt opens a
-// NEW item rather than being suppressed.
+// End-to-end with a REAL growing transcript, proving the behaviours that
+// were hard for the desktop notifier and the whole point of the status-driven
+// rewrite: a sustained wait collapses to a single ask no matter how much the
+// transcript grows underneath it, resolution happens only when the status
+// leaves the attention set, and a genuine second prompt opens a NEW item
+// rather than being suppressed.
 func TestSyncAsks_RealTranscript_ResolveThenReopen(t *testing.T) {
 	d, db, profile := newAskDaemon(t)
 
@@ -209,16 +217,31 @@ func TestSyncAsks_RealTranscript_ResolveThenReopen(t *testing.T) {
 		t.Errorf("summary = %q, want the hook message", open[0].Summary)
 	}
 
-	// Human answers: the agent resumes and appends to the transcript. No hook
-	// ask now, status back to running.
-	writeAskTranscript(t, inst, "line one\nline two — the answer and the work\n")
+	// The agent is still blocked on the SAME prompt, but its transcript keeps
+	// growing underneath it — this is the exact regression the rewrite
+	// guards against. Status stays waiting; the ask must neither resolve nor
+	// duplicate.
+	writeAskTranscript(t, inst, "line one\nline two -- still blocked, transcript grew\n")
+	d.syncAsks(profile, db, byID, map[string]string{"wh": "waiting"}, perm)
+	open, _ = db.ListOpenAskItems()
+	if len(open) != 1 {
+		t.Fatalf("sustained wait with transcript growth: open = %d, want 1 (no duplicate)", len(open))
+	}
+	if open[0].ID != firstID {
+		t.Error("sustained wait with transcript growth changed the ask id; growth alone must not open a new ask")
+	}
+
+	// Human answers: the agent resumes. No hook ask now, status back to
+	// running. Resolution is on the status leaving waiting, not on transcript
+	// advance.
+	writeAskTranscript(t, inst, "line one\nline two -- still blocked, transcript grew\nline three -- the answer and the work\n")
 	d.syncAsks(profile, db, byID, map[string]string{"wh": "running"}, nil)
 	if n := openAskCount(t, d, profile); n != 0 {
-		t.Fatalf("after the answer, open = %d, want 0 (resolved on transcript advance)", n)
+		t.Fatalf("after the answer, open = %d, want 0 (resolved on status leaving waiting)", n)
 	}
 
 	// Prompt 2: a genuinely new request, transcript grown further.
-	writeAskTranscript(t, inst, "line one\nline two — the answer and the work\nline three\n")
+	writeAskTranscript(t, inst, "line one\nline two -- still blocked, transcript grew\nline three -- the answer and the work\nline four\n")
 	d.syncAsks(profile, db, byID, map[string]string{"wh": "waiting"}, perm)
 	open, _ = db.ListOpenAskItems()
 	if len(open) != 1 {
@@ -226,6 +249,48 @@ func TestSyncAsks_RealTranscript_ResolveThenReopen(t *testing.T) {
 	}
 	if open[0].ID == firstID {
 		t.Error("prompt 2 reused the first ask's id; a new turn must be a new item")
+	}
+}
+
+// Direct repro of the measured production failure: a single unanswered
+// permission prompt whose transcript keeps growing underneath it (469 rows
+// observed for one instance under the old content-sig-gated design). With
+// the status-driven lifecycle, the open count must stay exactly 1 after
+// EVERY pass, no matter how many times the transcript grows while the
+// instance sits in `waiting`.
+func TestSyncAsks_SustainedWaitGrowingTranscriptStaysSingleOpen(t *testing.T) {
+	d, db, profile := newAskDaemon(t)
+
+	inst := &Instance{
+		ID:              "wh",
+		Title:           "flow",
+		Tool:            "claude",
+		ClaudeSessionID: "22222222-2222-2222-2222-222222222222",
+		ProjectPath:     t.TempDir(),
+	}
+	byID := map[string]*Instance{"wh": inst}
+	perm := map[string]*HookStatus{"wh": {Event: "notification", Matcher: "permission_prompt", Message: "Run the build?"}}
+	statuses := map[string]string{"wh": "waiting"}
+
+	var firstID string
+	content := "line one\n"
+	for i := 0; i < 8; i++ {
+		content += "more agent output emitted while still blocked on the same prompt\n"
+		writeAskTranscript(t, inst, content)
+		d.syncAsks(profile, db, byID, statuses, perm)
+
+		open, err := db.ListOpenAskItems()
+		if err != nil {
+			t.Fatalf("iteration %d: list: %v", i, err)
+		}
+		if len(open) != 1 {
+			t.Fatalf("iteration %d: open = %d, want exactly 1 despite a growing transcript under a sustained wait", i, len(open))
+		}
+		if i == 0 {
+			firstID = open[0].ID
+		} else if open[0].ID != firstID {
+			t.Fatalf("iteration %d: ask id changed from %q to %q; a sustained wait must stay a single ask", i, firstID, open[0].ID)
+		}
 	}
 }
 

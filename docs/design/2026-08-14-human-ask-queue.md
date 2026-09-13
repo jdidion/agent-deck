@@ -41,12 +41,19 @@ The detection, taxonomy, dedup, and resolution signals already exist:
   Stop-edge transcript reader (#1186) already opens the transcript JSONL tail
   through `session.ValidateTranscriptPath`, a fail-closed containment guard, so
   the assistant's last message is reachable by an already-reviewed path.
-- **Dedup / lifecycle** ride `transitionEventOutputHash` →
-  `transitionContentSignal` (`transition_notifier.go:489`), which is the
-  transcript *size*. It is stable while a session waits (a pending ask appends
-  nothing) and strictly increases on a genuine new turn. That gives idempotent
-  open (same signal = same ask) and clean resolution (signal advanced = the ask
-  was answered and the agent moved on) for free.
+- **Lifecycle is STATUS-driven, one open ask per instance.** An earlier design
+  keyed both identity and resolution on `transitionEventOutputHash` →
+  `transitionContentSignal` (the transcript *size*), on the assumption that a
+  waiting session appends nothing so the signal is stable. That assumption is
+  false in practice: a long-lived managed agent keeps appending to its JSONL
+  even while it sits at a permission prompt, so the size changes every poll. The
+  effect was catastrophic churn — one unanswered prompt produced hundreds of
+  create-then-resolve rows (measured: 469 for a single instance), and the
+  open-only panel almost never caught one. The lifecycle now ignores transcript
+  size: an ask opens when an instance enters an attention status with no ask
+  already open, and resolves only when it LEAVES that status (or the instance
+  disappears). `ContentSig` is retained as metadata but no longer gates the
+  lifecycle.
 - **The producer edge** is the poll loop in `internal/session/transition_daemon.go`
   that already computes every `running → waiting/error` transition and the
   content signal, at two sites: the snapshot loop (`:442`) and
@@ -127,21 +134,26 @@ instance owns the write, via the existing claim/primary election.
 
 Two additions to the poll loop, alongside the existing transition handling:
 
-**Open.** At the two transition sites, when the edge fires for
-`waiting`/`error` (or a `stop` with a completion sentinel), derive `AskKind`
-from `(event, matcher, status, DoneStatus)`, compute `ContentSig =
-transitionEventOutputHash(inst)`, and `UpsertAskItem`. Idempotent by
-construction.
+**Resolve first, then open**, once per pass, level-triggered:
 
-**Resolve.** Once per pass, walk open items and resolve any whose live session
-`ContentSig` now exceeds the value stored at open — the transcript grew, so the
-turn advanced and the ask was answered.
+**Resolve.** Walk open items; resolve any whose instance is gone from the live
+set, or whose live status is no longer an attention status (`waiting`/`error`).
+Leaving the attention status is what "the human answered / the agent moved on"
+looks like, independent of the transcript.
 
-Resolution keys on the content signal, NOT on an observed `running` status.
-This deliberately sidesteps the fast-turn trap that the desktop notifier had to
-handle with `releasesDesktopEdge`: a `waiting → idle → waiting` turn too fast
-for a `running` snapshot still appends to the transcript, so the signal advances
-and the item resolves correctly even when the daemon never sampled `running`.
+**Open.** For each live instance in an attention status that `deriveAsk`
+classifies AND that has no ask still open after the resolve pass, `UpsertAskItem`
+one row. Gating on "no open ask for this instance" is what keeps a sustained
+wait to a single row no matter how much the transcript grows underneath it.
+
+A genuine second prompt after the human answers still re-alerts: answering moves
+the status out of `waiting`, which resolves the first ask, so the next `waiting`
+finds no open ask and opens a fresh one. The one edge case the old
+content-signal design handled that this does not: a `waiting → idle → waiting`
+turn too fast for the daemon to ever sample the intermediate non-attention
+status collapses to a single open ask spanning both prompts. That is acceptable
+— it still points the human at a session that needs them — and far better than
+the churn the signal-based resolution produced.
 
 Best-effort, like the desktop notifier: a store error is logged, never fatal,
 and never stalls the poll loop. The store call is a local SQLite write behind
