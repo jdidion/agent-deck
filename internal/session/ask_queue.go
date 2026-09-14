@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,12 +24,32 @@ const (
 	AskError      AskKind = "error"      // session entered the error status
 )
 
-// askItemID is the stable identity of an ask. The same (instance, content
-// signal) always hashes to the same id, so re-observing one pending ask across
-// polls collapses onto a single row — the store upsert is ON CONFLICT(id) DO
-// NOTHING. A genuine new turn changes the content signal, and therefore the id.
-func askItemID(instanceID, sig string) string {
-	sum := sha256.Sum256([]byte(instanceID + "\x00" + sig))
+const (
+	// askPruneInterval rate-limits PruneResolvedAskItems so it runs at most once
+	// per profile per interval instead of every poll.
+	askPruneInterval = time.Hour
+	// askResolvedRetention is how long a resolved ask row is kept before pruning,
+	// so a recently-closed request stays inspectable for a while but the table
+	// stays bounded for a long-lived profile.
+	askResolvedRetention = 48 * time.Hour
+)
+
+// askItemID is the identity of one open ask, hashed from the instance and a
+// per-open discriminator.
+//
+// Identity must NOT be derived from the transcript content signal. That was the
+// original scheme and it had two failure modes, both proven in review: when the
+// signal is empty (every non-Claude tool, remote/SSH sessions, and any Claude
+// session before its transcript file exists) or merely unchanged between two
+// turns, a second ask for the instance hashed to the SAME id as the first —
+// which, once the first was resolved, made the ON CONFLICT(id) DO NOTHING upsert
+// a silent no-op, so the reopen never surfaced. Idempotency for a SUSTAINED wait
+// is enforced by the hasOpen gate in syncAsks (one open ask per instance), not by
+// the id, so the discriminator only has to be unique per open episode; the open
+// timestamp is. The transcript signal is kept as row metadata (ContentSig), not
+// as identity.
+func askItemID(instanceID, disambig string) string {
+	sum := sha256.Sum256([]byte(instanceID + "\x00" + disambig))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -148,7 +169,7 @@ func (d *TransitionDaemon) syncAsks(
 		}
 		sig := transitionEventOutputHash(inst)
 		row := &statedb.AskItemRow{
-			ID:         askItemID(id, sig),
+			ID:         askItemID(id, strconv.FormatInt(now.UnixNano(), 10)),
 			InstanceID: id,
 			Profile:    profile,
 			Kind:       string(kind),
@@ -162,6 +183,16 @@ func (d *TransitionDaemon) syncAsks(
 				slog.String("instance_id", id), slog.String("error", err.Error()))
 		}
 		hasOpen[id] = true
+	}
+
+	// Prune resolved rows so the table stays bounded, throttled per profile.
+	// Without this, every answered/errored turn leaves a row behind forever.
+	if last := d.lastAskPrune[profile]; last.IsZero() || now.Sub(last) >= askPruneInterval {
+		d.lastAskPrune[profile] = now
+		if err := db.PruneResolvedAskItems(now.Add(-askResolvedRetention)); err != nil {
+			askLog.Debug("ask_prune_failed",
+				slog.String("profile", profile), slog.String("error", err.Error()))
+		}
 	}
 }
 

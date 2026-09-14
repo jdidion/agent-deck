@@ -11373,9 +11373,10 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.helpOverlay.Show()
 		return h, nil
 
-	case "a":
+	case defaultHotkeyBindings[hotkeyAskPanel]:
 		// Open the human-ask queue: a cross-session list of open requests an
-		// agent has made of the human (permission / question / error).
+		// agent has made of the human (permission / question / error). Bound on a
+		// chord (see hotkeyAskPanel) so it does not shadow quick_approve's "a".
 		h.refreshAskPanel()
 		h.askPanel.SetSize(h.width, h.height)
 		h.askPanel.Show()
