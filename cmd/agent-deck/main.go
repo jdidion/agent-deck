@@ -1038,6 +1038,12 @@ func main() {
 	// startup; live sibling TUIs (allow_multiple=true) are preserved.
 	tmux.SweepStaleControlClients(tmux.DefaultSocketName())
 
+	// Ensure the always-on notify daemon is running so notifications actually
+	// fire (parent inbox, desktop/cmux banners, the ask queue) — it is a
+	// separate process the TUI does not otherwise start. Guarded by a
+	// machine-wide lock, so this is a no-op when one is already up.
+	ensureNotifyDaemon()
+
 	p := tea.NewProgram(
 		homeModel,
 		tea.WithAltScreen(),

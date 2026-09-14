@@ -257,6 +257,7 @@ type Home struct {
 	search               *Search
 	globalSearch         *GlobalSearch              // Global session search across all Claude conversations
 	globalSearchIndex    *session.GlobalSearchIndex // Search index (nil if disabled)
+	askPanel             *AskPanel                  // Open human-ask queue across sessions (see docs/design/2026-08-14-human-ask-queue.md)
 	newDialog            *NewDialog
 	pendingRemoteName    string                // #1353: remote target for the open new-session dialog ("" = local)
 	groupDialog          *GroupDialog          // For creating/renaming groups
@@ -1932,6 +1933,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// content into memory, causing agent-deck to balloon to 6+ GB and get OOM-killed.
 	// TODO: Fix by limiting watched dirs and enforcing balanced tier for large datasets.
 	h.globalSearch = NewGlobalSearch()
+	h.askPanel = NewAskPanel()
 	// claudeDir := session.GetClaudeConfigDir()
 	// userConfig, _ := session.LoadUserConfig()
 	// if userConfig != nil && userConfig.GlobalSearch.Enabled {
@@ -8929,6 +8931,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh cost totals for header display
 		h.refreshCostTotals()
 
+		// Live-refresh the ask panel while it is open, so items appear/resolve
+		// under the human as the producer daemon writes the store.
+		if h.askPanel.IsVisible() {
+			h.refreshAskPanel()
+		}
+
 		// Periodic UI state save (every 5 ticks = ~10 seconds)
 		h.uiStateSaveTicks++
 		if h.uiStateSaveTicks >= 5 {
@@ -9260,6 +9268,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.globalSearch.IsVisible() {
 			return h.handleGlobalSearchKey(msg)
 		}
+		if h.askPanel.IsVisible() {
+			return h.handleAskPanelKey(msg)
+		}
 		if h.newDialog.IsVisible() {
 			return h.handleNewDialogKey(msg)
 		}
@@ -9448,6 +9459,73 @@ func (h *Home) jumpToSession(inst *session.Instance) {
 			break
 		}
 	}
+}
+
+// refreshAskPanel reloads the open-ask queue from the current profile's store
+// and hands the display rows (store row + resolved session title) to the
+// panel. Best-effort: a nil storage/db or a read error just leaves the panel
+// with whatever rows it had. The db is per-profile, so ListOpenAskItems only
+// ever returns the current profile's items.
+func (h *Home) refreshAskPanel() {
+	if h.storage == nil {
+		return
+	}
+	db := h.storage.GetDB()
+	if db == nil {
+		return
+	}
+	items, err := db.ListOpenAskItems()
+	if err != nil {
+		return
+	}
+	rows := make([]askRow, 0, len(items))
+	for _, item := range items {
+		title := item.InstanceID
+		if inst := h.getInstanceByID(item.InstanceID); inst != nil {
+			title = inst.Title
+		}
+		rows = append(rows, askRow{item: item, title: title})
+	}
+	h.askPanel.SetRows(rows)
+}
+
+// handleAskPanelKey routes keys while the ask panel is open. v1 is
+// read-and-jump: Enter selects the owning session, r dismisses an item in
+// place, esc/a/q close the panel.
+func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		h.askPanel.MoveUp()
+		return h, nil
+	case "down", "j":
+		h.askPanel.MoveDown()
+		return h, nil
+	case "enter":
+		sel := h.askPanel.Selected()
+		if sel != nil {
+			if inst := h.getInstanceByID(sel.InstanceID); inst != nil {
+				h.jumpToSession(inst)
+			}
+		}
+		h.askPanel.Hide()
+		return h, nil
+	// TODO(ask-queue v2): answer-in-place here — route a reply to sel.InstanceID via session send.
+	case "r":
+		// Manual dismiss: resolve the item and stay in the panel so the human
+		// can keep working the queue down.
+		sel := h.askPanel.Selected()
+		if sel != nil && h.storage != nil {
+			if db := h.storage.GetDB(); db != nil {
+				_ = db.ResolveAskItem(sel.ID, time.Now())
+			}
+		}
+		h.refreshAskPanel()
+		return h, nil
+	case "esc", "a", "q":
+		h.askPanel.Hide()
+		return h, nil
+	}
+	return h, nil
 }
 
 // createSessionFromGlobalSearch creates a new Agent Deck session from global search result
@@ -10246,7 +10324,7 @@ func (h *Home) hasModalVisible() bool {
 		(h.toolVisibilityPanel != nil && h.toolVisibilityPanel.IsVisible()) ||
 		h.watcherPanel.IsVisible() || // hotkeyWatcherPanel overlay
 		h.agentsPanel.IsVisible() || // hotkeyAgentsPanel overlay
-		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
+		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() || h.askPanel.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.promptInputDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
@@ -11295,6 +11373,15 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.helpOverlay.Show()
 		return h, nil
 
+	case defaultHotkeyBindings[hotkeyAskPanel]:
+		// Open the human-ask queue: a cross-session list of open requests an
+		// agent has made of the human (permission / question / error). Bound on a
+		// chord (see hotkeyAskPanel) so it does not shadow quick_approve's "a".
+		h.refreshAskPanel()
+		h.askPanel.SetSize(h.width, h.height)
+		h.askPanel.Show()
+		return h, nil
+
 	case "<":
 		// Sessions/Preview split: shrink preview by previewPctStep (#1092).
 		// Works in dual (horizontal) and stacked (vertical) layouts — the
@@ -12235,7 +12322,9 @@ func (h *Home) confirmAction() tea.Cmd {
 	case ConfirmDeleteGroup:
 		groupPath := h.confirmDialog.GetTargetID()
 		h.groupTree.DeleteGroup(groupPath)
-
+		// SaveGroups is additive (never prunes), so the removed group's rows must
+		// be deleted explicitly or it would resurrect on the next reload.
+		h.deleteGroupRows(groupPath)
 		h.instancesMu.Lock()
 		h.instances = h.groupTree.GetAllInstances()
 		h.instancesMu.Unlock()
@@ -13497,7 +13586,10 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.pendingGroupOps = append(h.pendingGroupOps, pendingGroupOp{
 					kind: groupOpRename, oldPath: oldPath, name: name,
 				})
-
+				// A rename re-paths the group and its subgroups; the old path rows
+				// must be deleted explicitly (additive SaveGroups won't prune them)
+				// or the group reappears under its old name on the next reload.
+				h.deleteGroupRows(oldPath)
 				h.instancesMu.Lock()
 				h.instances = h.groupTree.GetAllInstances()
 				h.instancesMu.Unlock()
@@ -13890,6 +13982,19 @@ func (h *Home) adoptRestartRecord(sessionID string) {
 	if h.storageWatcher != nil {
 		// Our own bump should not make the watcher schedule a reload either.
 		h.storageWatcher.NotifySave()
+	}
+}
+
+// deleteGroupRows removes a group and its descendants from the groups table.
+// SaveGroups is additive (upsert, never prune), so an intentional removal —
+// delete or the old path of a rename/move — must be persisted explicitly here,
+// otherwise the stale rows resurrect the group on the next reload.
+func (h *Home) deleteGroupRows(path string) {
+	if h.storage == nil || path == "" {
+		return
+	}
+	if err := h.storage.DeleteGroupSubtree(path); err != nil {
+		uiLog.Warn("delete_group_rows_failed", slog.String("path", path), slog.String("error", err.Error()))
 	}
 }
 
@@ -17315,6 +17420,9 @@ func (h *Home) renderFrame() string {
 	}
 	if h.globalSearch.IsVisible() {
 		return h.globalSearch.View()
+	}
+	if h.askPanel.IsVisible() {
+		return h.askPanel.View()
 	}
 	if h.newDialog.IsVisible() {
 		return h.newDialog.View()

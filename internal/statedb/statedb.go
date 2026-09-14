@@ -588,6 +588,35 @@ func (s *StateDB) Migrate() error {
 		return fmt.Errorf("statedb: create watcher_events index: %w", err)
 	}
 
+	// ask_items table (human ask queue): a cross-session list of open requests
+	// an agent has made of the human. A dumb persistence table — all policy
+	// (kind derivation, dedup, resolution) lives in the producer daemon. Row
+	// identity is the producer-supplied id (hash of instance_id + content
+	// signal); ON CONFLICT DO NOTHING makes re-opening the same ask idempotent.
+	// Timestamps are unix-nano; resolved_at == 0 means open. See
+	// docs/design/2026-08-14-human-ask-queue.md.
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS ask_items (
+			id          TEXT PRIMARY KEY,
+			instance_id TEXT NOT NULL,
+			profile     TEXT NOT NULL DEFAULT '',
+			kind        TEXT NOT NULL DEFAULT '',
+			summary     TEXT NOT NULL DEFAULT '',
+			content_sig TEXT NOT NULL DEFAULT '',
+			event       TEXT NOT NULL DEFAULT '',
+			created_at  INTEGER NOT NULL DEFAULT 0,
+			resolved_at INTEGER NOT NULL DEFAULT 0
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create ask_items: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_ask_open ON ask_items(resolved_at)`); err != nil {
+		return fmt.Errorf("statedb: create idx_ask_open: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_ask_instance ON ask_items(instance_id)`); err != nil {
+		return fmt.Errorf("statedb: create idx_ask_instance: %w", err)
+	}
+
 	// ALTER TABLE migrations for existing databases.
 	// CREATE TABLE IF NOT EXISTS won't add new columns to tables that already exist.
 	// Each migration is idempotent: errors from "duplicate column" are silently ignored.

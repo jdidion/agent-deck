@@ -1252,6 +1252,27 @@ type NotificationsConfig struct {
 	// on by default; this covers the operator, including TOP-LEVEL sessions with
 	// no parent, which the transition path cannot reach at all.
 	Desktop bool `toml:"desktop,omitempty"`
+
+	// AutostartDaemon makes the TUI launch the always-on notify daemon on
+	// startup if one is not already running. The daemon is a SEPARATE process
+	// that does all notification dispatch (parent inbox, desktop banners, the
+	// ask queue); without it those never fire. Historically it had to be
+	// installed as a launchd/systemd service, so an operator running the TUI
+	// standalone got no notifications at all. Default true (nil = true): the
+	// spawn is guarded by a machine-wide lock, so repeated launches and
+	// multiple TUIs never produce a second daemon. Set false to manage the
+	// daemon yourself (e.g. via launchd).
+	AutostartDaemon *bool `toml:"autostart_daemon,omitempty"`
+}
+
+// GetAutostartDaemonEnabled reports whether the TUI should auto-start the notify
+// daemon. Defaults to true when unset (nil): the whole notification stack is
+// inert without a running daemon, so the safe default is to ensure one.
+func (n NotificationsConfig) GetAutostartDaemonEnabled() bool {
+	if n.AutostartDaemon == nil {
+		return true
+	}
+	return *n.AutostartDaemon
 }
 
 // GetDesktopEnabled reports whether desktop notifications are enabled.

@@ -62,6 +62,18 @@ const (
 	// have the bare key can set [hotkeys].agents_panel = "a" and move
 	// quick_approve.
 	hotkeyAgentsPanel = "agents_panel"
+	// hotkeyAskPanel opens the human-ask queue: a cross-session list of open
+	// requests an agent has made of the human (permission / question / error).
+	//
+	// It ships on the "alt+q" chord, not a bare letter. The bare "a" it
+	// originally used is quick_approve's canonical key, so a literal `case "a"`
+	// in the home dispatch shadowed quick_approve entirely (a duplicate switch
+	// case Go cannot flag, because the sibling arm is a map index rather than a
+	// constant). Every plain letter that reads as "ask" is taken, so — like
+	// hotkeyAgentsPanel with "alt+a" — this keeps a mnemonic on a free chord. A
+	// user who wants the bare key can set [hotkeys].ask_panel and move whatever
+	// currently owns it.
+	hotkeyAskPanel = "ask_panel"
 	// Session switcher. While attached it is intercepted in the tmux attach
 	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
 	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
@@ -130,6 +142,7 @@ var hotkeyActionOrder = []string{
 	hotkeyDetach,
 	hotkeyWatcherPanel,
 	hotkeyAgentsPanel,
+	hotkeyAskPanel,
 	hotkeySwitchSession,
 }
 
@@ -178,6 +191,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeyDetach:           "ctrl+q",
 	hotkeyWatcherPanel:     "w",
 	hotkeyAgentsPanel:      "alt+a",
+	hotkeyAskPanel:         "alt+q",
 	hotkeySwitchSession:    "ctrl+s",
 }
 

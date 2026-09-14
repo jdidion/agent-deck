@@ -83,6 +83,13 @@ type TransitionDaemon struct {
 	// means "never run" — the first SyncOnce pass will perform it.
 	lastInboxTTLSweep time.Time
 
+	// lastAskPrune tracks, per profile, the most recent PruneResolvedAskItems
+	// call so the ask store is pruned at most once per askPruneInterval rather
+	// than every poll. Without this the resolved rows the producer accumulates
+	// would grow the table without bound. Accessed only from the single-threaded
+	// Run loop.
+	lastAskPrune map[string]time.Time
+
 	// selfheal holds the per-profile observe-only self-heal engines (lazily
 	// created). Driven by this poll loop — NOT a new daemon (F3: no watchdog
 	// stacking). nil until the first enabled pass.
@@ -129,6 +136,7 @@ func NewTransitionDaemon() *TransitionDaemon {
 		turnLiveCheck:  func(inst *Instance) bool { return inst.Exists() },
 		lastDoneScan:   map[string]map[string]time.Time{},
 		lastProbeStall: map[string]time.Time{},
+		lastAskPrune:   map[string]time.Time{},
 
 		lastDesktopNotify: map[string]string{},
 	}
@@ -486,6 +494,11 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	// immediately. Reuses the instances/hookStatuses already loaded above — no
 	// extra capture, no new goroutine (F3). Disabled-by-config → cheap no-op.
 	d.runSelfHealObservePass(profile, instances, statuses, hookStatuses, db, time.Now().UTC())
+
+	// Reconcile the human ask queue once per pass (level-triggered, idempotent;
+	// see ask_queue.go). Placed here so it runs on both the first-init and the
+	// steady-state paths, and sees the freshest statuses.
+	d.syncAsks(profile, db, byID, statuses, hookStatuses)
 
 	// Runs on EVERY pass, the first scan included — see the FIRST SCAN note on
 	// recordTerminalTurns for why suppressing it would recreate the field bug.
@@ -971,6 +984,8 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		CodexCompletedSessionID  string `json:"codex_completed_session_id"`
 		HookGeneration           string `json:"hook_generation"`
 		Sequence                 uint64 `json:"sequence"`
+		Matcher                  string `json:"matcher"`
+		Message                  string `json:"message"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
@@ -1000,6 +1015,8 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		CodexCompletedSessionID:  raw.CodexCompletedSessionID,
 		HookGeneration:           raw.HookGeneration,
 		Sequence:                 raw.Sequence,
+		Matcher:                  raw.Matcher,
+		Message:                  raw.Message,
 	}
 	maskConsumedCodexCompletion(instanceID, hookStatus)
 	return hookStatus
