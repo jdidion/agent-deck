@@ -25,6 +25,14 @@ on:
       - 'go.sum'
   workflow_dispatch: {}
 
+# Every job here builds or launches the agent-deck binary. Since v1.16.7 a
+# TUI or daemon installs a newer release on its own and restarts in place;
+# a release landing mid-run must never hijack a test (issue #2251). The
+# binary also refuses under go test, CI=true and without a TTY, this is the
+# one switch that covers every spawn in this workflow.
+env:
+  AGENTDECK_SKIP_UPDATE_CHECK: "1"
+
 permissions:
   contents: read
 
@@ -100,7 +108,7 @@ jobs:
       # can see what changed without reproducing locally.
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: playwright-report
           path: tests/web/playwright-report
@@ -108,7 +116,7 @@ jobs:
 
       - name: Upload screenshot diffs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: playwright-screenshots
           path: tests/web/e2e-output

@@ -16,6 +16,7 @@ import (
 	"al.essio.dev/pkg/shellescape"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 // envVarFlags implements flag.Value for repeatable -env KEY=VALUE flags
@@ -127,8 +128,8 @@ func yesAnswer(s string) bool { return s == "y" || s == "yes" }
 // handleConductorSetup sets up a named conductor with directories, sessions, and optionally the Telegram bridge
 func handleConductorSetup(profile string, args []string) {
 	fs := flag.NewFlagSet("conductor setup", flag.ExitOnError)
-	agent := fs.String("agent", session.ConductorAgentClaude, "Conductor agent runtime (claude or codex)")
-	noClearOnCompact := fs.Bool("no-clear-on-compact", false, "Claude-only: allow normal compaction instead of /clear when context fills up")
+	agent := fs.String("agent", session.ConductorAgentClaude, "Conductor agent runtime (claude, codex, hermes, or pi)")
+	noClearOnCompact := fs.Bool("no-clear-on-compact", false, "Claude-only: allow normal compaction instead of /clear when context fills up (the /clear only arms on an established context window: AGENTDECK_CONTEXT_WINDOW or a harness-reported size)")
 	description := fs.String("description", "", "Description for this conductor")
 	heartbeat := fs.Bool("heartbeat", false, "Enable heartbeat for this conductor (default)")
 	noHeartbeat := fs.Bool("no-heartbeat", false, "Disable heartbeat for this conductor")
@@ -156,7 +157,7 @@ func handleConductorSetup(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Options:")
 		fmt.Println("  -agent string")
-		fmt.Println("        Conductor agent runtime: claude or codex (default \"claude\")")
+		fmt.Println("        Conductor agent runtime: claude, codex, hermes, or pi (default \"claude\")")
 		fmt.Println("  -description string")
 		fmt.Println("        Description for this conductor")
 		fmt.Println("  -heartbeat")
@@ -167,6 +168,8 @@ func handleConductorSetup(profile string, args []string) {
 		fmt.Println("        Minutes of idle time before pausing heartbeats (default 0=disabled, negative also disabled)")
 		fmt.Println("  -no-clear-on-compact")
 		fmt.Println("        Claude-only: allow normal compaction instead of /clear when context fills up")
+		fmt.Println("        The /clear only arms on an established context window (AGENTDECK_CONTEXT_WINDOW")
+		fmt.Println("        or a harness-reported size); a window inferred from the model id leaves it off.")
 		fmt.Println()
 		fmt.Println("Conductor-specific files:")
 		fmt.Println("  -instructions-md string")
@@ -596,6 +599,14 @@ func handleConductorSetup(profile string, args []string) {
 	if err := storage.SaveWithGroups(instances, groupTree); err != nil {
 		fmt.Fprintf(os.Stderr, "Error saving session for %s: %v\n", resolvedProfile, err)
 		os.Exit(1)
+	}
+	// Recall phase 1: a conductor session carries its purpose as a durable
+	// hint from the start (docs/recall.md), so the hint corpus does not
+	// depend on anyone typing --hint on the high-volume creation path.
+	if db := storage.GetDB(); db != nil && !existed {
+		if err := db.SetSessionHint(statedb.HintScopeInstance, sessionID, hintKeyPurpose, "conductor "+name, statedb.HintSourceConductor, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: recall hint: %v\n", err)
+		}
 	}
 
 	// Step 6: Install heartbeat timer (if heartbeat enabled and interval > 0)

@@ -2361,6 +2361,7 @@ func TestSaveUserConfig_OmitsZeroValueFields(t *testing.T) {
 		"[crush]",
 		"[hermes]",
 		"[global_search]",
+		"[recall]",
 		"[logs]",
 		"[mcp_pool]",
 		"[conductor]",
@@ -2711,5 +2712,24 @@ func TestSaveUserConfig_OmitsUnsetGroupSort(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `group_sort = "actionable"`) {
 		t.Errorf("config.toml must contain a set group_sort; got:\n%s", raw)
+	}
+}
+
+// #2153: the Keychain seed for sandboxes is opt-in and off by default.
+func TestDockerSettings_SeedCredentialsFromKeychain(t *testing.T) {
+	var cfg UserConfig
+	if _, err := toml.Decode("[docker]\nauto_cleanup = true\n", &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Docker.SeedCredentialsFromKeychain {
+		t.Error("seed_credentials_from_keychain must default to false")
+	}
+
+	cfg = UserConfig{}
+	if _, err := toml.Decode("[docker]\nseed_credentials_from_keychain = true\n", &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Docker.SeedCredentialsFromKeychain {
+		t.Error("seed_credentials_from_keychain = true must be honoured")
 	}
 }

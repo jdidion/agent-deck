@@ -34,6 +34,9 @@ import (
 // their respective attach paths (local tmux vs SSH remote).
 const sshAttachReplyQuarantine = 500 * time.Millisecond
 
+// Bound draining pipes inherited by a surviving SSH ControlPersist process.
+const sshWaitDelay = 100 * time.Millisecond
+
 // sshControlDir is the directory for SSH ControlMaster sockets.
 const sshControlDir = "/tmp/agent-deck-ssh"
 
@@ -157,6 +160,9 @@ type SSHRunner struct {
 	// lets ResolveRemotePath decide whether to honor an explicit user path or
 	// probe the remote's real binary location via $PATH (#1171).
 	configuredPath string
+	// installReport is where the last InstallBinary put the binary, for the
+	// update report (#2244).
+	installReport string
 
 	// runFn lets tests stub out command execution. nil = real SSH.
 	runFn func(ctx context.Context, args ...string) ([]byte, error)
@@ -164,6 +170,10 @@ type SSHRunner struct {
 	// name is the remote's config name; it keys the shared persistent
 	// channel (#2174). Empty for runners built without a name.
 	name string
+
+	// cleanChannelSocketsFn isolates socket cleanup in subprocess tests.
+	// nil uses the shared production ControlMaster directory.
+	cleanChannelSocketsFn func()
 
 	// dialChannelFn lets tests stub the persistent channel's ssh subprocess
 	// (channelFor). nil = real SSH.
@@ -257,7 +267,7 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 	// Persistent channel first (#2174): one ssh session per remote carries
 	// every command. A transport failure falls through to a plain exec, so
 	// the channel can only make things faster, never break them.
-	if ch := channelFor(r); ch != nil && ch.Connected() {
+	if ch := channelFor(r); ch != nil && ch.Connected() && remoteChannelArgsSafe(args) {
 		out, err := ch.Request(ctx, args)
 		switch {
 		case err == nil:
@@ -281,18 +291,32 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 	sshArgs := r.sshBaseArgs(remoteCmd)
 
 	cmd := exec.CommandContext(ctx, "ssh", sshArgs...)
+	cmd.WaitDelay = sshWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if detail := strings.TrimSpace(stderr.String()); detail != "" {
+		level := slog.LevelDebug
+		if err != nil {
+			level = slog.LevelWarn
+		}
+		sessionLog.Log(ctx, level, "ssh_command_stderr", slog.String("remote", r.name), slog.String("stderr", detail))
+	}
+	if err != nil {
 		// The remote CLI reports refusals such as "path does not exist" on
 		// stdout; fall back to it so the failure is not a bare exit status.
+		// stdout is returned as well: a --json verb that exits non-zero
+		// (switch-preview refusal, switch failure) still answered there.
 		detail := stderr.String()
 		if strings.TrimSpace(detail) == "" {
 			detail = strings.TrimSpace(stdout.String())
 		}
-		return nil, fmt.Errorf("ssh command failed: %w: %s", err, detail)
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		return stdout.Bytes(), fmt.Errorf("ssh command failed: %w: %s", err, detail)
 	}
 
 	return stdout.Bytes(), nil
@@ -304,21 +328,34 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 // PTY in sync when the local terminal is resized, and sends SIGWINCH to
 // self on detach so Bubble Tea re-queries the terminal size.
 func (r *SSHRunner) Attach(sessionID string) error {
+	return r.attachSSHArgs(r.buildAttachArgs(sessionID))
+}
+
+// RunInteractiveCreation uses the same PTY flow as ordinary remote attach.
+// All field/terminal checks must finish before the command reaches the host.
+func (r *SSHRunner) RunInteractiveCreation(args ...string) error {
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+		return fmt.Errorf("remote creation attach requires an interactive terminal")
+	}
+	remoteCmd := "env TERM=" + shellQuote(remoteAttachTERM()) + " " + r.buildRemoteCommand(args...)
+	sshArgs := append([]string{"-tt"}, r.sshConnOpts()...)
+	sshArgs = append(sshArgs, r.Host, remoteCmd)
+	return r.attachSSHArgs(sshArgs)
+}
+
+func (r *SSHRunner) attachSSHArgs(sshArgs []string) error {
 	if err := ValidateSSHHost(r.Host); err != nil {
 		return err
 	}
 	_ = os.MkdirAll(sshControlDir, 0700)
 
-	sshArgs := r.buildAttachArgs(sessionID)
-
 	cmd := exec.Command("ssh", sshArgs...)
 
 	// Start SSH with a local PTY pre-sized to the controlling terminal so the
 	// remote tmux client connects full-width from frame one (#1167). A bare
-	// pty.Start creates the PTY at the 80x24 default, which under the remote
-	// session's window-size=largest pins the pane to ~half a wide terminal
-	// until an async SIGWINCH grows it. Shares the local-attach helper so both
-	// paths size identically.
+	// pty.Start creates the PTY at the 80x24 default, which can size the remote
+	// session's pane to ~half a wide terminal until an async SIGWINCH grows it.
+	// Shares the local-attach helper so both paths size identically.
 	ptmx, err := tmux.StartAttachPTY(cmd, os.Stdin)
 	if err != nil {
 		return fmt.Errorf("failed to start ssh with pty: %w", err)
@@ -561,6 +598,185 @@ func parseRemoteSessions(output []byte) ([]RemoteSessionInfo, error) {
 		return nil, fmt.Errorf("failed to parse remote sessions: %w", err)
 	}
 	return sessions, nil
+}
+
+// RemoteHostStats is one remote's `system stats --json` snapshot: the same
+// load/memory/disk numbers the controller's own header shows for this Mac,
+// gathered by the remote's own agent-deck (never a controller-side ssh to
+// /proc). Ok is false when the remote could not be asked (older agent-deck
+// without the `system stats` subcommand, or the call failed/timed out); the
+// preview panel then renders "stats unknown" instead of a guess.
+type RemoteHostStats struct {
+	Ok bool
+
+	CPUAvailable    bool
+	CPUUsagePercent float64
+
+	LoadAvailable bool
+	Load1         float64
+	Load5         float64
+	Load15        float64
+
+	MemAvailable    bool
+	MemUsedBytes    uint64
+	MemTotalBytes   uint64
+	MemUsagePercent float64
+
+	DiskAvailable    bool
+	DiskUsedBytes    uint64
+	DiskTotalBytes   uint64
+	DiskUsagePercent float64
+
+	// AccountsAvailable is false when the remote's `system stats --json`
+	// omitted the accounts key entirely — an older agent-deck that predates
+	// this field, distinct from a remote answering with zero configured
+	// slots (AccountsAvailable true, Accounts empty).
+	AccountsAvailable bool
+	Accounts          []AccountUsage
+
+	// SSHAvailable is false when the remote sent no ssh_sessions: an older
+	// agent-deck (SSHError empty) or one that could not gather them
+	// (SSHError says why). Never guessed.
+	SSHAvailable bool
+	SSHError     string
+	SSHSessions  []RemoteSSHSession
+}
+
+// RemoteSSHSession is one user's live SSH logins on a remote host.
+type RemoteSSHSession struct {
+	User     string
+	Count    int
+	HasSince bool
+	Since    time.Time
+	From     string
+}
+
+// remoteHostStatsWire is the JSON shape `agent-deck system stats --json`
+// prints (cmd/agent-deck/system_cmd.go); pointers are omitted fields a
+// remote host could not collect (wrong platform, missing /proc, ...).
+type remoteHostStatsWire struct {
+	CPU *struct {
+		UsagePercent float64 `json:"usage_percent"`
+	} `json:"cpu,omitempty"`
+	Load *struct {
+		Load1  float64 `json:"load1"`
+		Load5  float64 `json:"load5"`
+		Load15 float64 `json:"load15"`
+	} `json:"load,omitempty"`
+	Memory *struct {
+		UsedBytes    uint64  `json:"used_bytes"`
+		TotalBytes   uint64  `json:"total_bytes"`
+		UsagePercent float64 `json:"usage_percent"`
+	} `json:"memory,omitempty"`
+	Disk *struct {
+		UsedBytes    uint64  `json:"used_bytes"`
+		TotalBytes   uint64  `json:"total_bytes"`
+		UsagePercent float64 `json:"usage_percent"`
+	} `json:"disk,omitempty"`
+	// Accounts is nil when the remote predates this field (backward
+	// compatible: FetchSystemStats leaves RemoteHostStats.AccountsAvailable
+	// false) and an empty, non-nil slice when the remote has this field but
+	// no configured Claude account slots.
+	Accounts *[]remoteAccountUsageWire `json:"accounts,omitempty"`
+	// SSHSessions is nil when the remote predates the field or could not
+	// gather it (SSHError set).
+	SSHSessions *[]remoteSSHSessionWire `json:"ssh_sessions,omitempty"`
+	SSHError    string                  `json:"ssh_error,omitempty"`
+}
+
+// remoteSSHSessionWire is one entry of remoteHostStatsWire.SSHSessions.
+type remoteSSHSessionWire struct {
+	User  string `json:"user"`
+	Count int    `json:"count"`
+	Since int64  `json:"since,omitempty"`
+	From  string `json:"from,omitempty"`
+}
+
+// remoteAccountUsageWire is the JSON shape of one entry in
+// remoteHostStatsWire.Accounts. Only the name and usage numbers travel: no
+// config_dir, no credential, matching FetchAccounts' existing privacy
+// contract for `accounts --json`.
+type remoteAccountUsageWire struct {
+	Name            string   `json:"name"`
+	Known           bool     `json:"known"`
+	UnknownReason   string   `json:"unknown_reason,omitempty"`
+	UpdatedAt       int64    `json:"updated_at,omitempty"`
+	FiveHourPercent *float64 `json:"five_hour_percent,omitempty"`
+	SevenDayPercent *float64 `json:"seven_day_percent,omitempty"`
+}
+
+// FetchSystemStats asks the remote for its own `system stats --json`
+// snapshot. An error (older remote without the subcommand, unreachable
+// host, malformed output) is reported to the caller, which must degrade to
+// RemoteHostStats{Ok: false} rather than block or fail the whole poll: the
+// TUI hot path never waits on this beyond the poll it already runs.
+func (r *SSHRunner) FetchSystemStats(ctx context.Context) (RemoteHostStats, error) {
+	output, err := r.Run(ctx, "system", "stats", "--json")
+	if err != nil {
+		return RemoteHostStats{}, err
+	}
+	return parseRemoteHostStats(output)
+}
+
+// parseRemoteHostStats decodes `system stats --json` output; a field the
+// remote omitted stays unavailable rather than zero.
+func parseRemoteHostStats(output []byte) (RemoteHostStats, error) {
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return RemoteHostStats{}, fmt.Errorf("unexpected remote system stats output: %q", string(trimmed))
+	}
+	var wire remoteHostStatsWire
+	if err := json.Unmarshal(trimmed, &wire); err != nil {
+		return RemoteHostStats{}, fmt.Errorf("failed to parse remote system stats: %w", err)
+	}
+	stats := RemoteHostStats{Ok: true}
+	if wire.CPU != nil {
+		stats.CPUAvailable = true
+		stats.CPUUsagePercent = wire.CPU.UsagePercent
+	}
+	if wire.Load != nil {
+		stats.LoadAvailable = true
+		stats.Load1, stats.Load5, stats.Load15 = wire.Load.Load1, wire.Load.Load5, wire.Load.Load15
+	}
+	if wire.Memory != nil {
+		stats.MemAvailable = true
+		stats.MemUsedBytes, stats.MemTotalBytes, stats.MemUsagePercent = wire.Memory.UsedBytes, wire.Memory.TotalBytes, wire.Memory.UsagePercent
+	}
+	if wire.Disk != nil {
+		stats.DiskAvailable = true
+		stats.DiskUsedBytes, stats.DiskTotalBytes, stats.DiskUsagePercent = wire.Disk.UsedBytes, wire.Disk.TotalBytes, wire.Disk.UsagePercent
+	}
+	if wire.Accounts != nil {
+		stats.AccountsAvailable = true
+		stats.Accounts = make([]AccountUsage, 0, len(*wire.Accounts))
+		for _, a := range *wire.Accounts {
+			usage := AccountUsage{Name: a.Name, Known: a.Known, UnknownReason: a.UnknownReason}
+			if a.UpdatedAt > 0 {
+				usage.UpdatedAt = time.Unix(a.UpdatedAt, 0)
+				usage.HasUpdatedAt = true
+			}
+			if a.FiveHourPercent != nil {
+				usage.FiveHour = AccountUsageWindow{Known: true, Percent: *a.FiveHourPercent}
+			}
+			if a.SevenDayPercent != nil {
+				usage.SevenDay = AccountUsageWindow{Known: true, Percent: *a.SevenDayPercent}
+			}
+			stats.Accounts = append(stats.Accounts, usage)
+		}
+	}
+	stats.SSHError = wire.SSHError
+	if wire.SSHSessions != nil {
+		stats.SSHAvailable = true
+		stats.SSHSessions = make([]RemoteSSHSession, 0, len(*wire.SSHSessions))
+		for _, s := range *wire.SSHSessions {
+			entry := RemoteSSHSession{User: s.User, Count: s.Count, From: s.From}
+			if s.Since > 0 {
+				entry.Since, entry.HasSince = time.Unix(s.Since, 0), true
+			}
+			stats.SSHSessions = append(stats.SSHSessions, entry)
+		}
+	}
+	return stats, nil
 }
 
 // FetchAccounts lists the named Claude account slots configured on the remote
@@ -966,13 +1182,25 @@ func (r *SSHRunner) remoteExec(ctx context.Context, remoteCmd string, stdin []by
 
 	sshArgs := r.sshBaseArgs(remoteCmd)
 	cmd := exec.CommandContext(ctx, "ssh", sshArgs...)
+	cmd.WaitDelay = sshWaitDelay
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if detail := strings.TrimSpace(stderr.String()); detail != "" {
+		level := slog.LevelDebug
+		if err != nil {
+			level = slog.LevelWarn
+		}
+		sessionLog.Log(ctx, level, "ssh_remote_stderr", slog.String("remote", r.name), slog.String("stderr", detail))
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return nil, fmt.Errorf("remote command failed: %w: %s", err, stderr.String())
 	}
 	return stdout.Bytes(), nil
@@ -981,7 +1209,7 @@ func (r *SSHRunner) remoteExec(ctx context.Context, remoteCmd string, stdin []by
 // remoteVersionRe matches the first semver-looking token (with optional
 // dotted/pre-release tail) in `agent-deck version` output. The leading "v" is
 // optional and not captured.
-var remoteVersionRe = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:[.\-+][0-9A-Za-z.\-]+)?)`)
+var remoteVersionRe = regexp.MustCompile(`v?(\d+\.\d+\.\d+(?:[.\-][0-9A-Za-z.\-]+)?(?:\+[0-9A-Za-z.\-]+)?)`)
 
 // parseRemoteVersion extracts the binary's ACTUAL current version from
 // `agent-deck version` output, e.g. "Agent Deck v0.20.2" -> "0.20.2".
@@ -1098,6 +1326,26 @@ func (r *SSHRunner) ResolveRemotePath(ctx context.Context) string {
 // InstallPathNotWritableError naming the path, the user and the remedy,
 // never a bare "permission denied" on the staged file.
 func (r *SSHRunner) DeployBinary(ctx context.Context, binaryData []byte, remotePath string) error {
+	// A symlink at the install path (the documented remedy for a root-owned
+	// /usr/local/bin points it at ~/.local/bin/agent-deck) is followed: the
+	// file it names is what $PATH and the remote's service units run, and
+	// putting a regular file over the link would leave that file behind
+	// forever (#2244). Writability, staging and the lock all concern the
+	// resolved file's directory.
+	resolved, err := r.resolveRemoteFile(ctx, remotePath)
+	if err != nil {
+		return err
+	}
+	return r.deployResolvedBinary(ctx, binaryData, resolved)
+}
+
+// deployResolvedBinary runs the deploy script against a path that has
+// already been resolved through any symlinks.
+func (r *SSHRunner) deployResolvedBinary(ctx context.Context, binaryData []byte, remotePath string) error {
+	return r.deployResolvedPayload(ctx, binaryData, remotePath, "", "")
+}
+
+func (r *SSHRunner) deployResolvedPayload(ctx context.Context, binaryData []byte, remotePath, checksum, expectedVersion string) error {
 	dir := remotePath
 	if idx := strings.LastIndex(remotePath, "/"); idx > 0 {
 		dir = remotePath[:idx]
@@ -1108,16 +1356,21 @@ func (r *SSHRunner) DeployBinary(ctx context.Context, binaryData []byte, remoteP
 	// binary (`sh`) the real call does, so a sudoers rule that allows
 	// `true` but not `sh` is not mistaken for permission to deploy.
 	script := shellQuote(remoteDeployScript)
-	args := shellQuote(dir) + " " + shellQuote(remotePath)
+	args := shellQuote(dir) + " " + shellQuote(remotePath) + " " + shellQuote(checksum) + " " + shellQuote(expectedVersion)
 	// Neither route, or sudo refused the real command after allowing the
 	// probe (exit 1 from sudo itself; the script's own failures exit 4 or
 	// 5 and pass through): report "<prefix><path><infix><user>" on stderr
 	// with the exit code parseInstallPathNotWritable recognises.
 	report := fmt.Sprintf("printf '%s%%s%s%%s\\n' %s \"$(id -un)\" >&2; exit %d",
 		installPathNotWritablePrefix, installPathNotWritableInfix, shellQuote(remotePath), installPathNotWritableExit)
-	cmd := fmt.Sprintf("mkdir -p %s 2>/dev/null; if [ -w %s ]; then sh -c %s sh %s; "+
-		"elif sudo -n sh -c true 2>/dev/null; then sudo -n sh -c %s sh %s || { rc=$?; case $rc in 4|5) exit $rc;; esac; %s; }; else %s; fi",
-		shellQuote(dir), shellQuote(dir), script, args, script, args, report, report)
+	// The direct route needs a writable directory and, when the file
+	// exists, ownership of it: a non-root deploy over someone else's file
+	// would silently change its owner, so that case takes the sudo route,
+	// where the script restores the owner.
+	quotedPath := shellQuote(remotePath)
+	cmd := fmt.Sprintf("mkdir -p %s 2>/dev/null; if [ -w %s ] && { [ ! -e %s ] || [ -O %s ]; }; then sh -c %s sh %s; "+
+		"elif sudo -n sh -c true 2>/dev/null; then sudo -n sh -c %s sh %s || { rc=$?; case $rc in 4|5|6) exit $rc;; esac; %s; }; else %s; fi",
+		shellQuote(dir), shellQuote(dir), quotedPath, quotedPath, script, args, script, args, report, report)
 
 	deployCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
@@ -1136,6 +1389,83 @@ func (r *SSHRunner) DeployBinary(ctx context.Context, binaryData []byte, remoteP
 		return fmt.Errorf("failed to deploy binary to %s: %w", remotePath, err)
 	}
 	return nil
+}
+
+// remoteResolveFn is a POSIX sh function that follows symlinks (file and
+// directory) to the real path, the way `readlink -f` does on GNU systems,
+// without depending on it: macOS remotes gained readlink -f only recently
+// and BSD ones may not have it.
+const remoteResolveFn = `resolve() { f="$1"; n=0; while [ -L "$f" ] && [ "$n" -lt 40 ]; do l=$(readlink "$f"); case "$l" in /*) f="$l";; *) f="$(dirname "$f")/$l";; esac; n=$((n+1)); done; d=$(cd "$(dirname "$f")" 2>/dev/null && pwd -P) || d=$(dirname "$f"); printf '%s/%s' "$d" "$(basename "$f")"; }; `
+
+// ErrRemoteProbeFailed is returned when the remote could not say what it
+// runs (the `command -v`, resolve or version probe failed or answered
+// ambiguously). The deploy then touches nothing: an unknown binary is not
+// an old one (#2245 review).
+var ErrRemoteProbeFailed = errors.New("could not determine what the remote runs; nothing deployed")
+
+// resolveRemoteFile returns path with every symlink followed.
+func (r *SSHRunner) resolveRemoteFile(ctx context.Context, path string) (string, error) {
+	resolved, err := r.remoteResolvedPath(ctx, "resolve "+shellQuote(path))
+	if err != nil {
+		return "", fmt.Errorf("%w: resolving %s: %v", ErrRemoteProbeFailed, path, err)
+	}
+	return resolved, nil
+}
+
+// remotePathBinary returns the resolved file behind `command -v agent-deck`
+// on the remote; found is false when nothing on $PATH answers to that
+// name, and err is set when the probe itself failed or answered with
+// something that is not a path.
+func (r *SSHRunner) remotePathBinary(ctx context.Context) (path string, found bool, err error) {
+	resolved, err := r.remoteResolvedPath(ctx, `pb=$(command -v agent-deck 2>/dev/null); if [ -z "$pb" ]; then printf NONE; else resolve "$pb"; fi`)
+	if err != nil {
+		if errors.Is(err, errRemoteNothingOnPath) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("%w: locating agent-deck on the remote's $PATH: %v", ErrRemoteProbeFailed, err)
+	}
+	return resolved, true, nil
+}
+
+// errRemoteNothingOnPath is remoteResolvedPath's answer to the NONE marker.
+var errRemoteNothingOnPath = errors.New("nothing on PATH")
+
+// remoteResolvedPath runs cmd on the remote with remoteResolveFn defined and
+// returns the absolute path it prints. A failed command, or an answer that
+// is not an absolute path (an alias, a function body), is an error.
+func (r *SSHRunner) remoteResolvedPath(ctx context.Context, cmd string) (string, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := r.remoteExec(timeoutCtx, remoteResolveFn+cmd, nil)
+	if err != nil {
+		return "", err
+	}
+	resolved := strings.TrimSpace(string(out))
+	if resolved == "NONE" {
+		return "", errRemoteNothingOnPath
+	}
+	if !strings.HasPrefix(resolved, "/") || strings.ContainsAny(resolved, "\n") {
+		return "", fmt.Errorf("ambiguous answer %q", resolved)
+	}
+	return resolved, nil
+}
+
+// remoteSameFile reports whether a and b are the same inode on the remote
+// (test -ef follows symlinks).
+func (r *SSHRunner) remoteSameFile(ctx context.Context, a, b string) bool {
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := r.remoteExec(timeoutCtx, "[ "+shellQuote(a)+" -ef "+shellQuote(b)+" ]", nil)
+	return err == nil
+}
+
+// remotePathRunsFile reports whether `command -v agent-deck` on the remote
+// resolves to the same inode as file (test -ef follows symlinks).
+func (r *SSHRunner) remotePathRunsFile(ctx context.Context, file string) bool {
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := r.remoteExec(timeoutCtx, `pb=$(command -v agent-deck 2>/dev/null); [ -n "$pb" ] && [ "$pb" -ef `+shellQuote(file)+` ]`, nil)
+	return err == nil
 }
 
 // ErrRemoteDeployBusy is returned when another deploy holds the lock on the
@@ -1158,16 +1488,76 @@ const remoteDeployBusyMarker = "agent-deck: another deploy holds "
 // Two controllers deploying at once must not share a staging file (one
 // could rename it into place while the other is still writing it), so the
 // name carries the shell's PID and a lock directory next to PATH serialises
-// deploys; a lock older than 15 minutes is treated as abandoned. The mode
-// is set explicitly (0755) rather than with +x so a root umask of 077 under
-// sudo still leaves the binary runnable by the remote user.
-const remoteDeployScript = `d="$1"; p="$2"; lock="$p.lock"; t="$p.new.$$"
+// deploys; a lock older than 15 minutes is treated as abandoned.
+//
+// The script never puts a regular file over a symlink (exit 6), checked
+// before streaming and again right before the rename: the caller resolves
+// links first, and the guard keeps a race or a stale resolution from
+// orphaning the link target (#2244). The previous file's mode and owner are
+// kept: as root a chown restores uid and gid, as the owning user a chgrp
+// restores the group (either failing aborts the deploy with the original
+// in place, exit 5), and the mode is
+// then made readable and executable for everyone so a root umask of 077
+// under sudo still leaves the binary runnable by the remote user.
+const remoteDeployScript = `d="$1"; p="$2"; checksum="${3:-}"; expected="${4:-}"; lock="$p.lock"; t="$p.new.$$"; archive="$p.archive.$$"
+if [ -L "$p" ]; then printf '` + remoteDeploySymlinkMarker + `%s\n' "$p" >&2; exit ` + remoteDeploySymlinkExitStr + `; fi
 mkdir -p "$d"
 if [ -d "$lock" ]; then find "$lock" -maxdepth 0 -mmin +15 -exec rmdir {} \; 2>/dev/null || true; fi
 if ! mkdir "$lock" 2>/dev/null; then printf '` + remoteDeployBusyMarker + `%s\n' "$p" >&2; exit 4; fi
-trap 'rm -f "$t"; rmdir "$lock" 2>/dev/null' EXIT HUP INT TERM
-if cat > "$t" && chmod 0755 "$t" && mv -f "$t" "$p"; then exit 0; fi
+trap '[ ! -f "$t" ] || unlink "$t"; [ ! -f "$archive" ] || unlink "$archive"; rmdir "$lock" 2>/dev/null' EXIT HUP INT TERM
+mode=755; own=""
+if [ -e "$p" ]; then
+  m=$(stat -c %a "$p" 2>/dev/null || stat -f %Lp "$p" 2>/dev/null); [ -n "$m" ] && mode="$m"
+  own=$(stat -c %u:%g "$p" 2>/dev/null || stat -f %u:%g "$p" 2>/dev/null)
+fi
+stage() {
+  if [ -z "$checksum" ]; then cat > "$t"; return $?; fi
+  if ! cat > "$archive"; then return 5; fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(sha256sum "$archive") || return 5
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(shasum -a 256 "$archive") || return 5
+  else
+    printf 'agent-deck: sha256sum or shasum is required\n' >&2; return 5
+  fi
+  digest="${digest%% *}"
+  if [ "$digest" != "$checksum" ]; then
+    printf 'agent-deck: archive checksum mismatch\n' >&2; return 5
+  fi
+  members=$(tar -tzf "$archive") || return 5
+  count=$(printf '%s\n' "$members" | awk '$0 == "agent-deck" { n++ } END { print n+0 }')
+  if [ "$count" != 1 ]; then
+    printf 'agent-deck: archive must contain one root agent-deck binary\n' >&2; return 5
+  fi
+  entry=$(tar -tvzf "$archive" agent-deck) || return 5
+  case "$entry" in -*) ;; *) printf 'agent-deck: archive binary must be a regular file\n' >&2; return 5;; esac
+  tar -xzOf "$archive" agent-deck > "$t" && [ -s "$t" ]
+}
+if stage && chmod "$mode" "$t" && chmod a+rx "$t"; then
+  if [ -n "$expected" ]; then
+    output=$(` + update.SkipUpdateCheckEnv + `=1 "$t" version) || { printf 'agent-deck: staged binary cannot execute\n' >&2; exit 5; }
+    actual=$(printf '%s\n' "$output" | sed -n 's/^Agent Deck v\([^ ]*\).*/\1/p' | head -n 1)
+    if [ "$actual" != "$expected" ]; then printf 'agent-deck: staged binary version mismatch\n' >&2; exit 5; fi
+  fi
+  if [ -n "$own" ]; then
+    if [ "$(id -u)" = 0 ]; then
+      if ! chown "$own" "$t"; then printf 'agent-deck: could not keep owner %s on %s\n' "$own" "$p" >&2; exit 5; fi
+    else
+      g="${own#*:}"; tg=$(stat -c %g "$t" 2>/dev/null || stat -f %g "$t" 2>/dev/null)
+      if [ -n "$g" ] && [ "$g" != "$tg" ] && ! chgrp "$g" "$t"; then printf 'agent-deck: could not keep group %s on %s\n' "$g" "$p" >&2; exit 5; fi
+    fi
+  fi
+  if [ -L "$p" ]; then printf '` + remoteDeploySymlinkMarker + `%s\n' "$p" >&2; exit ` + remoteDeploySymlinkExitStr + `; fi
+  if mv -f "$t" "$p"; then exit 0; fi
+fi
 printf 'agent-deck: deploy to %s failed\n' "$p" >&2; exit 5`
+
+// The script's refusal to replace a symlink, and its exit status.
+const (
+	remoteDeploySymlinkMarker  = "agent-deck: refusing to replace symlink "
+	remoteDeploySymlinkExit    = 6
+	remoteDeploySymlinkExitStr = "6"
+)
 
 // The remote deploy script reports an unwritable install directory on stderr
 // as "<prefix><path><infix><user>" with installPathNotWritableExit, which the
@@ -1194,32 +1584,184 @@ func parseInstallPathNotWritable(output string) *update.InstallPathNotWritableEr
 // there, then verifies the remote actually runs expectedVersion from its $PATH.
 // It returns an actionable error instead of a false success when the deployed
 // binary is not the one the remote executes (#1171).
+//
+// The configured path and the binary `command -v agent-deck` finds are both
+// resolved through symlinks. When they are the same file there is one
+// deploy. When they differ, the $PATH binary is what the remote runs, so it
+// is updated first, and the configured path too so the controller's own
+// commands over it see the same version; the report names both (#2244).
+// Verification then checks that $PATH resolves to the deployed inode and
+// reports expectedVersion.
 func (r *SSHRunner) InstallBinary(ctx context.Context, binaryData []byte, expectedVersion string) error {
-	path := r.ResolveRemotePath(ctx)
-	if err := r.DeployBinary(ctx, binaryData, path); err != nil {
+	return r.InstallBinaryWithForce(ctx, binaryData, expectedVersion, false)
+}
+
+// InstallBinaryWithForce permits replacing newer PATH targets when forced.
+func (r *SSHRunner) InstallBinaryWithForce(ctx context.Context, binaryData []byte, expectedVersion string, force bool) error {
+	return r.installPayload(ctx, expectedVersion, false, force, func(target string) error {
+		return r.deployResolvedBinary(ctx, binaryData, target)
+	})
+}
+
+// PreviewInstall resolves the same targets as an installation without writing.
+func (r *SSHRunner) PreviewInstall(ctx context.Context, expectedVersion string) error {
+	return r.PreviewInstallWithForce(ctx, expectedVersion, false)
+}
+
+// PreviewInstallWithForce includes newer PATH targets when force is requested.
+func (r *SSHRunner) PreviewInstallWithForce(ctx context.Context, expectedVersion string, force bool) error {
+	return r.installPayload(ctx, expectedVersion, true, force, nil)
+}
+
+var remoteArchiveChecksumRe = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+
+// InstallLocalArchive streams a release-layout archive and verifies its digest
+// on the remote before extracting or replacing any binary.
+func (r *SSHRunner) InstallLocalArchive(ctx context.Context, archive []byte, checksum, expectedVersion string, dryRun bool) error {
+	return r.InstallLocalArchiveWithForce(ctx, archive, checksum, expectedVersion, dryRun, false)
+}
+
+// InstallLocalArchiveWithForce permits replacing a newer PATH binary when forced.
+func (r *SSHRunner) InstallLocalArchiveWithForce(ctx context.Context, archive []byte, checksum, expectedVersion string, dryRun, force bool) error {
+	if !remoteArchiveChecksumRe.MatchString(checksum) {
+		return fmt.Errorf("invalid archive SHA-256 checksum")
+	}
+	return r.installPayload(ctx, expectedVersion, dryRun, force, func(target string) error {
+		return r.deployResolvedPayload(ctx, archive, target, strings.ToLower(checksum), strings.TrimPrefix(expectedVersion, "v"))
+	})
+}
+
+func (r *SSHRunner) installPayload(ctx context.Context, expectedVersion string, dryRun, force bool, deploy func(string) error) error {
+	r.installReport = ""
+	want := strings.TrimPrefix(expectedVersion, "v")
+	// Every probe must answer before anything is written: a path that
+	// cannot be resolved or a $PATH binary whose version cannot be read is
+	// unknown, not old, and is left exactly as it is.
+	configured, err := r.resolveRemoteFile(ctx, r.ResolveRemotePath(ctx))
+	if err != nil {
+		return err
+	}
+	onPath, onPathFound, err := r.remotePathBinary(ctx)
+	if err != nil {
 		return err
 	}
 
-	want := strings.TrimPrefix(expectedVersion, "v")
+	// The $PATH binary is a second target only when it is a different file
+	// with a successfully read version needing replacement. Equal-core builds
+	// with different metadata also need deployment. A newer release stays
+	// untouched unless force explicitly permits a downgrade.
+	var targets []string
+	pathLeft := ""
+	if onPathFound && onPath != configured {
+		pathVer, found := r.versionAt(ctx, onPath)
+		switch {
+		case !found || !isVersionString(pathVer):
+			return fmt.Errorf("%w: could not read the version of the remote's $PATH binary %s (got %q)", ErrRemoteProbeFailed, onPath, pathVer)
+		case !force && (update.CompareVersions(pathVer, want) > 0 || pathVer == want):
+			pathLeft = fmt.Sprintf("left the remote's $PATH binary %s at v%s (not older than v%s)", onPath, pathVer, want)
+		default:
+			targets = append(targets, onPath)
+		}
+	}
+	targets = append(targets, configured)
+
+	if dryRun {
+		r.installReport = "would deploy v" + want + " to " + strings.Join(targets, " and ")
+		if pathLeft != "" {
+			r.installReport += "; " + pathLeft
+		}
+		return nil
+	}
+	var done []string
+	for _, target := range targets {
+		if err := deploy(target); err != nil {
+			r.installReport = r.installReportFor(done, onPath, configured, pathLeft)
+			return err
+		}
+		done = append(done, target)
+	}
+	r.installReport = r.installReportFor(done, onPath, configured, pathLeft)
+
+	// A $PATH binary deliberately left newer: the deployed configured path
+	// is verified on its own, and $PATH keeps running the newer one.
+	if pathLeft != "" {
+		if deployedVer, found := r.versionAt(ctx, configured); found && deployedVer == want {
+			return nil
+		}
+		return fmt.Errorf("post-deploy verification failed: remote does not report v%s at %s", want, configured)
+	}
 
 	// The binary the remote actually runs: bare `agent-deck` through its $PATH.
-	if pathVer, found := r.versionAt(ctx, "agent-deck"); found && pathVer == want {
+	pathVer, found := r.versionAt(ctx, "agent-deck")
+	if found && pathVer == want {
+		if !r.remotePathRunsFile(ctx, targets[0]) {
+			return fmt.Errorf("the remote's $PATH agent-deck reports v%s but is not the file deployed to %s; "+
+				"check for a wrapper or a second copy on the remote's PATH, or set agent_deck_path to it", want, targets[0])
+		}
 		return nil
 	} else if found {
 		// Something is on $PATH but it is not what we just deployed.
-		return fmt.Errorf("deployed v%s to %s, but the remote runs v%s from $PATH — "+
-			"set agent_deck_path to the $PATH binary or fix the remote's PATH", want, path, pathVer)
+		return fmt.Errorf("deployed v%s to %s, but the remote runs v%s from $PATH; "+
+			"set agent_deck_path to the binary the remote's PATH finds (command -v agent-deck) or fix the remote's PATH", want, targets[0], pathVer)
 	}
 
 	// Nothing on $PATH. If the deployed binary itself reports the right version,
-	// the install worked but the location is not on $PATH yet.
-	if deployedVer, found := r.versionAt(ctx, path); found && deployedVer == want {
-		return fmt.Errorf("installed v%s at %s, but it is not on the remote's $PATH — "+
-			"add %s to PATH or set agent_deck_path to a $PATH location", want, path, path)
+	// the install worked but the location is not on $PATH yet. With an
+	// explicit agent_deck_path that is exactly how the controller reaches
+	// this remote, so the update succeeded and the missing entry is a
+	// warning for sessions started over SSH (#2249); without one the
+	// controller itself runs `agent-deck` through PATH, so it is a failure.
+	if deployedVer, found := r.versionAt(ctx, configured); found && deployedVer == want {
+		if entry := strings.TrimSpace(r.configuredPath); entry != "" {
+			// The version alone is not identity: the configured entry (as
+			// written, symlink and all) must still be the file that was
+			// deployed, checked by inode now, after the deploy.
+			entry = r.expandHome(ctx, entry)
+			if !r.remoteSameFile(ctx, entry, configured) {
+				return fmt.Errorf("post-deploy verification failed: agent_deck_path %s no longer resolves to the deployed file %s (v%s); "+
+					"check what the path points at on the remote", entry, configured, want)
+			}
+			r.installReport += fmt.Sprintf("; warning: %s is not on the remote's non-interactive PATH (add %s to PATH)", configured, filepath.Dir(configured))
+			if spawnPathCoversUserBinDir(filepath.Dir(configured), r.remoteHome(ctx)) {
+				// The spawn prelude (spawn_path.go) puts the standard user
+				// bin dirs in front of a session's PATH, so the sessions the
+				// remote starts find this binary; only a bare `ssh host
+				// agent-deck` still needs the entry.
+				r.installReport += "; sessions the remote starts add it to PATH themselves"
+			} else {
+				r.installReport += "; sessions started via SSH may need PATH"
+			}
+			return nil
+		}
+		return fmt.Errorf("installed v%s at %s, but it is not on the remote's $PATH; "+
+			"add %s to PATH or set agent_deck_path to a $PATH location", want, configured, configured)
 	}
 
-	return fmt.Errorf("post-deploy verification failed: remote does not report v%s at %s or on $PATH", want, path)
+	return fmt.Errorf("post-deploy verification failed: remote does not report v%s at %s or on $PATH", want, configured)
 }
+
+// installReportFor words where the binary went (and what was left alone) so
+// the report is right even when a later deploy fails.
+func (r *SSHRunner) installReportFor(done []string, onPath, configured, pathLeft string) string {
+	parts := make([]string, 0, 3)
+	switch {
+	case len(done) == 2:
+		parts = append(parts, fmt.Sprintf("deployed to %s (the remote's $PATH binary) and to %s (agent_deck_path); set agent_deck_path to %s to keep one copy", onPath, configured, onPath))
+	case len(done) == 1 && done[0] == onPath && onPath != configured:
+		parts = append(parts, fmt.Sprintf("deployed to %s (the remote's $PATH binary); %s (agent_deck_path) not deployed", onPath, configured))
+	case len(done) == 1:
+		parts = append(parts, "deployed to "+done[0])
+	default:
+		parts = append(parts, "nothing deployed")
+	}
+	if pathLeft != "" {
+		parts = append(parts, pathLeft)
+	}
+	return strings.Join(parts, "; ")
+}
+
+// LastInstallReport says where the last InstallBinary put the binary.
+func (r *SSHRunner) LastInstallReport() string { return r.installReport }
 
 // sshConnOpts returns the SSH -o options shared by every connection agent-deck
 // makes. They are the single source of truth for agent-deck's host-key stance:
@@ -1286,6 +1828,8 @@ func remoteVerbReadOnly(args []string) bool {
 		second = args[1]
 	}
 	switch args[0] {
+	case "add":
+		return len(args) == 3 && args[1] == "--capabilities" && args[2] == "--json"
 	case "list", "ls", "accounts", "version", "status":
 		return true
 	case "group":
@@ -1336,10 +1880,16 @@ func (r *SSHRunner) CreateSession(ctx context.Context) (string, error) {
 // this machine's config or credentials is copied. Zero values mean "remote
 // default" so an untouched dialog behaves exactly as before.
 type RemoteAddOptions struct {
-	Tool  string // -c; empty means shell
-	Title string // -t; empty means --quick (auto-generated name)
-	Path  string // positional; empty or "." means remote CWD
-	Group string // -g
+	ClaudeOptions   *ClaudeOptions
+	YoloOverride    *bool
+	StartQuery      string
+	AdditionalPaths []string
+	ReasoningEffort string
+	ParentID        string
+	Tool            string // -c; empty means shell
+	Title           string // -t; empty means --quick (auto-generated name)
+	Path            string // positional; empty or "." means remote CWD
+	Group           string // -g
 
 	// Sandbox forwards the "Run in Docker sandbox" checkbox as -sandbox; the
 	// image and other Docker settings come from the remote's own config.
@@ -1390,10 +1940,29 @@ func IsRemotePathMissing(err error) bool {
 // never copied) and an --extra-arg token that would fail the server's own
 // validation.
 func remoteAddArgs(o RemoteAddOptions) ([]string, error) {
+	if o.StartQuery != "" {
+		if o.ResumeSessionID != "" || (o.ClaudeOptions != nil && o.ClaudeOptions.SessionMode != "" && o.ClaudeOptions.SessionMode != "new") {
+			return nil, fmt.Errorf("startup query requires a new session, not resume or continue")
+		}
+		for _, arg := range o.ExtraArgs {
+			name, _, _ := strings.Cut(arg, "=")
+			switch name {
+			case "--resume", "-r", "--continue", "-c":
+				return nil, fmt.Errorf("startup query cannot be combined with resume or continue extra arguments")
+			}
+		}
+	}
+
 	args := []string{"add", "--json"}
+	if o.StartQuery != "" {
+		args = []string{"launch", "--json", "--no-wait", "--startup-query", o.StartQuery}
+		if o.ParentID == "" {
+			args = append(args, "--no-parent")
+		}
+	}
 	if t := strings.TrimSpace(o.Title); t != "" {
 		args = append(args, "-t", t)
-	} else {
+	} else if o.StartQuery == "" {
 		args = append(args, "--quick")
 	}
 	if g := strings.TrimSpace(o.Group); g != "" {
@@ -1431,16 +2000,46 @@ func remoteAddArgs(o RemoteAddOptions) ([]string, error) {
 		}
 		args = append(args, "--extra-arg", token)
 	}
-	if o.Yolo {
+	if o.YoloOverride != nil {
+		args = append(args, fmt.Sprintf("--yolo=%t", *o.YoloOverride))
+	} else if o.Yolo {
 		args = append(args, "--yolo")
 	}
+	if flags := o.ClaudeOptions; flags != nil {
+		args = append(args, fmt.Sprintf("--skip-permissions=%t", flags.SkipPermissions), fmt.Sprintf("--auto-mode=%t", flags.AutoMode), fmt.Sprintf("--chrome=%t", flags.UseChrome), fmt.Sprintf("--teammate-mode=%t", flags.UseTeammateMode))
+		if flags.SessionMode == "continue" {
+			args = append(args, "--continue")
+		}
+		if flags.SessionMode == "resume" && flags.ResumeSessionID == "" {
+			args = append(args, "--extra-arg", "--resume")
+		}
+		if flags.Effort != "" {
+			args = append(args, "--effort", flags.Effort)
+		}
+	}
+
 	if b := strings.TrimSpace(o.WorktreeBranch); b != "" {
 		args = append(args, "-w", b)
+	}
+	if o.ReasoningEffort != "" {
+		args = append(args, "--effort", o.ReasoningEffort)
+	}
+	if o.ParentID != "" {
+		args = append(args, "--parent", o.ParentID)
+	}
+	for _, path := range o.AdditionalPaths {
+		if strings.TrimSpace(path) == "" {
+			return nil, fmt.Errorf("additional remote path must not be blank")
+		}
+		args = append(args, "--additional-path", path)
 	}
 	if o.CreateDir {
 		args = append(args, "--create-dir")
 	}
 	if p := strings.TrimSpace(o.Path); p != "" && p != "." {
+		if strings.HasPrefix(p, "-") {
+			args = append(args, "--")
+		}
 		args = append(args, p)
 	}
 	return args, nil
@@ -1454,6 +2053,13 @@ func (r *SSHRunner) CreateSessionWithOptions(ctx context.Context, opts RemoteAdd
 	if err != nil {
 		return "", err
 	}
+	catalog, err := r.FetchCreationCatalog(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := catalog.ValidateArgs(addArgs); err != nil {
+		return "", err
+	}
 	// Step 1: Create the session
 	output, err := r.Run(ctx, addArgs...)
 	if err != nil {
@@ -1461,8 +2067,9 @@ func (r *SSHRunner) CreateSessionWithOptions(ctx context.Context, opts RemoteAdd
 	}
 
 	var result struct {
-		ID    string `json:"id"`
-		Title string `json:"title"`
+		ID     string `json:"id"`
+		Title  string `json:"title"`
+		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(output, &result); err != nil {
 		return "", fmt.Errorf("failed to parse remote add output: %w", err)
@@ -1471,6 +2078,12 @@ func (r *SSHRunner) CreateSessionWithOptions(ctx context.Context, opts RemoteAdd
 		return "", fmt.Errorf("remote add returned empty session ID")
 	}
 
+	if addArgs[0] == "launch" {
+		if result.Status == string(StatusQueued) {
+			return "", &RemoteSessionQueuedError{ID: result.ID, Title: result.Title}
+		}
+		return result.ID, nil
+	}
 	// Step 2: Start the session so it has a tmux process to attach to.
 	// Use ID to avoid ambiguity when titles are duplicated.
 	startCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -1484,9 +2097,20 @@ func (r *SSHRunner) CreateSessionWithOptions(ctx context.Context, opts RemoteAdd
 		startOutput, err = r.run(startCtx, remoteStartArgs(result.ID, false)...)
 	}
 	if err != nil {
-		// Compensate: the remote DB has the row but no tmux process. Best-effort
-		// delete with a fresh context so an upstream cancellation doesn't skip
-		// the cleanup. Surface the original start failure.
+		// A remote that verified the spawn (#2099) and found the pane gone
+		// has already persisted the session as an error with its
+		// spawn_failure record, exactly what `remote <r> add` followed by
+		// `session start` leaves behind. Keep it and tell the caller what
+		// the remote said, so the row is drawn with the error light and
+		// the explainer instead of flashing and vanishing (g14 parity walk).
+		if spawnFailed := parseRemoteStartSpawnFailure(startOutput, result.ID, result.Title); spawnFailed != nil {
+			return "", spawnFailed
+		}
+		// Any other shape (an older remote, a failure before the spawn was
+		// attempted) says nothing about what the remote kept. Compensate as
+		// before: the remote DB has the row but no tmux process, so delete
+		// it best-effort with a fresh context (an upstream cancellation must
+		// not skip the cleanup) and surface the original start failure.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
 		_ = r.DeleteSession(cleanupCtx, result.ID)
@@ -1518,6 +2142,74 @@ func remoteStartArgs(sessionID string, noWait bool) []string {
 // "flag provided but not defined: -name").
 func isUnknownFlagError(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "flag provided but not defined")
+}
+
+// RemoteSessionSpawnFailedError reports that `add` succeeded and `session
+// start` ran, but the remote found the new session's process gone at once
+// and recorded why (#2099's `reason` + `spawn_failure` JSON). The session
+// exists on the remote as an error record with that explainer; it was
+// deliberately NOT deleted, so it can be inspected, retried or removed like
+// one created from the CLI.
+type RemoteSessionSpawnFailedError struct {
+	ID     string
+	Title  string
+	Reason string
+	// Record is the remote's spawn_failure block, nil when the remote sent
+	// only a reason.
+	Record *SpawnFailureRecord
+	// Message is the remote's own error line.
+	Message string
+}
+
+func (e *RemoteSessionSpawnFailedError) Error() string {
+	detail := e.Message
+	if detail == "" {
+		detail = e.Reason
+	}
+	return fmt.Sprintf("remote session %q was created but did not start: %s", e.Title, detail)
+}
+
+// Preview is the explainer block the remote's own preview would show for
+// the record: the same text `session show` prints there.
+func (e *RemoteSessionSpawnFailedError) Preview() string {
+	if e.Record != nil {
+		return e.Record.FormatForDisplay()
+	}
+	return "⚠  session failed to start\n" + e.Reason + "\n"
+}
+
+// parseRemoteStartSpawnFailure recognises the #2099 failure shape in a
+// failed `session start --json`'s stdout. It returns nil for anything else
+// (an older remote's shape, plain text, nothing), which the caller treats
+// as unknown.
+func parseRemoteStartSpawnFailure(output []byte, id, title string) *RemoteSessionSpawnFailedError {
+	var payload struct {
+		Success      *bool               `json:"success"`
+		Error        string              `json:"error"`
+		ID           string              `json:"id"`
+		Title        string              `json:"title"`
+		Reason       string              `json:"reason"`
+		SpawnFailure *SpawnFailureRecord `json:"spawn_failure"`
+	}
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 || json.Unmarshal(trimmed, &payload) != nil {
+		return nil
+	}
+	if payload.Success == nil || *payload.Success || payload.Reason == "" {
+		return nil
+	}
+	// The remote names the session it kept; a mismatch means the answer is
+	// about something else and nothing can be assumed about this one.
+	if payload.ID != "" && payload.ID != id {
+		return nil
+	}
+	if payload.Title != "" {
+		title = payload.Title
+	}
+	if payload.SpawnFailure != nil {
+		payload.SpawnFailure.InstanceID = id
+	}
+	return &RemoteSessionSpawnFailedError{ID: id, Title: title, Reason: payload.Reason, Message: payload.Error, Record: payload.SpawnFailure}
 }
 
 // RemoteSessionQueuedError reports that `add` succeeded but `session start`
@@ -1597,6 +2289,11 @@ type RemoteSessionInfo struct {
 	Status    string `json:"status"`
 	CreatedAt string `json:"created_at"`
 
+	// Account is the stored account slot on the remote ("" = default). It
+	// names the remote's own [profiles.<name>] slot; the Edit Session dialog
+	// shows it as the current slot and the switch confirmation as "from".
+	Account string `json:"account"`
+
 	// Substate and Archived are what the local row needs to pick the same
 	// status glyph a local session would get: the ⚡/🔒 substate refinements
 	// and the archived override (an archived session keeps a live Status, so
@@ -1606,6 +2303,10 @@ type RemoteSessionInfo struct {
 	// degrade to the coarse-status glyph.
 	Substate string `json:"substate"`
 	Archived bool   `json:"archived"`
+	// SubstateDetail is the free text `list --json` emits beside Substate
+	// (the codex usage-limit retry time), so a remote codex session's retry
+	// time reaches the controller. Omitted by older remotes → "".
+	SubstateDetail string `json:"substate_detail,omitempty"`
 
 	// LastActivityAt is the remote session's Instance.DisplayLastActivityTime(),
 	// RFC3339Nano-formatted (fractional seconds kept: TimeFilterMode's 3/7-day
@@ -1617,8 +2318,24 @@ type RemoteSessionInfo struct {
 	// "" — see LastActivity below.
 	LastActivityAt string `json:"last_activity_at,omitempty"`
 
+	// Viewers are the terminals attached to the session on the remote (its
+	// `list --json` viewers field): the "who else is viewing" indicator for
+	// a remote row. nil means the remote did not say (an agent-deck older
+	// than 1.16.11, or tmux could not be asked there); an empty list means
+	// nobody. See ViewerList.
+	Viewers *[]tmux.Viewer `json:"viewers,omitempty"`
+
 	// Set locally, not from JSON
 	RemoteName string `json:"-"`
+}
+
+// ViewerList returns the remote session's viewers and whether the remote
+// reported them at all.
+func (r RemoteSessionInfo) ViewerList() (viewers []tmux.Viewer, known bool) {
+	if r.Viewers == nil {
+		return nil, false
+	}
+	return *r.Viewers, true
 }
 
 // LastActivity parses LastActivityAt. ok is false when the field is empty or
@@ -1676,3 +2393,15 @@ func (r *SSHRunner) MeasureLatency(ctx context.Context) (time.Duration, error) {
 // builtin, so no process is forked on the remote and the timing is pure
 // transport.
 const latencyProbeCommand = "true"
+
+// The persistent agent rejects line breaks. Select one-shot SSH before sending
+// such arguments so multiline startup queries are delivered once without a
+// failed mutation or an unsafe retry.
+func remoteChannelArgsSafe(args []string) bool {
+	for _, arg := range args {
+		if strings.ContainsAny(arg, "\n\r") {
+			return false
+		}
+	}
+	return true
+}

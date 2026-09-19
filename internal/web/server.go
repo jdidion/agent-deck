@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
@@ -175,6 +177,11 @@ type Server struct {
 	// whose hook file is present on disk. Defaults to defaultLoadHookStatuses
 	// (which reads ~/.agent-deck/hooks/) but is injectable for tests.
 	hookStatusLoader func() map[string]*session.HookStatus
+
+	// inFlight counts requests inside a handler, excluding the event
+	// streams (see trackInFlight). It is what Idle reports for the
+	// headless self-restart.
+	inFlight atomic.Int64
 }
 
 // NewServer creates a new web server with base routes and middleware.
@@ -216,6 +223,7 @@ func NewServer(cfg Config) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/s/", s.handleIndex)
+	mux.HandleFunc("/g/", s.handleIndex)
 	mux.HandleFunc("/manifest.webmanifest", s.handleManifest)
 	mux.HandleFunc("/sw.js", s.handleServiceWorker)
 	mux.Handle("/static/", gzipAndCacheStatic(http.StripPrefix("/static/", s.staticFileServer())))
@@ -263,36 +271,11 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
 
-	// Command Center (the embedded live fleet god-view — see
-	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
-	// one write endpoint, all behind the existing authorize/CSRF/mutation gates.
-	mux.HandleFunc("/api/command-center/status", s.handleCommandCenterStatus)
-	mux.HandleFunc("/events/command-center", s.handleCommandCenterEvents)
-	mux.HandleFunc("POST /api/command-center/ask", s.handleCommandCenterAsk)
+	// Feature routes (command center, costs, system, skills, MCPs) register
+	// themselves from their handlers_<feature>.go files; see routes.go.
+	s.mountFeatureRoutes(mux)
 
-	mux.HandleFunc("/api/costs/summary", s.handleCostsSummary)
-	mux.HandleFunc("/api/costs/daily", s.handleCostsDaily)
-	mux.HandleFunc("/api/costs/sessions", s.handleCostsSessions)
-	mux.HandleFunc("/api/costs/models", s.handleCostsModels)
-	mux.HandleFunc("/api/costs/export", s.handleCostsExport)
-	mux.HandleFunc("/api/costs/groups", s.handleCostsGroups)
-	mux.HandleFunc("/api/costs/session", s.handleCostsSessionDetail)
-	mux.HandleFunc("/api/costs/batch", s.handleCostsBatch)
-	mux.HandleFunc("/api/costs/stream", s.handleCostsStream)
-
-	mux.HandleFunc("/api/system/stats", s.handleSystemStats)
-
-	mux.HandleFunc("/api/skills", s.handleSkillsCatalog)
-
-	// MCP management (Web UI parity with TUI `m` key dialog). Closes the
-	// four MISSING rows under "MCP MANAGEMENT" in PARITY_MATRIX.md.
-	mux.HandleFunc("/api/mcps", s.handleMCPsCatalog)
-	mux.HandleFunc("GET /api/sessions/{id}/mcps", s.handleSessionMCPsRouter)
-	mux.HandleFunc("POST /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-
-	handler := withRecover(s.csrfProtect(mux))
+	handler := s.trackInFlight(withRecover(s.csrfProtect(mux)))
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -384,6 +367,46 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// streamPathPrefixes are the long-lived responses that never count as
+// in-flight work: the browser's EventSource reconnects on its own the
+// moment the connection drops, so an open event stream must not keep a
+// headless server from restarting into a new build. A terminal WebSocket
+// (/ws/session/) is not on this list: someone is typing into it.
+var streamPathPrefixes = []string{"/events/", "/api/costs/stream"}
+
+func isStreamPath(path string) bool {
+	for _, p := range streamPathPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// trackInFlight counts requests from handler entry to exit so Idle can
+// tell when it is safe to hand the process over.
+func (s *Server) trackInFlight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStreamPath(r.URL.Path) {
+			s.inFlight.Add(1)
+			defer s.inFlight.Add(-1)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// InFlightRequests is the number of requests currently inside a handler,
+// event streams excluded.
+func (s *Server) InFlightRequests() int64 {
+	return s.inFlight.Load()
+}
+
+// Idle reports whether no request (event streams excluded) is being
+// served right now. `web --no-tui` uses it as the self-restart gate.
+func (s *Server) Idle() bool {
+	return s.inFlight.Load() == 0
 }
 
 func withRecover(next http.Handler) http.Handler {

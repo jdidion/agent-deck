@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
+	"github.com/asheshgoplani/agent-deck/internal/fswatch"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -102,7 +102,7 @@ func TestReadHookStatusFile_RetainsMatcherAndMessage(t *testing.T) {
 // rooted at the given hooksDir, suitable for live Start() tests.
 func newTestWatcher(t *testing.T, hooksDir string) *StatusFileWatcher {
 	t.Helper()
-	fsw, err := fsnotify.NewWatcher()
+	fsw, err := fswatch.NewWatcher()
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &StatusFileWatcher{
