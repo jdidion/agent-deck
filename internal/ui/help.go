@@ -198,6 +198,7 @@ func (h *HelpOverlay) View() string {
 	pluginKey := h.key(hotkeyPluginManager, "L")
 	skillsKey := h.key(hotkeySkillsManager, "s")
 	previewKey := h.key(hotkeyTogglePreview, "v")
+	togglePreviewSectionsKey := h.key(hotkeyTogglePreviewSections, "alt+h")
 	groupViewKey := h.key(hotkeyCycleGroupView, "t")
 	timeFilterKey := h.key(hotkeyCycleTimeFilter, "*")
 	// Opt-in: empty when switch_session is unbound, so the filter drops the row.
@@ -290,6 +291,7 @@ func (h *HelpOverlay) View() string {
 				{skillsKey, "Skills Manager"},
 				{CostDashboardKey, "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
+				{togglePreviewSectionsKey, "Show/hide preview Worktree + Claude sections"},
 				{"O", "Toggle preview orientation (right / below — portrait monitors)"},
 				{"< / >", "Shrink / grow preview pane by 5% (drag divider with mouse; vertical in below-orientation)"},
 				{unreadKey, "Mark unread"},

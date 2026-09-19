@@ -1077,6 +1077,50 @@ show_notes = true
 	}
 }
 
+// TestPreviewSettings_HideSectionDefaults pins GetHideWorktree/GetHideClaude:
+// both default to false (shown) when unset, true when explicitly enabled, and
+// the TOML keys hide_worktree/hide_claude decode correctly.
+func TestPreviewSettings_HideSectionDefaults(t *testing.T) {
+	settings := PreviewSettings{}
+	if settings.GetHideWorktree() {
+		t.Error("GetHideWorktree should default to false")
+	}
+	if settings.GetHideClaude() {
+		t.Error("GetHideClaude should default to false")
+	}
+
+	hideTrue := true
+	settings = PreviewSettings{HideWorktree: &hideTrue, HideClaude: &hideTrue}
+	if !settings.GetHideWorktree() {
+		t.Error("GetHideWorktree should be true when HideWorktree points to true")
+	}
+	if !settings.GetHideClaude() {
+		t.Error("GetHideClaude should be true when HideClaude points to true")
+	}
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	content := `
+[preview]
+hide_worktree = true
+hide_claude = true
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	var config UserConfig
+	if _, err := toml.DecodeFile(configPath, &config); err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
+	if !config.Preview.GetHideWorktree() {
+		t.Error("Preview.GetHideWorktree should be true from TOML [preview] hide_worktree = true")
+	}
+	if !config.Preview.GetHideClaude() {
+		t.Error("Preview.GetHideClaude should be true from TOML [preview] hide_claude = true")
+	}
+}
+
 func TestGetPreviewSettings(t *testing.T) {
 	// Setup: use temp directory with no config
 	tempDir := t.TempDir()

@@ -447,3 +447,42 @@ func TestAskPanelHotkey_AltQOpens_PlainADoesNot(t *testing.T) {
 		t.Fatal("pressing \"alt+q\" did not open the ask panel")
 	}
 }
+
+// TestTogglePreviewSections_HidesAndShowsBoth pins the alt+h dispatch at
+// hotkeyTogglePreviewSections: toggling flips previewHideWorktree and
+// previewHideClaude together using "toggle-all" semantics — both become false
+// only when both started true, otherwise both become true.
+func TestTogglePreviewSections_HidesAndShowsBoth(t *testing.T) {
+	cases := []struct {
+		name          string
+		startWorktree bool
+		startClaude   bool
+		wantWorktree  bool
+		wantClaude    bool
+	}{
+		{"both shown -> both hidden", false, false, true, true},
+		{"both hidden -> both shown", true, true, false, false},
+		{"worktree hidden only -> both hidden", true, false, true, true},
+		{"claude hidden only -> both hidden", false, true, true, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := NewHome()
+			home.width = 120
+			home.height = 40
+			home.initialLoading = false
+			home.previewHideWorktree = tc.startWorktree
+			home.previewHideClaude = tc.startClaude
+
+			home.handleMainKey(altKeyMsg('h'))
+
+			if home.previewHideWorktree != tc.wantWorktree {
+				t.Errorf("previewHideWorktree = %v, want %v", home.previewHideWorktree, tc.wantWorktree)
+			}
+			if home.previewHideClaude != tc.wantClaude {
+				t.Errorf("previewHideClaude = %v, want %v", home.previewHideClaude, tc.wantClaude)
+			}
+		})
+	}
+}

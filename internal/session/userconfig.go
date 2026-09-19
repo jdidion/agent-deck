@@ -1185,6 +1185,16 @@ type PreviewSettings struct {
 	// in the preview pane when output is visible.
 	// Range: 0.1 - 0.9 (fraction reserved for notes). Default: 0.33
 	NotesOutputSplit float64 `toml:"notes_output_split,omitzero"`
+
+	// HideWorktree hides the Worktree section in the preview pane. This is the
+	// INITIAL state; the toggle-preview-sections hotkey flips it at runtime.
+	// Default: false (shown). Pointer to distinguish "not set" from "explicitly false".
+	HideWorktree *bool `toml:"hide_worktree,omitempty"`
+
+	// HideClaude hides the Claude section in the preview pane. Initial state only;
+	// the toggle-preview-sections hotkey flips it at runtime.
+	// Default: false (shown). Pointer to distinguish "not set" from "explicitly false".
+	HideClaude *bool `toml:"hide_claude,omitempty"`
 }
 
 // AnalyticsDisplaySettings configures which analytics sections to display
@@ -1417,6 +1427,18 @@ func (p *PreviewSettings) GetShowNotes() bool {
 		return false // Default: notes OFF
 	}
 	return *p.ShowNotes
+}
+
+// GetHideWorktree reports the INITIAL hidden state of the preview Worktree
+// section. Default false (shown).
+func (p *PreviewSettings) GetHideWorktree() bool {
+	return p.HideWorktree != nil && *p.HideWorktree
+}
+
+// GetHideClaude reports the INITIAL hidden state of the preview Claude section.
+// Default false (shown).
+func (p *PreviewSettings) GetHideClaude() bool {
+	return p.HideClaude != nil && *p.HideClaude
 }
 
 // GetNotesOutputSplit returns notes/output split ratio, clamped to sane bounds.

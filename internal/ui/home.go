@@ -582,6 +582,13 @@ type Home struct {
 	// back to config on toggle.
 	previewOrientation string
 
+	// previewHideWorktree / previewHideClaude hide the Worktree and Claude
+	// sections in the preview pane. Initialized from [preview] hide_worktree /
+	// hide_claude and toggled together at runtime by the toggle-preview-sections
+	// hotkey (see hotkeyTogglePreviewSections).
+	previewHideWorktree bool
+	previewHideClaude   bool
+
 	// footerMode selects the bottom hint-bar style (config.toml [ui] footer).
 	// One of session.FooterCurated (default), FooterFull, FooterCompact, or
 	// FooterMinimal. Cached so every render of a frame agrees. Additive/opt-in:
@@ -1826,6 +1833,10 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.remoteSessionRefreshSec = cfg.UI.GetRemoteSessionRefreshSecs()
 		h.footerMode = cfg.UI.GetFooter()
 		h.attachOnCreate = cfg.UI.GetAttachOnCreate()
+		// Initial hidden state of the collapsible preview sections; the
+		// toggle-preview-sections hotkey flips these at runtime.
+		h.previewHideWorktree = cfg.Preview.GetHideWorktree()
+		h.previewHideClaude = cfg.Preview.GetHideClaude()
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
 		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
@@ -11380,6 +11391,14 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.refreshAskPanel()
 		h.askPanel.SetSize(h.width, h.height)
 		h.askPanel.Show()
+		return h, nil
+
+	case defaultHotkeyBindings[hotkeyTogglePreviewSections]:
+		// Show/hide the collapsible preview sections (Worktree, Claude) together:
+		// if both are hidden, show both; otherwise hide both.
+		hidden := h.previewHideWorktree && h.previewHideClaude
+		h.previewHideWorktree = !hidden
+		h.previewHideClaude = !hidden
 		return h, nil
 
 	case "<":
@@ -21128,8 +21147,9 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(h.renderAgentCard(agentRow, width))
 	}
 
-	// Worktree info section (for sessions running in git worktrees)
-	if selected.IsWorktree() {
+	// Worktree info section (for sessions running in git worktrees). Hidden when
+	// previewHideWorktree is set (config [preview] hide_worktree / runtime toggle).
+	if selected.IsWorktree() && !h.previewHideWorktree {
 		wtHeader := renderSectionDivider("Worktree", width-4)
 		b.WriteString(wtHeader)
 		b.WriteString("\n")
@@ -21224,8 +21244,9 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		}
 	}
 
-	// Claude-specific info (session ID and MCPs)
-	if session.IsClaudeCompatible(selected.Tool) {
+	// Claude-specific info (session ID and MCPs). Hidden when previewHideClaude
+	// is set (config [preview] hide_claude / runtime toggle).
+	if session.IsClaudeCompatible(selected.Tool) && !h.previewHideClaude {
 		// Section divider for Claude info
 		claudeHeader := renderSectionDivider("Claude", width-4)
 		b.WriteString(claudeHeader)
