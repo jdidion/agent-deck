@@ -663,6 +663,11 @@ type Home struct {
 	previewHideWorktree bool
 	previewHideClaude   bool
 
+	// compact tightens vertical layout ([ui] compact): one-line panel titles and
+	// a single-line preview header (name + status + pills + activity). Default
+	// off (the classic roomier layout).
+	compact bool
+
 	// footerMode selects the bottom hint-bar style (config.toml [ui] footer).
 	// One of session.FooterCurated (default), FooterFull, FooterCompact, or
 	// FooterMinimal. Cached so every render of a frame agrees. Additive/opt-in:
@@ -2047,6 +2052,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		// toggle-preview-sections hotkey flips these at runtime.
 		h.previewHideWorktree = cfg.Preview.GetHideWorktree()
 		h.previewHideClaude = cfg.Preview.GetHideClaude()
+		h.compact = cfg.UI.GetCompact()
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
 		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
@@ -3645,6 +3651,9 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
 func (h *Home) sidebarLineBudget() (lineBudget int, sidebarWidth int) {
 	helpBarHeight := 2
 	panelTitleLines := 2 // SESSIONS title + underline (matches View())
+	if h.compact {
+		panelTitleLines = 1 // compact: single "TITLE ────" line
+	}
 
 	// Filter bar is always shown for consistent layout (matches View())
 	filterBarHeight := 1
@@ -3918,6 +3927,9 @@ func (h *Home) applySavedLayoutSettings(ui session.UISettings) {
 func (h *Home) getVisibleHeight() int {
 	helpBarHeight := 2
 	panelTitleLines := 2
+	if h.compact {
+		panelTitleLines = 1
+	}
 	filterBarHeight := 1
 	updateBannerHeight := 0
 	if h.shouldRenderUpdateBanner() {
@@ -19103,17 +19115,23 @@ func (h *Home) renderPanelTitle(title string, width int) string {
 
 	titleStyle := lipgloss.NewStyle().
 		Foreground(ColorCyan).
-		Bold(true).
-		Width(width)
+		Bold(true)
 
+	if h.compact {
+		// One line: "TITLE ─────────" — the title, a space, then a rule that
+		// fills the remaining width. Saves a vertical line versus the classic
+		// title-over-underline. panelTitleLines (= 1 when compact) must match.
+		barStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+		barLen := max(0, width-lipgloss.Width(title)-1)
+		return titleStyle.Render(title) + " " + barStyle.Render(strings.Repeat("─", barLen))
+	}
+
+	// Classic two-line: title, then a full-width underline.
+	titleStyle = titleStyle.Width(width)
 	underlineStyle := lipgloss.NewStyle().
 		Foreground(ColorBorder).
 		Width(width)
-
-	// Create underline that extends to panel width
-	underlineLen := max(0, width)
-	underline := underlineStyle.Render(strings.Repeat("─", underlineLen))
-
+	underline := underlineStyle.Render(strings.Repeat("─", max(0, width)))
 	return titleStyle.Render(title) + "\n" + underline
 }
 
@@ -19593,6 +19611,9 @@ func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	// Panel title is exactly 2 lines (title + underline)
 	// Panel content gets the remaining space: contentHeight - 2
 	panelTitleLines := 2
+	if h.compact {
+		panelTitleLines = 1
+	}
 	panelContentHeight := contentHeight - panelTitleLines
 
 	// Build left panel (session list) with styled title.
@@ -22832,57 +22853,15 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		statusColor = ColorTextDim
 	}
 
-	// Header with session name and status
+	// Header line: session name, status, tool/group pills, and activity time all
+	// on ONE line to conserve vertical space. Activity is computed first so it can
+	// join the line; sessionActivityTime is the SAME formula as the row badge
+	// (issue #1846: the preview once read DisplayLastActivityTime while the badge
+	// used pickBadgeTime, so the two surfaces showed a different age for one
+	// session).
 	statusBadge := lipgloss.NewStyle().Foreground(statusColor).Render(statusIcon + " " + string(selectedStatus))
 	nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
-	b.WriteString(nameStyle.Render(selected.Title))
-	b.WriteString("  ")
-	b.WriteString(statusBadge)
-	b.WriteString("\n")
-
-	// Auth hold banner. A session whose agent exited on a 401 shows a bare
-	// "error" status that no amount of restarting will clear, and during a
-	// fleet-wide credential failure that reads as unexplained mass death (the
-	// 2026-07-26 incident). Say what happened and what to do, right under the
-	// status, before anything else in the preview. Reads the in-memory mirror so
-	// the render path never touches the filesystem.
-	if selected.AuthHeldCached() {
-		b.WriteString(authHoldBannerLines(width))
-	}
-
-	// Info lines: path and activity time
 	infoStyle := lipgloss.NewStyle().Foreground(ColorText)
-	pathStr := truncatePath(selected.ProjectPath, width-4)
-	b.WriteString(infoStyle.Render("📁 " + pathStr))
-	b.WriteString("\n")
-
-	// Activity time - shows when session was last active. Composed with
-	// sessionActivityTime — the SAME formula as the row badge (issue #1846:
-	// the preview used to read DisplayLastActivityTime while the badge used
-	// pickBadgeTime, so the two surfaces showed different ages for the same
-	// session; both were stale once the underlying evidence was destroyed).
-	var previewHookStatus *session.HookStatus
-	if h.hookWatcher != nil {
-		previewHookStatus = h.hookWatcher.GetHookStatus(selected.ID)
-	}
-	confirmedTs, confirmedObserved := selected.LastObservedActivity()
-	activityTime := sessionActivityTime(selected.CreatedAt, selected.LastStartedAt, selected.LastActivityAt(), selected.LastAccessedAt, confirmedTs, confirmedObserved, previewHookStatus)
-	activityStr := formatRelativeTime(activityTime)
-	if selectedStatus == session.StatusRunning {
-		activityStr = "active now"
-	}
-	b.WriteString(infoStyle.Render("⏱ " + activityStr))
-	b.WriteString("\n")
-
-	// Who else has this session open (shared attach), from the per-socket
-	// viewer cache so the render path never spawns tmux. A stopped session
-	// has no tmux to view, so the line is for live ones.
-	if selectedStatus != session.StatusStopped {
-		previewViewers, previewViewersKnown := selected.ViewersCached()
-		b.WriteString(infoStyle.Render(viewersLine(previewViewers, previewViewersKnown, time.Now())))
-		b.WriteString("\n")
-	}
-
 	toolBadge := lipgloss.NewStyle().
 		Foreground(ColorBg).
 		Background(ColorPurple).
@@ -22893,10 +22872,76 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		Background(ColorCyan).
 		Padding(0, 1).
 		Render(selected.GroupPath)
-	b.WriteString(toolBadge)
-	b.WriteString(" ")
-	b.WriteString(groupBadge)
+
+	var previewHookStatus *session.HookStatus
+	if h.hookWatcher != nil {
+		previewHookStatus = h.hookWatcher.GetHookStatus(selected.ID)
+	}
+	confirmedTs, confirmedObserved := selected.LastObservedActivity()
+	activityTime := sessionActivityTime(selected.CreatedAt, selected.LastStartedAt, selected.LastActivityAt(), selected.LastAccessedAt, confirmedTs, confirmedObserved, previewHookStatus)
+	activityStr := formatRelativeTime(activityTime)
+	if selectedStatus == session.StatusRunning {
+		activityStr = "active now"
+	}
+
+	if h.compact {
+		// Compact: name, status, tool/group pills, and activity on ONE line.
+		b.WriteString(nameStyle.Render(selected.Title))
+		b.WriteString("  ")
+		b.WriteString(statusBadge)
+		b.WriteString("  ")
+		b.WriteString(toolBadge)
+		b.WriteString(" ")
+		b.WriteString(groupBadge)
+		b.WriteString("  ")
+		b.WriteString(infoStyle.Render("⏱ " + activityStr))
+		b.WriteString("\n")
+	} else {
+		// Classic: name and status on their own line.
+		b.WriteString(nameStyle.Render(selected.Title))
+		b.WriteString("  ")
+		b.WriteString(statusBadge)
+		b.WriteString("\n")
+	}
+
+	// Auth hold banner. A session whose agent exited on a 401 shows a bare
+	// "error" status that no amount of restarting will clear, and during a
+	// fleet-wide credential failure that reads as unexplained mass death (the
+	// 2026-07-26 incident). Say what happened and what to do right under the
+	// header. Reads the in-memory mirror so the render path never touches the
+	// filesystem.
+	if selected.AuthHeldCached() {
+		b.WriteString(authHoldBannerLines(width))
+	}
+
+	// Path.
+	pathStr := truncatePath(selected.ProjectPath, width-4)
+	b.WriteString(infoStyle.Render("📁 " + pathStr))
 	b.WriteString("\n")
+
+	if !h.compact {
+		// Classic: activity time on its own line (compact folds it into the header).
+		b.WriteString(infoStyle.Render("⏱ " + activityStr))
+		b.WriteString("\n")
+	}
+
+	// Who else has this session open (shared attach), from the per-socket
+	// viewer cache so the render path never spawns tmux. A stopped session
+	// has no tmux to view, so the line is for live ones.
+	if selectedStatus != session.StatusStopped {
+		previewViewers, previewViewersKnown := selected.ViewersCached()
+		b.WriteString(infoStyle.Render(viewersLine(previewViewers, previewViewersKnown, time.Now())))
+		b.WriteString("\n")
+	}
+
+	if !h.compact {
+		// Classic: tool/group pills on their own line (compact folds them into
+		// the header).
+		b.WriteString(toolBadge)
+		b.WriteString(" ")
+		b.WriteString(groupBadge)
+		b.WriteString("\n")
+	}
 
 	// Agent card. When the selected session belongs to an adopted agent, its
 	// role, triggers, connector health and recent ledger entries render here

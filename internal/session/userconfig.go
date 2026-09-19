@@ -407,6 +407,13 @@ type UISettings struct {
 	// omitted setting preserves the classic layout and Enter-to-attach behavior.
 	EmbeddedTerminal *bool `toml:"embedded_terminal,omitempty"`
 
+	// Compact tightens vertical layout: the SESSIONS/PREVIEW panel titles render
+	// as a single "TITLE ────" line instead of title-over-underline, and the
+	// preview header puts session name, status, tool/group pills, and the
+	// activity time on one line. Default false (the classic roomier layout).
+	// Distinct from SidebarDensity, which controls per-session ROW height.
+	Compact *bool `toml:"compact,omitempty"`
+
 	// SidebarDensity controls how many lines one session occupies in the
 	// embedded-layout sidebar. It has no effect on the classic layout. Valid
 	// values:
@@ -662,6 +669,11 @@ func normalizePreviewFieldList(fields []string, key string) []string {
 // An omitted value preserves the classic layout.
 func (u UISettings) GetEmbeddedTerminal() bool {
 	return u.EmbeddedTerminal != nil && *u.EmbeddedTerminal
+}
+
+// GetCompact reports whether the tightened vertical layout is on. Default false.
+func (u UISettings) GetCompact() bool {
+	return u.Compact != nil && *u.Compact
 }
 
 // Sidebar densities for the embedded layout. See UISettings.SidebarDensity.
