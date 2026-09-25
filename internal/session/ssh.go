@@ -167,6 +167,21 @@ type SSHRunner struct {
 	// runFn lets tests stub out command execution. nil = real SSH.
 	runFn func(ctx context.Context, args ...string) ([]byte, error)
 
+	// fetchSessionsFn lets tests stub FetchSessions's stdout+stderr directly
+	// (needed because ListStats travels on stderr, which runFn does not
+	// carry). nil = real SSH via run(), reading lastStderr.
+	fetchSessionsFn func(ctx context.Context, args ...string) (stdout, stderr []byte, err error)
+
+	// lastStderr holds the most recent successful run()'s stderr (#2331):
+	// FetchSessions reads it right after its own Run call returns, before
+	// any concurrent call on this runner can overwrite it (fetchOneRemote
+	// issues FetchSessions synchronously, then fans the version/stats/cost/
+	// group calls out afterward). A pointer + its own mutex, not a plain
+	// sync.Mutex field, because channelFor's `rc := *r` (remote_channel.go)
+	// copies SSHRunner by value to capture a closure and copying a Mutex is
+	// a vet error; a pointer copies safely and both copies still share it.
+	lastStderr *lastStderrBox
+
 	// name is the remote's config name; it keys the shared persistent
 	// channel (#2174). Empty for runners built without a name.
 	name string
@@ -187,6 +202,9 @@ type SSHRunner struct {
 	// update/deploy path (ResolveRemotePath, DeployBinary, version checks)
 	// without spawning a real ssh/scp subprocess. nil = real SSH (#1171).
 	remoteExecFn func(ctx context.Context, remoteCmd string, stdin []byte) ([]byte, error)
+
+	// nudgeFn lets tests stub NudgeCheckNow without spawning ssh. nil = real SSH.
+	nudgeFn func(ctx context.Context) error
 }
 
 // NewSSHRunner creates an SSHRunner from a RemoteConfig.
@@ -198,6 +216,7 @@ func NewSSHRunner(name string, rc RemoteConfig) *SSHRunner {
 		Profile:        rc.GetProfile(),
 		commandTimeout: rc.GetCommandTimeout(),
 		name:           name,
+		lastStderr:     &lastStderrBox{},
 	}
 }
 
@@ -268,9 +287,10 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 	// every command. A transport failure falls through to a plain exec, so
 	// the channel can only make things faster, never break them.
 	if ch := channelFor(r); ch != nil && ch.Connected() && remoteChannelArgsSafe(args) {
-		out, err := ch.Request(ctx, args)
+		out, stderr, err := ch.RequestWithStderr(ctx, args)
 		switch {
 		case err == nil:
+			r.setLastStderr(stderr)
 			return out, nil
 		case errors.Is(err, errChannelDown):
 			// Never reached the agent: an exec is the same request.
@@ -319,7 +339,43 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 		return stdout.Bytes(), fmt.Errorf("ssh command failed: %w: %s", err, detail)
 	}
 
+	r.setLastStderr(stderr.Bytes())
 	return stdout.Bytes(), nil
+}
+
+// lastStderrBox is lastStderr's storage: a pointer field on SSHRunner so
+// copying the runner (channelFor's `rc := *r`) copies the pointer, not a
+// lock, and every copy still shares the one box.
+type lastStderrBox struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+// setLastStderr records the stderr of the run() call that just succeeded.
+// A runner built by a struct literal (tests, mainly) has a nil box, which
+// this treats as "not tracked" — the same as an SSHRunner that predates
+// this field.
+func (r *SSHRunner) setLastStderr(stderr []byte) {
+	if r.lastStderr == nil {
+		return
+	}
+	r.lastStderr.mu.Lock()
+	r.lastStderr.data = append([]byte(nil), stderr...)
+	r.lastStderr.mu.Unlock()
+}
+
+// consumeLastStderr returns and clears the stderr captured by the most
+// recent successful run(), so a later call on this runner does not see a
+// stale value from an earlier command.
+func (r *SSHRunner) consumeLastStderr() []byte {
+	if r.lastStderr == nil {
+		return nil
+	}
+	r.lastStderr.mu.Lock()
+	defer r.lastStderr.mu.Unlock()
+	data := r.lastStderr.data
+	r.lastStderr.data = nil
+	return data
 }
 
 // Attach connects interactively to a remote agent-deck session.
@@ -565,6 +621,58 @@ func (r *SSHRunner) RunCommand(ctx context.Context, args ...string) ([]byte, err
 	return r.Run(ctx, args...)
 }
 
+// nudgeDialTimeout bounds how long NudgeCheckNow waits for the SSH
+// connection + fork to succeed. It is not how long the remote's own check
+// takes — that runs backgrounded on the remote, detached from this SSH
+// session, so the nudge returns as soon as the remote has launched it.
+const nudgeDialTimeout = 10 * time.Second
+
+// NudgeCheckNow tells the remote to check for an update right now, without
+// transferring any bytes itself: the remote's own `agent-deck update
+// --check-now` downloads and verifies on its own if a release is available.
+// It is fire-and-forget — the remote command is backgrounded with nohup and
+// disowned before this call returns, so a slow or stuck remote update never
+// blocks the controller (which moves on to nudging the next remote) and a
+// dropped SSH connection never interrupts it either.
+func (r *SSHRunner) NudgeCheckNow(ctx context.Context) error {
+	if err := ValidateSSHHost(r.Host); err != nil {
+		return err
+	}
+	if r.nudgeFn != nil {
+		return r.nudgeFn(ctx)
+	}
+	remoteCmd := r.buildRemoteCommand("update", "--check-now", "--trigger", "nudge")
+	background := fmt.Sprintf("nohup sh -c %s >/dev/null 2>&1 </dev/null & disown 2>/dev/null; true", shellQuote(remoteCmd))
+	timeoutCtx, cancel := context.WithTimeout(ctx, nudgeDialTimeout)
+	defer cancel()
+	// #nosec G204 -- args are ssh connection options plus a shell-quoted
+	// remote command built from this runner's own config, never user input
+	// at call time.
+	cmd := exec.CommandContext(timeoutCtx, "ssh", r.sshBaseArgs(background)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nudge failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// fallbackUpdateTimeout bounds the compatibility fallback for a remote too
+// old to understand --check-now (see NudgeRemotes): the remote's own
+// `agent-deck update --unattended` downloads and verifies the release
+// itself, which needs more headroom than an ordinary status command.
+const fallbackUpdateTimeout = 5 * time.Minute
+
+// FallbackUpdate runs `agent-deck update --unattended` on the remote and
+// blocks until it finishes: the compatibility path for a remote whose
+// version predates the --check-now nudge (NudgeRemotes). The bytes are
+// still fetched BY the remote, exactly as an interactive `agent-deck
+// update` on that host would.
+func (r *SSHRunner) FallbackUpdate(ctx context.Context) ([]byte, error) {
+	timeoutCtx, cancel := context.WithTimeout(ctx, fallbackUpdateTimeout)
+	defer cancel()
+	return r.run(timeoutCtx, "update", "--unattended", "--trigger", "nudge-fallback")
+}
+
 // buildRemoteCommand safely quotes each argument for execution through the remote shell.
 func (r *SSHRunner) buildRemoteCommand(args ...string) string {
 	parts := []string{shellQuote(r.AgentDeckPath)}
@@ -577,13 +685,95 @@ func (r *SSHRunner) buildRemoteCommand(args ...string) string {
 	return strings.Join(parts, " ")
 }
 
-// FetchSessions retrieves the session list from the remote agent-deck instance.
-func (r *SSHRunner) FetchSessions(ctx context.Context) ([]RemoteSessionInfo, error) {
-	output, err := r.Run(ctx, "list", "--json")
-	if err != nil {
-		return nil, err
+// FetchSessions retrieves the session list from the remote agent-deck
+// instance, along with the remote's own status-pass timing when it answered
+// with one (#2331: an older remote, or a malformed line, simply yields a nil
+// *ListStats — this is best-effort observability, never a fetch failure).
+//
+// #2333: every real remote at the time --stats shipped was still on
+// v1.16.13, which rejects an unrecognized flag outright (Go's flag package,
+// ExitOnError, before "list" ever runs) — sending --stats unconditionally
+// broke polling of every remote fleet-wide until each one's binary caught
+// up. So the flag is only sent once this remote is known to accept it
+// (remoteSupportsStats, keyed to the remote's cached version so an upgrade
+// forces one fresh probe); an unknown remote is still asked optimistically,
+// but a rejection is detected, remembered, and retried without the flag in
+// the same call instead of surfacing as a fetch failure.
+func (r *SSHRunner) FetchSessions(ctx context.Context) ([]RemoteSessionInfo, *ListStats, error) {
+	sentStats := r.remoteSupportsStats()
+	stdout, stderr, err := r.fetchSessionsOnce(ctx, sentStats)
+	switch {
+	case sentStats && err != nil && isStatsFlagRejected(err):
+		r.recordStatsSupport(false)
+		sentStats = false
+		stdout, stderr, err = r.fetchSessionsOnce(ctx, false)
+	case sentStats && err == nil:
+		r.recordStatsSupport(true)
 	}
-	return parseRemoteSessions(output)
+	if err != nil {
+		return nil, nil, err
+	}
+	sessions, err := parseRemoteSessions(stdout)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !sentStats {
+		return sessions, nil, nil
+	}
+	return sessions, parseListStats(stderr), nil
+}
+
+// fetchSessionsOnce runs one `list --json[--stats]` against the remote,
+// through whichever transport this runner uses (test stub or real SSH).
+func (r *SSHRunner) fetchSessionsOnce(ctx context.Context, withStats bool) (stdout, stderr []byte, err error) {
+	args := []string{"list", "--json"}
+	if withStats {
+		args = append(args, ListStatsFlag)
+	}
+	if r.fetchSessionsFn != nil {
+		return r.fetchSessionsFn(ctx, args...)
+	}
+	out, runErr := r.Run(ctx, args...)
+	if runErr != nil {
+		return out, nil, runErr
+	}
+	return out, r.consumeLastStderr(), nil
+}
+
+// isStatsFlagRejected reports whether err is Go's flag package refusing
+// --stats on `list`, i.e. a remote binary built before #2331 that has never
+// heard of the flag (v1.16.13 and earlier). Any other error — unreachable
+// host, timeout, a `list` that panicked — must not be read as "no stats
+// support"; it just fails the poll as it always did.
+func isStatsFlagRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "flag provided but not defined") &&
+		strings.Contains(msg, strings.TrimLeft(ListStatsFlag, "-"))
+}
+
+// remoteSupportsStats decides whether this poll should ask for --stats. An
+// unknown remote (never probed, or probed at a version that has since
+// changed) is asked optimistically; FetchSessions detects and remembers an
+// actual rejection rather than this guessing from a version number, since
+// "which release added --stats" is not something the controller should
+// have to hardcode.
+func (r *SSHRunner) remoteSupportsStats() bool {
+	state, ok := LoadRemoteVersions()[r.name]
+	if !ok || state.StatsSupported == nil {
+		return true
+	}
+	return *state.StatsSupported
+}
+
+// recordStatsSupport persists this poll's --stats verdict against the
+// remote's currently-known version (RecordRemoteStatsSupport drops it if
+// that version has moved since, rather than pinning the wrong version).
+func (r *SSHRunner) recordStatsSupport(supported bool) {
+	version := LoadRemoteVersions()[r.name].Version
+	_ = RecordRemoteStatsSupport(r.name, version, supported)
 }
 
 // parseRemoteSessions decodes `list --json` output; empty or non-JSON output
@@ -1336,13 +1526,13 @@ func (r *SSHRunner) DeployBinary(ctx context.Context, binaryData []byte, remoteP
 	if err != nil {
 		return err
 	}
-	return r.deployResolvedBinary(ctx, binaryData, resolved)
+	return r.deployResolvedBinary(ctx, binaryData, resolved, "")
 }
 
 // deployResolvedBinary runs the deploy script against a path that has
 // already been resolved through any symlinks.
-func (r *SSHRunner) deployResolvedBinary(ctx context.Context, binaryData []byte, remotePath string) error {
-	return r.deployResolvedPayload(ctx, binaryData, remotePath, "", "")
+func (r *SSHRunner) deployResolvedBinary(ctx context.Context, binaryData []byte, remotePath, expectedVersion string) error {
+	return r.deployResolvedPayload(ctx, binaryData, remotePath, "", expectedVersion)
 }
 
 func (r *SSHRunner) deployResolvedPayload(ctx context.Context, binaryData []byte, remotePath, checksum, expectedVersion string) error {
@@ -1598,8 +1788,15 @@ func (r *SSHRunner) InstallBinary(ctx context.Context, binaryData []byte, expect
 
 // InstallBinaryWithForce permits replacing newer PATH targets when forced.
 func (r *SSHRunner) InstallBinaryWithForce(ctx context.Context, binaryData []byte, expectedVersion string, force bool) error {
+	want := strings.TrimPrefix(expectedVersion, "v")
 	return r.installPayload(ctx, expectedVersion, false, force, func(target string) error {
-		return r.deployResolvedBinary(ctx, binaryData, target)
+		// want must reach remoteDeployScript's "$expected" so it runs the
+		// staged binary's `--version` and refuses to rename a corrupt or
+		// truncated transfer into place (#2340: InstallBinary used to call
+		// deployResolvedBinary with no version, silently skipping the
+		// remote-side check that InstallLocalArchive already had, and a
+		// transfer cut mid-stream landed at the final path unverified).
+		return r.deployResolvedBinary(ctx, binaryData, target, want)
 	})
 }
 
@@ -1842,6 +2039,13 @@ func remoteVerbReadOnly(args []string) bool {
 		return second == "export" || second == "writer-status"
 	case "session":
 		return second == "show" || second == "output" || second == "pane"
+	case "recall":
+		// Every forwarded recall verb reads the remote's index; export is
+		// a read too (the write happens on the puller).
+		switch second {
+		case "search", "sessions", "show", "context", "export", "status":
+			return true
+		}
 	}
 	return false
 }

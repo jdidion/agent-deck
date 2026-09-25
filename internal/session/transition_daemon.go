@@ -134,6 +134,13 @@ type TransitionDaemon struct {
 	// off the poll loop so a wedged notifier binary cannot stall session
 	// monitoring. Only tests wait on it.
 	desktopWG sync.WaitGroup
+
+	// recallBackfillMu guards recallBackfillStarted: the daemon/timer path's
+	// one-time trigger for the background initial recall backfill
+	// (docs/recall.md, issue #2329). Per-instance rather than a package
+	// global so tests get a fresh trigger per daemon.
+	recallBackfillMu      sync.Mutex
+	recallBackfillStarted bool
 }
 
 func NewTransitionDaemon() *TransitionDaemon {
@@ -160,6 +167,16 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 	d.ensureHookWatcher()
 	defer d.shutdown()
 
+	// The daemon/timer path recall's initial backfill trigger asks for
+	// (docs/recall.md, issue #2329), never the TUI's render loop and never
+	// the Stop/SessionEnd hook. Checked once per iteration (cheap: a mutex
+	// and a bool once started) so a config edit that turns recall or
+	// backfill_on_enable on while this daemon is already running is picked
+	// up without a restart. `notify-daemon --once` calls SyncOnce directly
+	// and never reaches this loop, so a single diagnostic pass never starts
+	// a background goroutine it has no way to let finish.
+	d.maybeStartInitialRecallBackfill(ctx)
+
 	// Prime baseline once, then run adaptive loop.
 	interval := d.SyncOnce(ctx)
 	if interval <= 0 {
@@ -171,6 +188,7 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(interval):
+			d.maybeStartInitialRecallBackfill(ctx)
 			interval = d.SyncOnce(ctx)
 			if interval <= 0 {
 				interval = notifyPollSlow
@@ -547,7 +565,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	// Runs on EVERY pass, the first scan included — see the FIRST SCAN note on
 	// recordTerminalTurns for why suppressing it would recreate the field bug.
 	d.recordTerminalTurns(profile, byID, statuses, hookStatuses)
-	d.journalStatusChanges(profile, statuses, substates)
+	d.journalStatusChanges(profile, byID, statuses, substates)
 
 	if !d.initialized[profile] {
 		// Cover fast transitions that completed before we observed a running snapshot.
@@ -613,11 +631,8 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 // never straight to the journal: this runs on the daemon's only goroutine, the
 // one every other profile's status detection also depends on, so a slow or
 // wedged health volume must not be able to block it.
-func (d *TransitionDaemon) journalStatusChanges(profile string, statuses, substates map[string]string) {
+func (d *TransitionDaemon) journalStatusChanges(profile string, byID map[string]*Instance, statuses, substates map[string]string) {
 	writer := d.journalWriter(profile)
-	if writer == nil {
-		return
-	}
 	seen, known := d.lastJournaled[profile]
 	if !known {
 		seen = map[string]string{}
@@ -633,6 +648,17 @@ func (d *TransitionDaemon) journalStatusChanges(profile string, statuses, substa
 			continue
 		}
 		from, fromSubstate, _ := strings.Cut(previous, "|")
+		// Recall trigger (docs/recall.md): a running session that stopped
+		// running just finished a turn; queue its transcript for the next
+		// sweep. Handed to the recall notify worker like the journal write
+		// goes to its async writer: resolving the transcript path walks
+		// the recall roots, and nothing on this goroutine may.
+		if from == "running" && to != "running" {
+			RecallNotifyInstanceAsync(byID[id], "turn_end")
+		}
+		if writer == nil {
+			continue
+		}
 		event := health.Event{TS: now, SessionID: id, Kind: health.KindStatus, From: from, To: to}
 		detail := map[string]any{}
 		if substate != "" {

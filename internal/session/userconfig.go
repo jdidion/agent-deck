@@ -1397,13 +1397,59 @@ type UpdateSettings struct {
 	// Default: true (nil = true)
 	CheckEnabled *bool `toml:"check_enabled,omitempty"`
 
-	// CheckIntervalHours is how often to check for updates (in hours)
-	// Default: 24
+	// CheckIntervalHours is how often the startup remote sweep (see
+	// AutoUpdateRemotes/ShouldAutoUpdateRemotes) throttles itself, in hours.
+	// Default: 24. This is unrelated to CheckInterval below, which governs
+	// the near-event-driven GitHub poll every daemon/TUI runs.
 	CheckIntervalHours int `toml:"check_interval_hours,omitzero"`
+
+	// CheckInterval is how often every agent-deck daemon/TUI polls the
+	// GitHub releases endpoint for a new release, as a Go duration string
+	// (e.g. "90s", "2m"). The poll is a conditional GET (ETag /
+	// If-None-Match): a 304 (no new release) does not spend the caller's
+	// GitHub API rate limit, so a short interval is cheap. On error the
+	// caller backs off exponentially with jitter rather than retrying at
+	// this rate (see update.NextRecheck). Default: "90s".
+	CheckInterval string `toml:"check_interval,omitempty"`
+
+	// SweepRemotes pushes the controller's binary bytes to every configured
+	// remote after an unattended install, the way AutoUpdateRemotes always
+	// did before this setting existed. Default: false — remotes are instead
+	// nudged (a best-effort, byte-free "check now" over the same channel,
+	// falling back to `ssh <host> agent-deck update` for a remote that does
+	// not understand the nudge) and pull + verify themselves. `agent-deck
+	// remote update <host>` is unaffected either way: it always pulls onto
+	// the named remote by hand, regardless of this setting.
+	SweepRemotes *bool `toml:"sweep_remotes,omitempty"`
 
 	// NotifyInCLI shows update notification in CLI commands (not just TUI)
 	// Default: true (nil = true)
 	NotifyInCLI *bool `toml:"notify_in_cli,omitempty"`
+}
+
+// DefaultCheckInterval is how often a daemon/TUI polls GitHub for a new
+// release when [updates].check_interval is unset.
+const DefaultCheckInterval = 90 * time.Second
+
+// GetCheckInterval returns the configured poll interval, defaulting to
+// DefaultCheckInterval when unset or unparsable. Never returns a
+// non-positive duration.
+func (u UpdateSettings) GetCheckInterval() time.Duration {
+	if v := strings.TrimSpace(u.CheckInterval); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return DefaultCheckInterval
+}
+
+// GetSweepRemotes reports whether the controller pushes bytes to remotes
+// after an install, instead of nudging them to pull (default: false).
+func (u UpdateSettings) GetSweepRemotes() bool {
+	if u.SweepRemotes == nil {
+		return false
+	}
+	return *u.SweepRemotes
 }
 
 // GetCheckEnabled returns whether update checks are enabled (default: true).
@@ -2893,11 +2939,112 @@ type RecallSettings struct {
 	// Enabled turns the recall.db transcript index on (default: false).
 	// Hints and annotations work regardless of this value.
 	Enabled *bool `toml:"enabled,omitempty"`
+	// MaxLoadAvg refuses a backfill or sweep while the one-minute load
+	// average is above it (default 4.0; 0 disables the check).
+	MaxLoadAvg *float64 `toml:"max_loadavg,omitempty"`
+	// TextTier is the stored body per message: "clipped" (default, 8 KiB)
+	// or "full".
+	TextTier string `toml:"text_tier,omitempty"`
+	// KeepMissingDays is how long the ledger row and tombstone of a
+	// vanished transcript survive before `recall gc` drops them (default 30).
+	KeepMissingDays *int `toml:"keep_missing_days,omitempty"`
+	// PerSourceMB caps how much of one transcript a single sweep parses;
+	// the rest continues next sweep (default 64; 0 = unlimited).
+	PerSourceMB *int `toml:"per_source_mb,omitempty"`
+	// Harnesses lists the harnesses the index reads (default: every
+	// registered reader: claude, codex, pi, gemini, opencode, hermes).
+	Harnesses []string `toml:"harnesses,omitempty"`
+	// HookSweep lets the asynchronous Claude SessionEnd hook index its own
+	// transcript inline, within the interactive budget (default true). Off,
+	// the hook only queues the file for the next sweep. The synchronous
+	// Stop hook never sweeps: it appends one queue line and returns.
+	HookSweep *bool `toml:"hook_sweep,omitempty"`
+	// RemoteCards allows conversation-derived cards (titles, hints, tags,
+	// 200-character previews, derived summaries; never bodies or paths) to
+	// cross the SSH boundary: `recall export` on this machine and `recall
+	// pull`/`recall import` into it (default false). The federated query
+	// (`recall search --remote`) never depends on it: it stores nothing.
+	RemoteCards *bool `toml:"remote_cards,omitempty"`
+	// BackfillOnEnable runs one bounded background pass, from the
+	// notify-daemon's poll loop, the first time recall is enabled with an
+	// empty index or a never-finished initial backfill (default true;
+	// issue #2329). It throttles instead of refusing under load, unlike
+	// the manual `recall backfill`, which still refuses without --force.
+	BackfillOnEnable *bool `toml:"backfill_on_enable,omitempty"`
 }
+
+// Recall defaults.
+const (
+	DefaultRecallMaxLoadAvg      = 4.0
+	DefaultRecallKeepMissingDays = 30
+	DefaultRecallPerSourceMB     = 64
+)
 
 // GetEnabled reports whether the recall index is switched on (default false).
 func (r RecallSettings) GetEnabled() bool {
 	return r.Enabled != nil && *r.Enabled
+}
+
+// GetHarnesses returns the harness names to index, lower-cased and
+// trimmed; nil means every registered reader.
+func (r RecallSettings) GetHarnesses() []string {
+	var out []string
+	for _, h := range r.Harnesses {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// GetRemoteCards reports whether cards may cross the SSH boundary
+// (default false).
+func (r RecallSettings) GetRemoteCards() bool {
+	return r.RemoteCards != nil && *r.RemoteCards
+}
+
+// GetHookSweep reports whether the SessionEnd hook indexes its transcript
+// inline (default true).
+func (r RecallSettings) GetHookSweep() bool {
+	return r.HookSweep == nil || *r.HookSweep
+}
+
+// GetBackfillOnEnable reports whether the daemon runs the one-time
+// background initial backfill (default true).
+func (r RecallSettings) GetBackfillOnEnable() bool {
+	return r.BackfillOnEnable == nil || *r.BackfillOnEnable
+}
+
+// GetMaxLoadAvg returns the load gate threshold (default 4.0).
+func (r RecallSettings) GetMaxLoadAvg() float64 {
+	if r.MaxLoadAvg == nil {
+		return DefaultRecallMaxLoadAvg
+	}
+	return *r.MaxLoadAvg
+}
+
+// GetTextTier returns "clipped" unless "full" is configured.
+func (r RecallSettings) GetTextTier() string {
+	if strings.EqualFold(strings.TrimSpace(r.TextTier), "full") {
+		return "full"
+	}
+	return "clipped"
+}
+
+// GetKeepMissingDays returns the tombstone retention (default 30).
+func (r RecallSettings) GetKeepMissingDays() int {
+	if r.KeepMissingDays == nil || *r.KeepMissingDays < 0 {
+		return DefaultRecallKeepMissingDays
+	}
+	return *r.KeepMissingDays
+}
+
+// GetPerSourceMB returns the per-sweep per-source cap (default 64).
+func (r RecallSettings) GetPerSourceMB() int {
+	if r.PerSourceMB == nil || *r.PerSourceMB < 0 {
+		return DefaultRecallPerSourceMB
+	}
+	return *r.PerSourceMB
 }
 
 // ToolDef defines a custom AI tool
@@ -5116,8 +5263,12 @@ auto_install = true
 auto_restart = true
 # Enable update checks on startup (default: true)
 check_enabled = true
-# How often to check for updates in hours (default: 24)
-check_interval_hours = 24
+# How often to poll GitHub for a new release, e.g. "90s", "2m" (default: "90s").
+# Polls are conditional (ETag) so an unchanged answer (304) is nearly free.
+# check_interval = "90s"
+# Push the controller's binary onto every configured remote after an
+# install, instead of nudging remotes to pull it themselves (default: false)
+# sweep_remotes = true
 # Show update notification in CLI commands, not just TUI (default: true)
 notify_in_cli = true
 
@@ -5380,7 +5531,42 @@ func GetAvailableMCPs() map[string]MCPDef {
 	if err != nil || config == nil {
 		return make(map[string]MCPDef)
 	}
-	return config.MCPs
+	return withRecallMCP(config)
+}
+
+// RecallMCPName is the built-in MCP entry for `agent-deck recall mcp`.
+const RecallMCPName = "recall"
+
+// RecallMCPDef is the definition `mcp list` shows and `mcp attach` writes
+// while [recall] enabled = true: this binary serving the index over stdio.
+// A user-defined [mcps.recall] wins over it. The command follows the hook
+// rule (hookExecutablePath): an installed binary is pinned by its stable
+// install path, an unpinnable dev build keeps the bare "agent-deck", so
+// the project's .mcp.json never names a build directory that goes away.
+func RecallMCPDef() MCPDef {
+	command := "agent-deck"
+	if exe, err := hookExecutablePath(); err == nil && exe != "" {
+		command = exe
+	}
+	return MCPDef{Command: command, Args: []string{"recall", "mcp"},
+		Description: "Recall: search, show and hand over every conversation on this machine (built-in; docs/recall.md)"}
+}
+
+// withRecallMCP returns the configured MCPs plus the built-in recall entry
+// when the index is enabled; the config's own map is never mutated.
+func withRecallMCP(config *UserConfig) map[string]MCPDef {
+	if !config.Recall.GetEnabled() {
+		return config.MCPs
+	}
+	if _, defined := config.MCPs[RecallMCPName]; defined {
+		return config.MCPs
+	}
+	out := make(map[string]MCPDef, len(config.MCPs)+1)
+	for k, v := range config.MCPs {
+		out[k] = v
+	}
+	out[RecallMCPName] = RecallMCPDef()
+	return out
 }
 
 // GetAvailableMCPNames returns sorted list of MCP names from config.toml

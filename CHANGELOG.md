@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.16] - 2026-09-20
+
+### Fixed
+
+- Remotes now receive a new release through a temp file that is checksum-verified and started once before it replaces the old binary, so an interrupted transfer can no longer leave a broken agent-deck behind. The old binary stays in place and the transfer is retried instead (#2340).
+- Restarting the web daemon can no longer kill a remote sweep in flight, and only one updater runs at a time (#2340).
+
+## [1.16.15] - 2026-09-20
+
+### Fixed
+
+- Recall's background first indexing no longer reports "done" after a few sessions; it keeps going, slice by slice, until every folder of every user on the machine is indexed, and `recall status` shows real progress (#2337).
+- Remote session rows show how old their status is and the health line names the slow step when a remote polls slowly; the new stats request is only sent to remotes that understand it, older remotes keep polling as before (#2333).
+- Refreshed web visual baselines (#2338).
+
+## [1.16.14] - 2026-09-20
+
+### Added
+
+- Recall phase 4 (behind `[recall] enabled = false`): enrichment and classifiers run on the index rows, search across remotes (`recall search --remote <host>` / `--all-remotes`) with opt-in card sync, `recall context <session> --into current` hands a session's brief to the one you are in, and `agent-deck recall mcp` exposes search/show/context over MCP (#2320). When Recall is switched on, old sessions are indexed in the background on their own, slowed down under load instead of refusing (#2331).
+
+### Fixed
+
+- The deck no longer shows duplicate group or session rows or repeated preview blocks while a remote refreshes (#2330).
+- The profile store root is chosen by an explicit, stable rule, never by a bare directory stat: an empty `~/.local/share/agent-deck/profiles/<profile>/state.db` beside a populated legacy `~/.agent-deck` store no longer hijacks every new CLI, hook and daemon process (twice on 2026-09-19/20 the fleet looked wiped from the CLI while the TUI kept running on the legacy store). When both roots hold profiles, the marker `profiles/.active-root` that `agent-deck migrate-paths` now writes pins the XDG root (the legacy copy it leaves behind is ignored, however many rows it keeps); without a marker the legacy root stays active and a WARNING names the remedy. The only automatic protection is an empty store beside a populated one, which is a stray: the populated root is used. An unreadable store counts as unknown, never as empty. `migrate-paths` sets an empty stray XDG `profiles/` aside (`profiles.stray-<timestamp>`) before copying, so the remedy the WARNING names works on the incident layout. A second store for a profile is never created implicitly, the TUI's startup reviver no longer opens a store before the outer-tmux guard, the TUI and notify daemon log `store_selected` (plus a WARN naming a stray or unreadable store) once per process, every other CLI process prints the WARNING once on stderr (hook and completion handlers stay silent), and `agent-deck doctor`/`health` report both roots with real session counts, the marker, unreadable stores and the active root. Already-migrated users get the marker by rerunning `agent-deck migrate-paths --force` once; older binaries keep resolving the XDG root by the bare `profiles/` stat (#2323).
+- Configured tool status detection is restored when sessions are reloaded (#2322, thanks @tignear).
+- The embedded preview fits again after a session restart (#2327, thanks @karaaslanz).
+- The archive confirmation reads as archiving, not deleting (#2328, thanks @dbeaudoin).
+
+## [1.16.13] - 2026-09-19
+
+### Added
+
+- Recall (behind `[recall] enabled = false`): a local index of every session's conversation across Claude Code, Codex, Pi, Gemini, OpenCode and Hermes. New commands `recall backfill|sweep|status|sessions|search|show|open|gc|rebuild`; new sessions land automatically through the stop hook, and `G` opens Recall search in the deck. The agent-deck skill gained a Recall section. Measured: 3.4 GB of transcripts indexed in under 40s into ~125 MB, with searches under 100ms; see the PR bodies for details (#2314, #2318).
+
+### Fixed
+
+- The self-update no longer boots out its own launchd service: the headless web daemon's own updater used to take `com.agentdeck.web` down with it and leave it unloaded, so that agent is now deferred and re-registered by the next update run outside it (timer, TUI), with bounded bootstrap retries and a second-miss failure. Every unattended update run also keeps an append-only update audit log. The startup remote sweep is throttled per controller version and reports the reason for every skipped or deferred sweep. Control-pipe reconnects are budgeted per session instead of storming. A TUI that has had a newer build on disk for two hours without restarting reports it through a heartbeat that `agent-deck update --check` surfaces (#2312).
+- Width-aware footers and dialog wraps at 80/120 columns (#2313).
+- The Go telemetry `TempDir` test race (#2315).
+
 ## [1.16.12] - 2026-09-19
 
 ### Added

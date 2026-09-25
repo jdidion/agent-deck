@@ -1,20 +1,9 @@
-# fix/preview-scale-20260918
+# fix/never-prefer-empty-xdg-store-20260920 (round 2, review HOLD on 4e84dd1d)
 
-- [x] 1. Layout root cause + scalable accounts table (golden frames 1/2/7/12 slots x 60/100/200)
-- [x] 2. Usage feed by construction: hooks install wraps statusLine per slot; hooks status reports feed; preview names the reason
-- [x] 3. Opt-in "ssh" field (system stats ssh_sessions via `who`, remote wire, header + preview, unknown first class)
-- [x] 4. EXPLORE other optional fields at width 60 / long values -> issue drafts
-- [x] Verify: go build/vet, Docker tests, on-screen frames (rc.6 vs branch) at 200/100
-- [x] code-simplifier, commits, RESULTS.md, PR-BODY.md
-
-## Round 2 (review HOLD aa00ef70)
-
-- [x] 1. `usage ingest` never fails closed: store open/parse/save errors are stderr warnings, wrapped command always runs (bytes + exit code forwarded); `hooks install` refuses a slot the quota cache cannot name, `hooks status` says `cannot wire (...)`
-- [x] 2. `wrapPreviewLine`: a clause that fits neither the current line nor a continuation line behind its lead is word-wrapped; every line ≤ width, second pass is the identity (no blank line)
-- [x] 3. Single-line fields share the row budget: wrapped lines capped with `…` so later fields and the hint stay on a short pane
-- [x] 4. `who` under `LC_ALL=C`
-- [x] 5. `hooks install` never creates a slot's config dir: `skipped: slot dir missing`
-- [x] 6. Pinned absolute path: keep (a); shell fallback double-runs the status line on a forwarded non-zero exit (proven); documented
-- [x] 7. `hooks uninstall` removes only the keys install wrote; the pre-install object comes back
-- [x] 8. Wrapped command sees `AGENTDECK_PROFILE` as inherited, not the wrapper's `-p`
-- [x] Verify: go build/vet, Docker tests, temp-HOME proofs, on-screen frames w45/h30 and w60/h20, code-simplifier
+- [x] 1. Root rule is marker-based, not count-based: `profiles/.active-root` (written by `migrate-paths`) decides when both roots are populated; no marker -> legacy + WARN; the only automatic protection is empty-beside-populated = stray -> populated root; matrix documented; post-migration `remove` + profile create keeps XDG (test + probe)
+- [x] 2. `store_selected` / `stray_xdg_store` actually emitted: structured line after `logging.Init` (TUI, notify daemon), one stderr WARN per CLI process (not hook-handler/completion/doctor/health); tests
+- [x] 3. Unreadable store = unknown, never 0: never loses to an empty store; prefer the readable populated root + WARN; doctor prints `unreadable`; test
+- [x] 4. doctor counts rows in the clean layout too; test
+- [x] 5. Remedies that work: stray WARN says "move the stray profiles/ aside"; refusal error names the real fix; `migrate-paths` writes the marker (plain and --force); end-to-end sandbox test legacy -> XDG then the CLI uses XDG
+- [x] 6. `--group`/`--select` store open before the guards: note (kept before the no-TTY gate on purpose, #2011; the create guard makes it harmless)
+- [x] CHANGELOG + config-reference + PR body; go build/vet/gofmt; incident reproductions re-run; CI; RESULTS.md

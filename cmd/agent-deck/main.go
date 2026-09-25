@@ -29,6 +29,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/health"
 	"github.com/asheshgoplani/agent-deck/internal/intervalhook"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -41,7 +42,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.16.12" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.16.16" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -65,7 +66,7 @@ func init() {
 // unsandboxed-test warning on every run of this package (issue #2012).
 func initUpdateSettings() {
 	settings := session.GetUpdateSettings()
-	update.SetCheckInterval(settings.CheckIntervalHours)
+	update.SetCheckIntervalDuration(settings.GetCheckInterval())
 	update.SetBridgeScriptInstaller(session.InstallBridgeScript)
 	update.SetConductorDirResolver(session.ConductorDir)
 }
@@ -99,7 +100,7 @@ func recordCLITelemetry(subcommand string, rest []string) {
 	case "add", "list", "ls", "remove", "rm", "rename", "mv", "status", "profile", "update",
 		"session", "fleet", "mcp", "plugin", "skill", "mcp-proxy", "group", "try", "launch",
 		"accounts", "conductor", "agents", "agent", "telegram-doctor", "watcher", "openclaw", "oc",
-		"remote", "worktree", "wt", "costs", "usage", "web", "uninstall", "migrate-paths", "hooks",
+		"remote", "worktree", "wt", "costs", "usage", "web", "uninstall", "migrate-paths", "hooks", "recall",
 		"codex-hooks", "gemini-hooks", "hermes-hooks", "cursor-hooks", "tmux-hooks", "pi-hooks", "deepseek", "feedback", "creds-refresh",
 		"config":
 	default:
@@ -374,6 +375,16 @@ func main() {
 	// no-op on non-macOS, suppressible via AGENTDECK_SUPPRESS_TMUX_WARNING.
 	tmux.WarnIfVulnerableTmux()
 
+	// One stderr WARNING per CLI process when the profile store layout needs
+	// the user's hand (stray or unpinned second store). CLI processes never
+	// open the debug log, so this is their only trace of the decision; the
+	// TUI and the notify daemon log `store_selected` after logging.Init.
+	// Hook and completion handlers must stay silent, doctor/health/migrate-
+	// paths print the same information themselves.
+	if len(args) > 0 && !storeRootQuietCommands[args[0]] {
+		session.WarnStoreRootDivergence(os.Stderr)
+	}
+
 	var webEnabled bool
 	// webHeadless: true when --no-tui is passed to the `web` subcommand.
 	// Skips bubbletea boot (the bulk of ~60 MB RSS) and runs HTTP-server only.
@@ -496,6 +507,9 @@ func main() {
 			return
 		case "costs":
 			handleCosts(profile, args[1:])
+			return
+		case "recall":
+			handleRecall(profile, args[1:])
 			return
 		case "usage":
 			handleUsage(profile, args[1:])
@@ -693,13 +707,6 @@ func main() {
 		AllowInteractivePrompt: false,
 	})
 
-	// Startup reviver scan (v1.7.8, REPORT-D). Fire-and-forget — rebuilds
-	// control pipes for any instance whose tmux server is alive but whose
-	// pipe got killed by e.g. an SSH logout scope cleanup. Runs in the
-	// background so it never blocks TUI boot. See .planning/v178-ssh-reviver/PLAN.md.
-	// Read the restart hand-off now: the TUI unsets it as soon as it boots.
-	go reviveOnStartup(profile, startupReviveDelay(os.Getenv))
-
 	// Block TUI launch when stdin is not a terminal.
 	//
 	// A full-screen app with no keyboard is not a screen, it is a hang: bubbletea
@@ -765,6 +772,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "      AGENT_DECK_ALLOW_OUTER_TMUX=1 agent-deck")
 		os.Exit(1)
 	}
+
+	// Startup reviver scan (v1.7.8, REPORT-D). Fire-and-forget — rebuilds
+	// control pipes for any instance whose tmux server is alive but whose
+	// pipe got killed by e.g. an SSH logout scope cleanup. Runs in the
+	// background so it never blocks TUI boot. See .planning/v178-ssh-reviver/PLAN.md.
+	// Read the restart hand-off now: the TUI unsets it as soon as it boots.
+	//
+	// It runs only past the no-TTY and outer-tmux guards above: a TUI that
+	// exits there must not open (and, on a first touch, create) a profile
+	// store. The 2026-09-20 03:06 stray XDG store was created by exactly
+	// this goroutine in a TUI that then exited at the outer-tmux guard.
+	go reviveOnStartup(profile, startupReviveDelay(os.Getenv))
 
 	// Set version for UI update checking
 	ui.SetVersion(Version)
@@ -924,6 +943,9 @@ func main() {
 		// dynamicHandler + lumberjack pipeline that logging.Init wires up.
 		// See internal/session/userconfig.go LogCgroupIsolationDecision.
 		session.LogCgroupIsolationDecision()
+		// Same shape: the profile store root decision, made long before the
+		// log file was open, is emitted here exactly once.
+		session.LogStoreRootSelection()
 
 		if debugMode {
 			logging.ForComponent(logging.CompUI).Info("instance_started",
@@ -1367,9 +1389,29 @@ func newHeadlessAutoInstaller(exe string, homebrewManaged func() bool) *update.I
 		Exe:            exe,
 		RunningVersion: Version,
 		Trigger:        "web",
+		Interval:       session.GetUpdateSettings().GetCheckInterval(),
 		Enabled:        func() bool { return session.GetUpdateSettings().GetAutoInstall() },
 		Log:            webLog,
 	}
+}
+
+// storeRootQuietCommands never print the profile store WARNING to stderr:
+// hook and completion handlers feed other programs, and doctor, health and
+// migrate-paths report the layout themselves.
+var storeRootQuietCommands = map[string]bool{
+	"hook-handler":  true,
+	"__complete":    true,
+	"completion":    true,
+	"doctor":        true,
+	"health":        true,
+	"migrate-paths": true,
+	"telemetry":     true,
+	"version":       true,
+	"--version":     true,
+	"-v":            true,
+	"help":          true,
+	"--help":        true,
+	"-h":            true,
 }
 
 // commandRegistry lists every token that main()'s dispatch switch treats
@@ -1384,7 +1426,7 @@ var commandRegistry = map[string]bool{
 	"group": true, "try": true, "launch": true, "conductor": true,
 	"agents": true, "agent": true,
 	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
-	"remote": true, "remote-agent": true, "system": true, "worktree": true, "wt": true, "costs": true, "usage": true, "web": true, "config": true,
+	"remote": true, "remote-agent": true, "system": true, "worktree": true, "wt": true, "costs": true, "usage": true, "web": true, "config": true, "recall": true,
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "tmux-hooks": true, "pi-hooks": true, "deepseek": true, "notify-daemon": true,
@@ -2543,6 +2585,17 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 		autoHints[hintKeyParent] = parentInstance.ID
 	}
 	sessionHints, sessionTags := applyCreationHints(storage, newInstance, creationHints, autoHints)
+	// An operator-named conversation (--resume-session) is an explicit
+	// ownership declaration, so it is an authoritative harness link from
+	// creation: the recall index binds the transcript to this session
+	// without waiting for a hook (docs/recall.md, "Harness links").
+	if *resumeSession != "" {
+		if db := storage.GetDB(); db != nil {
+			if err := db.UpsertSessionLink(newInstance.ID, "claude", *resumeSession, "", true); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: session link: %v\n", err)
+			}
+		}
+	}
 
 	// Attach MCPs if specified
 	if len(mcpFlags) > 0 {
@@ -2739,6 +2792,10 @@ func handleList(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	allProfiles := fs.Bool("all", false, "List sessions from all profiles")
 	includeSuperseded := fs.Bool("include-superseded", false, "Include archived source rows retained for cross-harness recovery")
+	// Undocumented: SSHRunner passes this on its own remote invocation
+	// (#2331) so a slow `list --json` names its own status-pass duration
+	// instead of leaving the caller with one opaque round-trip number.
+	statsFlag := fs.Bool(strings.TrimLeft(session.ListStatsFlag, "-"), false, "")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck list [options]")
@@ -2796,8 +2853,23 @@ func handleList(profile string, args []string) {
 	if *jsonOutput {
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
+		statusStarted := time.Now()
+		tmuxBefore := tmux.SubprocessStarts()
 		session.RefreshInstancesForCLIStatus(instances)
 		output, err := buildListJSON(storage.Profile(), instances)
+		statusElapsed := time.Since(statusStarted)
+		tmuxCalls := tmux.SubprocessStarts() - tmuxBefore
+		// #2331: this status pass is the one thing both the poll (`list
+		// --json`) and the remote-agent's push probe run, but unlike its
+		// TUI/web siblings (backgroundStatusUpdate, refreshStatuses) it never
+		// recorded itself, so a slow remote gave the controller one opaque
+		// wall-clock number with no stage to blame. Record it locally like
+		// the other two surfaces, plus emit a stderr stats line an SSH caller
+		// can read, since a remote's own health.jsonl is never fetched back.
+		health.RecordStatusPass(statusElapsed, len(instances), tmuxCalls)
+		if *statsFlag {
+			emitListStats(statusElapsed, tmuxCalls, len(instances))
+		}
 		if err != nil {
 			fmt.Printf("Error: failed to format JSON output: %v\n", err)
 			os.Exit(1)
@@ -2832,6 +2904,15 @@ func handleList(profile string, args []string) {
 // row to the default list without replaying or deleting its retained lineage.
 func defaultListInstances(instances []*session.Instance) []*session.Instance {
 	return session.VisibleInstances(instances)
+}
+
+func emitListStats(elapsed time.Duration, tmuxCalls int64, sessions int) {
+	stats := session.ListStats{StatusPassMS: elapsed.Milliseconds(), TmuxCalls: tmuxCalls, Sessions: sessions}
+	encoded, err := json.Marshal(stats)
+	if err != nil {
+		return
+	}
+	fmt.Fprintln(os.Stderr, session.ListStatsPrefix+string(encoded))
 }
 
 // buildListJSON is the body of `list --json`: every session with its status
@@ -3825,9 +3906,10 @@ func handleProfileSetDefault(out *CLIOutput, name string) {
 func handleUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	checkOnly := fs.Bool("check", false, "Only check for updates, don't install")
-	jsonOut := fs.Bool("json", false, "With --check: print the result as JSON (current, latest, available, publishing, auto_install, auto_restart, timer)")
+	jsonOut := fs.Bool("json", false, "With --check: print the result as JSON (current, latest, available, publishing, auto_install, auto_restart, timer, on_disk, running_tuis, pending_launch_agents)")
 	targetVersion := fs.String("version", "", "Install a specific released version (e.g. 1.7.3); may be a downgrade")
 	unattended := fs.Bool("unattended", false, "Install without prompts (no changelog, no stdin); honours [updates] auto_install; exit 2 on Homebrew installs")
+	checkNow := fs.Bool("check-now", false, "Same as --unattended, but for a controller's nudge: checks GitHub right away and never nudges this host's own remotes")
 	trigger := fs.String("trigger", "", "Who started this run, for the debug log: tui, timer or manual (default: $AGENTDECK_UPDATE_TRIGGER or manual)")
 	installTimer := fs.Bool("install-timer", false, "Install (or replace) the daily unattended update timer (launchd on macOS, systemd --user on Linux)")
 	uninstallTimer := fs.Bool("uninstall-timer", false, "Remove the daily unattended update timer")
@@ -3845,9 +3927,10 @@ func handleUpdate(args []string) {
 		fmt.Println("Examples:")
 		fmt.Println("  agent-deck update                     # Check and install latest if available")
 		fmt.Println("  agent-deck update --check             # Only check, don't install")
-		fmt.Println("  agent-deck update --check --json      # Machine-readable check incl. timer state")
+		fmt.Println("  agent-deck update --check --json      # Machine-readable check incl. timer state, running TUIs, pending launch agents")
 		fmt.Println("  agent-deck update --version 1.7.3     # Install a specific version (may downgrade)")
 		fmt.Println("  agent-deck update --unattended        # No prompts; what the timer and the TUI run")
+		fmt.Println("  agent-deck update --check-now          # What a controller's nudge runs on this host")
 		fmt.Println("  agent-deck update --install-timer     # Daily unattended update at 07:MM (random minute)")
 		fmt.Println("  agent-deck update --install-timer --dry-run")
 		fmt.Println("  agent-deck update --uninstall-timer")
@@ -3876,7 +3959,7 @@ func handleUpdate(args []string) {
 		exit(runTimerCommand("status", false, os.Stdout))
 	}
 
-	if *unattended {
+	if *unattended || *checkNow {
 		// The TUI runs this child with its stdout on a pipe. Should the TUI
 		// go away mid-run (a quit, or a restart that slipped past the
 		// in-flight guard), the next progress line would otherwise kill
@@ -3884,7 +3967,14 @@ func handleUpdate(args []string) {
 		// leave its sweep marker and update.lock behind. Everything that
 		// matters is in the debug log; a lost stdout is just EPIPE here.
 		signal.Ignore(syscall.SIGPIPE)
-		exit(runUnattendedUpdate(realUnattendedDeps(updateTrigger(*trigger))))
+		effectiveTrigger := updateTrigger(*trigger)
+		if *checkNow && strings.TrimSpace(*trigger) == "" {
+			effectiveTrigger = "nudge"
+		}
+		deps, closeAudit := realUnattendedDeps(effectiveTrigger)
+		code := runUnattendedUpdate(deps)
+		closeAudit()
+		exit(code)
 	}
 
 	if strings.TrimSpace(*targetVersion) != "" {
@@ -3902,7 +3992,8 @@ func handleUpdate(args []string) {
 		if cfg, err := update.DefaultTimerConfig(); err == nil {
 			timer = update.QueryTimerStatus(cfg, update.ExecRunner{})
 		}
-		if err := printUpdateCheckJSON(os.Stdout, buildUpdateCheckJSON(info, session.GetUpdateSettings(), timer)); err != nil {
+		onDisk := onDiskVersion()
+		if err := printUpdateCheckJSON(os.Stdout, buildUpdateCheckJSON(info, session.GetUpdateSettings(), timer, onDisk, runningTUIReports(onDisk), update.ListPendingRebootstrap())); err != nil {
 			exit(1)
 		}
 		exit(0)
@@ -3930,6 +4021,17 @@ func handleUpdate(args []string) {
 
 	if !info.Available {
 		fmt.Println("✓ You're running the latest version!")
+		if *checkOnly {
+			printOutdatedTUIs(onDiskVersion())
+			printPendingLaunchAgents()
+			return
+		}
+		// Nothing to install, but a launch agent an earlier run left
+		// pending is retried here too, loudly when it still fails.
+		if err := drainPendingLaunchAgents(updateCLILog); err != nil {
+			fmt.Printf("\nLaunch agent still not re-registered: %v\n", err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -3956,6 +4058,8 @@ func handleUpdate(args []string) {
 		} else {
 			fmt.Println("\nRun 'agent-deck update' to install.")
 		}
+		printOutdatedTUIs(onDiskVersion())
+		printPendingLaunchAgents()
 		return
 	}
 
@@ -4263,6 +4367,7 @@ func printHelp() {
 	fmt.Println("  group            Manage groups")
 	fmt.Println("  worktree, wt     Manage git worktrees")
 	fmt.Println("  usage            Show remaining provider subscription quota")
+	fmt.Println("  recall           Search every Claude conversation on this machine (docs/recall.md)")
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
@@ -4273,7 +4378,7 @@ func printHelp() {
 	fmt.Println("  update           Check for and install updates")
 	fmt.Println("  telemetry        Opt-in anonymous usage reports: status|enable|disable|preview|show-last|reset-id (see TELEMETRY.md)")
 	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
-	fmt.Println("  migrate-paths    Copy legacy ~/.agent-deck files into XDG paths")
+	fmt.Println("  migrate-paths    Copy legacy ~/.agent-deck files into XDG paths and pin the XDG data root")
 	fmt.Println("  uninstall        Uninstall Agent Deck")
 	fmt.Println("  version          Show version")
 	fmt.Println("  help             Show this help")

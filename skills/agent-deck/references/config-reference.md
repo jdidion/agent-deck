@@ -39,6 +39,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[mcps.*] Section](#mcps-section)
 - [[tools.*] Section](#tools-section)
 - [Path Resolution](#path-resolution)
+- [Data Locations](#data-locations)
 
 ## Top-Level
 
@@ -699,21 +700,27 @@ auto_update_remotes = true    # Keep older remotes on the controller's version (
 auto_install = true           # Install unattended (TUI check + timer)
 auto_restart = true           # Restart in place after an install
 check_enabled = true          # Check on startup
-check_interval_hours = 24     # Check frequency
+check_interval_hours = 24     # Legacy throttle for the byte-pushing sweep only
+check_interval = "90s"        # How often every daemon/TUI polls GitHub for a new release
+sweep_remotes = false         # Push bytes to remotes after an install (default: nudge instead)
 notify_in_cli = true          # Show in CLI commands
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auto_update_remotes` | bool | `true` | Keep configured remotes on the controller's version: after a successful `agent-deck update`, and in the background on TUI startup (at most once per `check_interval_hours`), every remote whose `agent-deck version` is older than the controller's gets the same verified binary deploy as `agent-deck remote update --all`. Never prompts, never blocks the TUI; a remote that fails stays on its version and is logged. Remotes without a reachable binary, or whose `agent-deck version` is not a version string, are skipped (install them once with `agent-deck remote update <name>`), and a release that is not newer than what the remote runs is never deployed, so the fallback from a tag without a release to the latest release cannot downgrade a remote. A pre-release controller (`1.16.4-preview.abc`) counts as older than release `1.16.4`, so it never pushes onto a remote already on that release. Set `auto_update_remotes = false` to opt out and be prompted after `agent-deck update` instead. |
+| `auto_update_remotes` | bool | `true` | Keep configured remotes on the controller's version: after a successful `agent-deck update`, and in the background on TUI startup (at most once per `check_interval_hours`), every remote whose `agent-deck version` is older than the controller's gets the same verified binary deploy as `agent-deck remote update --all`. Never prompts, never blocks the TUI; a remote that fails stays on its version and is logged. Remotes without a reachable binary, or whose `agent-deck version` is not a version string, are skipped (install them once with `agent-deck remote update <name>`), and a release that is not newer than what the remote runs is never deployed, so the fallback from a tag without a release to the latest release cannot downgrade a remote. A pre-release controller (`1.16.4-preview.abc`) counts as older than release `1.16.4`, so it never pushes onto a remote already on that release. Set `auto_update_remotes = false` to opt out and be prompted after `agent-deck update` instead. This is the startup-only sweep; the always-on nudge below is separate and unaffected by this key. |
 | `auto_update` | bool | `false` | Offer to install an available update (Y/n prompt) before the TUI opens. |
 | `auto_install` | bool | `true` | Install an available update unattended, from the TUI's periodic check and from the `agent-deck update --install-timer` job (launchd on macOS, systemd on Linux). `false` opts out; `agent-deck update` then only runs by hand. |
 | `auto_restart` | bool | `true` | Once a newer binary is on disk, re-exec the running process in place (TUI: from the home screen when no dialog or session action is in flight; `web --no-tui` and daemons: at an idle point). `false` keeps the "installed, press ctrl+t to restart" notice instead. |
 | `check_enabled` | bool | `true` | Enable startup update checks. |
-| `check_interval_hours` | int | `24` | Hours between checks. |
+| `check_interval_hours` | int | `24` | Hours between runs of the legacy byte-pushing sweep (`auto_update_remotes`'s throttle). Unrelated to `check_interval` below. |
+| `check_interval` | duration string | `"90s"` | How often every agent-deck daemon/TUI polls the GitHub releases endpoint for a new release. The poll is a conditional GET (`If-None-Match` against the last seen `ETag`): when nothing has changed, GitHub answers `304 Not Modified`, which does not spend the caller's API rate limit, so a short interval stays cheap between releases. A release is normally installed within one interval of publishing (plus install time), not on the next restart or the next daily timer run. |
+| `sweep_remotes` | bool | `false` | Push the controller's binary bytes onto every configured remote after an unattended install (the pre-nudge model, see "Nudging remotes" below). Off by default: remotes are nudged instead and pull the release themselves. `agent-deck remote update <host>` is unaffected either way — it always pulls onto the named remote by hand. |
 | `notify_in_cli` | bool | `true` | Show updates in CLI (not just TUI). |
 
-**Timer.** `agent-deck update --install-timer` schedules `agent-deck update --unattended --trigger timer` once a day: a launchd agent (`~/Library/LaunchAgents/com.agentdeck.autoupdate.plist`, 07:MM local time with a minute drawn at random at install time, since launchd has no `RandomizedDelaySec`) on macOS, or a systemd user timer (`agent-deck-autoupdate.timer`, `OnCalendar=daily`, `RandomizedDelaySec=1h`, `Persistent=true`) on Linux. The unattended run honours `auto_install`, never runs Homebrew, takes `<cache dir>/update.lock` so it cannot collide with the TUI's own install, and afterwards runs the same no-prompt remote sweep as an interactive update when `auto_update_remotes` is on (with it off, remotes are left alone). `--timer-status`, `--uninstall-timer` and `--dry-run` round it out; `agent-deck update --check --json` reports the timer state alongside these settings.
+**Nudging remotes instead of pushing bytes.** With `sweep_remotes` at its default of `false`, an unattended install (or a "nothing to install, already current" run) tells every configured remote to check for the release right now, over the same SSH connection `remote list`/`remote update` already use: `agent-deck update --check-now` runs on the remote, backgrounded (`nohup … & disown`) so the controller never waits on the remote's own download and never transfers any release bytes to it. A remote whose last known version predates `--check-now` (anything before this feature, e.g. v1.16.14/v1.16.15) gets the compatibility fallback instead — a blocking `agent-deck update --unattended` on that remote — so the bytes are still fetched BY the remote either way. Either path is best-effort: a remote that cannot be reached is reported (`agent-deck update`'s own output lists one line per remote) and never fails the local install. Set `sweep_remotes = true` to restore the old behavior of the controller pushing a verified binary onto every remote directly.
+
+**Timer.** `agent-deck update --install-timer` schedules `agent-deck update --unattended --trigger timer` once a day: a launchd agent (`~/Library/LaunchAgents/com.agentdeck.autoupdate.plist`, 07:MM local time with a minute drawn at random at install time, since launchd has no `RandomizedDelaySec`) on macOS, or a systemd user timer (`agent-deck-autoupdate.timer`, `OnCalendar=daily`, `RandomizedDelaySec=1h`, `Persistent=true`) on Linux. This daily run is now a backstop, not the primary path: any long-running agent-deck process (an open TUI, `web --no-tui`, `notify-daemon`) already polls every `check_interval` on its own and installs the moment a release appears. The unattended run honours `auto_install`, never runs Homebrew, takes `<cache dir>/update.lock` so it cannot collide with another run (single-flight; a run whose holder process has died is detected and the lock recovered automatically), and afterwards nudges every configured remote (falling back to a blocking pull for one that predates the nudge) and, only with `sweep_remotes` on, also runs the old push-based sweep. `--timer-status`, `--uninstall-timer` and `--dry-run` round it out; `agent-deck update --check --json` reports the timer state alongside these settings, plus `on_disk` (the version of the binary at the executable's path) and `running_tuis` (every open TUI's pid, version, `outdated`, `ticking`, `restart_state` and `block_reason`, from the heartbeat each TUI writes to `<cache dir>/tui/<pid>.json`). Every unattended run also appends to `<cache dir>/update.log` (trigger, pid, ppid, launchd service, version on each line). On macOS the run re-registers the `com.agentdeck.*` launch agents that run the binary, except the one it runs inside itself, which goes to `<cache dir>/launchd-rebootstrap-pending.json` for the next run outside it; an agent that was booted out and never came back is kept there too (with its attempts) and retried by every later run, and `agent-deck update --check --json` lists the marker as `pending_launch_agents` (label, reason, since, attempts, last_error).
 
 **When the automatic paths stay quiet.** `auto_install` and `auto_restart` are for a person's deck. Neither fires, whatever the config says, when the process runs under `go test`, when `AGENTDECK_SKIP_UPDATE_CHECK` is set, when `CI` is truthy, when an `AGENTDECK_TEST_*` marker is in the environment, or (TUI only) when stdin or stdout is not a terminal. Headless daemons (`web --no-tui`, `remote-agent`) keep their idle-point restart for real deployments but honour the same environment markers. The reason is logged once at startup (`auto_update_suppressed`), the banner then offers the keys instead of promising a restart, and `ctrl+y` / `ctrl+t` and the explicit `agent-deck update` commands keep working. Scripts that drive `agent-deck` and must never see an unattended install set `AGENTDECK_SKIP_UPDATE_CHECK=1`; the repository's CI workflows do so once per workflow.
 
@@ -877,16 +884,32 @@ index_rate_limit = 20       # Files/second for indexing
 
 ## [recall] Section
 
-Recall, the cross-harness conversation store (`docs/recall.md`). Phase 1 ships the durable hint layer only (`add`/`launch --hint/--tag/--ticket/--why`, `session annotate`), which lives in the profile's `state.db` and does not depend on this switch.
+Recall, the cross-harness conversation store (`docs/recall.md`). The durable hint layer (`add`/`launch --hint/--tag/--ticket/--why`, `session annotate`) lives in the profile's `state.db` and does not depend on this section. `enabled` gates the transcript index (`agent-deck recall ...` and the TUI `G` key), one machine-global `recall.db` in the data dir beside `profiles/` covering Claude (every profile), Codex, pi, Gemini, OpenCode and Hermes.
 
 ```toml
 [recall]
-enabled = false             # Reserved: gates the recall.db transcript index (later phases)
+enabled = false             # Turn the recall.db transcript index on
+max_loadavg = 4.0           # backfill/sweep/rebuild refuse above this 1-minute load (0 disables)
+text_tier = "clipped"       # message bodies stored clipped to 8 KiB, or "full"
+keep_missing_days = 30      # how long a vanished transcript's tombstone survives before gc drops it
+per_source_mb = 64          # per-sweep cap on one transcript; the rest continues next sweep (0 = unlimited)
+harnesses = ["claude", "codex", "pi", "gemini", "opencode", "hermes"]  # which harnesses to index (default: all)
+hook_sweep = true           # the async Claude SessionEnd hook indexes its own transcript inline (150 ms / 32 MB); Stop only queues
+remote_cards = false        # let session cards (never bodies or paths) cross SSH: recall export / pull / import
+backfill_on_enable = true   # the daemon runs one throttled background pass the first time recall is enabled with an empty or never-finished index
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Turn the recall.db index on once it ships. Hints and annotations work regardless. |
+| `enabled` | bool | `false` | Turn the recall.db index on. Hints and annotations work regardless. |
+| `max_loadavg` | float | `4.0` | Load gate for `backfill`, `sweep` and `rebuild` (they also refuse while a session is `running`); `--force` overrides. Also scales the sleep between `backfill_on_enable`'s chunks, which never refuses outright. |
+| `text_tier` | string | `"clipped"` | `clipped` stores 8 KiB per message body (the FTS index always covers the full text); `full` stores whole bodies. |
+| `keep_missing_days` | int | `30` | `recall gc` drops the ledger row and tombstone of a transcript missing longer than this. |
+| `per_source_mb` | int | `64` | Most of one file a single sweep parses before deferring the rest. |
+| `harnesses` | list | all | Harness names to index; a harness whose home is absent is skipped anyway. |
+| `hook_sweep` | bool | `true` | The asynchronous Claude `SessionEnd` hook indexes only its own transcript within the interactive budget; off, it only queues the file for the next sweep. The synchronous `Stop` hook never sweeps: it appends one queue line and returns. |
+| `remote_cards` | bool | `false` | Opt in to remote card sync: `recall export --cards` on this machine and `recall pull <host>` / `recall import` into it. Cards are titles, hints, tags, 200-character previews and derived summaries; message bodies, offsets and paths never leave. The federated query (`recall search --remote <host>` / `--all-remotes`) never depends on this key: it runs the search on the remote and stores nothing. |
+| `backfill_on_enable` | bool | `true` | Run the initial catch-up backfill from `agent-deck notify-daemon`, throttled instead of gated, the first time `enabled` is true with an empty index or a marker saying the pass never finished (`recall status --json`'s `initial_backfill`). Off, an empty index stays empty until someone runs `recall backfill` by hand. |
 
 ## [notifications] Section
 
@@ -1337,3 +1360,23 @@ description = "GitHub access"
 | `CLAUDE_CONFIG_DIR` | Override Claude config dir |
 | `AGENTDECK_DEBUG=1` | Enable debug logging |
 | `AGENTDECK_IDENTITY_FILE` | Set in every spawned session: path of the model-readable identity block for that session (see `[launch] inject_identity`) |
+
+## Data Locations
+
+Session state lives in one **profile store** per profile: `profiles/<profile>/state.db` under a single data root, either the XDG data dir (`$XDG_DATA_HOME/agent-deck`, default `~/.local/share/agent-deck`) or the legacy `~/.agent-deck`. Which root is active is decided per process by this table, never by a bare directory stat or by which copy has more rows:
+
+| legacy `profiles/` | XDG `profiles/` | active root | reason |
+|---|---|---|---|
+| absent | absent | XDG | `default_new` (fresh install) |
+| present | absent | legacy | `legacy_only` |
+| absent | present | XDG | `xdg_only` |
+| present | present, with `profiles/.active-root` | XDG | `active_root_marker` (migrated; the legacy copy is ignored) |
+| populated or unreadable | empty | legacy | `stray_xdg_store` + WARNING |
+| empty | populated or unreadable | XDG | `stray_legacy_store` + WARNING |
+| populated | unreadable | legacy | `xdg_store_unreadable` + WARNING |
+| unreadable | populated | XDG | `legacy_store_unreadable` + WARNING |
+| anything else (both populated, both empty, both unreadable), no marker | | legacy | `no_marker_legacy` + WARNING |
+
+"Empty" means every store under the root opens read-only and holds 0 session rows; an unreadable store is unknown and never counts as empty. The marker `profiles/.active-root` is written only by `agent-deck migrate-paths` (which also sets an empty stray XDG `profiles/` aside as `profiles.stray-<timestamp>` before copying, and leaves the legacy directory untouched); a `profiles/` directory that a stray process created never carries one, and moving the XDG `profiles/` aside removes the pin with it. Already-migrated installs (both copies populated, no marker) get the marker by running `agent-deck migrate-paths --force` once: existing XDG files are kept, missing ones copied from legacy. A running TUI keeps the root it started with. A new `state.db` is created only when the profile has no store under the other root; otherwise the open fails with `profile store exists under the other data root` instead of silently creating an empty twin.
+
+The decision is emitted once per process: the TUI and the notify daemon log `store_selected path=... reason=...` (and a `WARN` named after the reason, e.g. `stray_xdg_store`, with the offending path) to `debug.log`; every other CLI process prints the same WARNING once on stderr (hook, completion, doctor, health and migrate-paths stay silent there). `agent-deck doctor` (and the `health` flags) print both roots with their session counts, unreadable stores, the marker and the active root, plus the WARNING or, for a migrated layout, a note that the legacy copy can be moved aside. Sandboxed runs of agent-deck must export `HOME` first and the `XDG_*_HOME` variables in a second `export`, since `export HOME=$T XDG_DATA_HOME=$HOME/.local/share` expands the old `$HOME` and points a throwaway home at the real data dir.

@@ -3,6 +3,7 @@ package update
 import (
 	"context"
 	"log/slog"
+	"math/rand"
 	"os/exec"
 	"time"
 
@@ -49,6 +50,41 @@ func NextRecheck(last time.Time, failed bool) time.Time {
 		return last.Add(RecheckBackoff)
 	}
 	return last.Add(RecheckInterval)
+}
+
+// RecheckBackoffMax bounds the exponential backoff a poller applies after
+// repeated failures in a row (a GitHub outage, a flaky network), so a
+// process that has been failing for hours does not end up polling once a
+// day.
+const RecheckBackoffMax = 30 * time.Minute
+
+// backoffJitter is mockable by tests so the jittered delay is deterministic.
+var backoffJitter = rand.Int63n
+
+// NextRecheckAfterFailures is NextRecheck's counterpart for a caller that
+// tracks how many polls have failed in a row (rather than just the last
+// one): RecheckBackoff, doubled per additional consecutive failure and
+// capped at RecheckBackoffMax, plus up to 25% jitter so many processes that
+// started failing at the same moment (a GitHub outage) don't all retry in
+// lockstep. consecutive <= 0 is the same as NextRecheck(last, false).
+func NextRecheckAfterFailures(last time.Time, consecutive int) time.Time {
+	if last.IsZero() {
+		return time.Time{}
+	}
+	if consecutive <= 0 {
+		return last.Add(RecheckInterval)
+	}
+	d := RecheckBackoff
+	for i := 1; i < consecutive && d < RecheckBackoffMax; i++ {
+		d *= 2
+	}
+	if d > RecheckBackoffMax {
+		d = RecheckBackoffMax
+	}
+	jitterCeiling := int64(d)/4 + 1
+	// #nosec G404 -- schedule jitter, not security.
+	jitter := time.Duration(backoffJitter(jitterCeiling))
+	return last.Add(d + jitter)
 }
 
 // RunUnattendedInstall runs `<exe> update --unattended --trigger <trigger>`
@@ -113,6 +149,10 @@ type Installer struct {
 	Check func() (*UpdateInfo, error)
 	// Install runs the unattended updater (default: RunUnattendedInstall).
 	Install func(ctx context.Context, exe, trigger string) (string, error)
+	// Pending reports whether a launch agent waits to be re-registered
+	// (default: HasPendingRebootstrap). With nothing to install, a tick
+	// still runs the updater to retry it, once per InstallRetryAfter.
+	Pending func() bool
 	// Log receives one line per decision (default: slog.Default()).
 	Log *slog.Logger
 
@@ -122,10 +162,10 @@ type Installer struct {
 	// handled, when set, receives after every tick (tests).
 	handled chan struct{}
 
-	lastCheck  time.Time
-	lastFailed bool
-	attempts   map[string]time.Time
-	lastSkip   string
+	lastCheck           time.Time
+	consecutiveFailures int
+	attempts            map[string]time.Time
+	lastSkip            string
 }
 
 // Run blocks until ctx is done. It is safe to run on its own goroutine;
@@ -162,29 +202,29 @@ func (in *Installer) Run(ctx context.Context) {
 // tick is one ask: skip while the last check is still fresh (or backing
 // off), otherwise check and install when everything lines up.
 func (in *Installer) tick(ctx context.Context, now time.Time) {
-	if now.Before(NextRecheck(in.lastCheck, in.lastFailed)) {
+	if now.Before(NextRecheckAfterFailures(in.lastCheck, in.consecutiveFailures)) {
 		return
 	}
 	in.lastCheck = now
 	info, err := in.Check()
-	in.lastFailed = err != nil
 	if err != nil {
-		in.Log.Debug("headless_update_check_failed", slog.String("error", err.Error()))
+		in.consecutiveFailures++
+		in.Log.Debug("headless_update_check_failed", slog.String("error", err.Error()), slog.Int("consecutive_failures", in.consecutiveFailures))
 		return
 	}
+	in.consecutiveFailures = 0
 	if reason := in.skipReason(info, now); reason != "" {
 		if info != nil && info.Available && reason != in.lastSkip {
 			in.Log.Info("headless_auto_install_skipped", slog.String("latest", info.LatestVersion), slog.String("reason", reason))
 		}
 		in.lastSkip = reason
+		in.maybeDrainPending(ctx, now)
 		return
 	}
 	in.lastSkip = ""
 	in.attempts[info.LatestVersion] = now
 	in.Log.Info("headless_auto_install_started", slog.String("exe", in.Exe), slog.String("latest", info.LatestVersion), slog.String("trigger", in.Trigger))
-	runCtx, cancel := context.WithTimeout(ctx, UnattendedInstallTimeout)
-	out, err := in.Install(runCtx, in.Exe, in.Trigger)
-	cancel()
+	out, err := in.runUpdater(ctx)
 	if err != nil {
 		in.Log.Warn("headless_auto_install_failed", slog.String("latest", info.LatestVersion), slog.String("error", err.Error()), slog.String("output", out))
 		return
@@ -192,6 +232,35 @@ func (in *Installer) tick(ctx context.Context, now time.Time) {
 	// The binary watch (Watcher) sees the new file and re-execs at the
 	// next idle point; nothing more to do here.
 	in.Log.Info("headless_auto_install_finished", slog.String("latest", info.LatestVersion), slog.String("output", out))
+}
+
+// pendingDrainKey is the attempts key of a run started only to retry
+// pending launch agents.
+const pendingDrainKey = "launchd-pending"
+
+// maybeDrainPending runs the updater for a pending launch agent when
+// nothing is being installed: the run re-registers every pending agent
+// this process is not inside (its own service stays deferred for the
+// timer or a TUI), at most once per InstallRetryAfter.
+func (in *Installer) maybeDrainPending(ctx context.Context, now time.Time) {
+	if !in.Pending() || now.Sub(in.attempts[pendingDrainKey]) < InstallRetryAfter {
+		return
+	}
+	in.attempts[pendingDrainKey] = now
+	in.Log.Info("headless_launchd_pending_drain_started", slog.String("exe", in.Exe), slog.String("trigger", in.Trigger))
+	out, err := in.runUpdater(ctx)
+	if err != nil {
+		in.Log.Warn("headless_launchd_pending_drain_failed", slog.String("error", err.Error()), slog.String("output", out))
+		return
+	}
+	in.Log.Info("headless_launchd_pending_drain_finished", slog.String("output", out))
+}
+
+// runUpdater runs one bounded unattended updater.
+func (in *Installer) runUpdater(ctx context.Context) (string, error) {
+	runCtx, cancel := context.WithTimeout(ctx, UnattendedInstallTimeout)
+	defer cancel()
+	return in.Install(runCtx, in.Exe, in.Trigger)
 }
 
 // skipReason returns "" when info may be installed now, else why not.
@@ -219,6 +288,9 @@ func (in *Installer) fillDefaults() {
 	}
 	if in.Install == nil {
 		in.Install = RunUnattendedInstall
+	}
+	if in.Pending == nil {
+		in.Pending = HasPendingRebootstrap
 	}
 	if in.Log == nil {
 		in.Log = slog.Default()

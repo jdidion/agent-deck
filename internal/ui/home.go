@@ -41,6 +41,8 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/intervalhook"
 	"github.com/asheshgoplani/agent-deck/internal/jujutsu"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/recall/query"
+	"github.com/asheshgoplani/agent-deck/internal/recall/reader"
 	"github.com/asheshgoplani/agent-deck/internal/safego"
 	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -269,9 +271,10 @@ type Home struct {
 
 	// Components
 	search               *Search
-	globalSearch         *GlobalSearch              // Global session search across all Claude conversations
-	globalSearchIndex    *session.GlobalSearchIndex // Search index (nil if disabled)
-	askPanel             *AskPanel                  // Open human-ask queue across sessions (see docs/design/2026-08-14-human-ask-queue.md)
+	globalSearch         *GlobalSearch // Recall search over recall.db (the G key)
+	recallSource         RecallSource  // the index behind it (nil when [recall] enabled = false)
+	recallOff            string        // why the index is not open ("" when it is); G shows it in the local search
+	askPanel             *AskPanel     // Open human-ask queue across sessions (see docs/design/2026-08-14-human-ask-queue.md)
 	newDialog            *NewDialog
 	pendingRemoteName    string                // #1353: remote target for the open new-session dialog ("" = local)
 	groupDialog          *GroupDialog          // For creating/renaming groups
@@ -524,6 +527,20 @@ type Home struct {
 	// tried, so a failure is not retried every check.
 	autoInstallInFlight string
 	autoInstallAttempts map[string]time.Time
+	// restartWaitReason is why the last tick did not restart into the
+	// newer build ("" when it could); restartOverdueReason is the same
+	// once the wait passed restartOverdueAfter (banner + heartbeat), and
+	// restartOverdueLoggedAt rate-limits tui_restart_overdue.
+	restartWaitReason      string
+	restartOverdueReason   string
+	restartOverdueLoggedAt time.Time
+	// autoRestartHoldReason is why the auto path is holding off (a target
+	// that failed its dry run) until autoRestartHoldUntil.
+	autoRestartHoldReason string
+	// heartbeatDir is the cache dir the TUI heartbeat is written under
+	// ("" disables it); heartbeatWrittenAt is the last write.
+	heartbeatDir       string
+	heartbeatWrittenAt time.Time
 	// binaryOrphanReason is set while the executable this process started
 	// from is gone or in the Trash: the deck cannot update or restart
 	// itself then, says so in the banner, and both auto paths stay off.
@@ -1696,7 +1713,7 @@ type remoteFetchRoundMsg struct {
 
 // remoteFetchRunner is what one per-remote fetch needs from an SSHRunner.
 type remoteFetchRunner interface {
-	FetchSessions(context.Context) ([]session.RemoteSessionInfo, error)
+	FetchSessions(context.Context) ([]session.RemoteSessionInfo, *session.ListStats, error)
 	FetchCostSummary(context.Context) (*costs.RemoteCostSummary, error)
 	FetchGroupPaths(context.Context) ([]string, error)
 }
@@ -2162,23 +2179,23 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.startLogWorkers()
 	}
 
-	// Initialize global search
-	// DISABLED: Global search opens 884+ directory watchers and loads 4.4 GB of JSONL
-	// content into memory, causing agent-deck to balloon to 6+ GB and get OOM-killed.
-	// TODO: Fix by limiting watched dirs and enforcing balanced tier for large datasets.
+	// Recall search (the G key) reads recall.db, the on-disk index that
+	// `agent-deck recall` maintains (docs/recall.md). It replaced the
+	// in-memory global search index, which opened one directory watcher per
+	// project and loaded every transcript into memory (6+ GB, OOM-killed).
+	// Opening the index is one SQLite open; nothing is parsed here, and with
+	// [recall] enabled = false the key falls back to the local title search.
 	h.globalSearch = NewGlobalSearch()
 	h.askPanel = NewAskPanel()
-	// claudeDir := session.GetClaudeConfigDir()
-	// userConfig, _ := session.LoadUserConfig()
-	// if userConfig != nil && userConfig.GlobalSearch.Enabled {
-	// 	globalSearchIndex, err := session.NewGlobalSearchIndex(claudeDir, userConfig.GlobalSearch)
-	// 	if err != nil {
-	// 		uiLog.Warn("global_search_init_failed", slog.String("error", err.Error()))
-	// 	} else {
-	// 		h.globalSearchIndex = globalSearchIndex
-	// 		h.globalSearch.SetIndex(globalSearchIndex)
-	// 	}
-	// }
+	if src, err := openRecallIndex(actualProfile); err != nil {
+		uiLog.Warn("recall_index_open_failed", slog.String("error", err.Error()))
+		h.recallOff = "Recall index unavailable: " + err.Error()
+	} else if src != nil {
+		h.recallSource = src
+		h.globalSearch.SetSource(src)
+	} else {
+		h.recallOff = recallOffNotice
+	}
 
 	// Initialize MCP socket pool if enabled
 	// Note: Pool initialization happens AFTER loading sessions so we can discover MCPs in use
@@ -4016,6 +4033,11 @@ func (h *Home) Init() tea.Cmd {
 	}
 	h.homebrewManaged = detectHomebrewManaged()
 	h.applyAutoUpdateSuppression()
+	if h.autoUpdateSuppressedReason == "" {
+		if dir, err := agentpaths.CacheDir(); err == nil {
+			h.heartbeatDir = dir
+		}
+	}
 
 	cmds := []tea.Cmd{
 		h.sessionLoadCmd(nil, true),
@@ -4797,8 +4819,15 @@ func (h *Home) fetchOneRemote(gen uint64, name string, rc session.RemoteConfig, 
 	}
 	remoteStarted := time.Now()
 	remoteOutcome := "ok"
-	defer func() { health.RecordRemote(name, time.Since(remoteStarted), remoteOutcome) }()
-	sessions, err := runner.FetchSessions(ctx)
+	var listStats *session.ListStats
+	defer func() {
+		statusPassMS, tmuxCalls, statCount := int64(0), int64(0), 0
+		if listStats != nil {
+			statusPassMS, tmuxCalls, statCount = listStats.StatusPassMS, listStats.TmuxCalls, listStats.Sessions
+		}
+		health.RecordRemote(name, time.Since(remoteStarted), remoteOutcome, statusPassMS, tmuxCalls, statCount)
+	}()
+	sessions, listStats, err := runner.FetchSessions(ctx)
 	pollErr = err
 	if err != nil {
 		remoteOutcome = "failed"
@@ -4913,12 +4942,25 @@ func (h *Home) fetchOneRemote(gen uint64, name string, rc session.RemoteConfig, 
 //     (finding 12);
 //   - remotes absent from both fetched and failed → dropped (deconfigured).
 //
+// A remote's own `list --json` answer is untrusted wire data: nothing on the
+// client enforces that it names each session id at most once (a
+// misconfigured profile scope, a remote-side listing bug, or two profiles
+// whose sessions happen to share an id could all produce a collision), and a
+// duplicate id here used to survive straight into the flattened tree as two
+// rows for "the same" session with two different Status/Group snapshots —
+// the group and session duplication seen in the field (root cause: a
+// same-id collision inside one fetch's own slice, never de-duplicated
+// before this function's caller renders it). dedupeRemoteSessionsByID closes
+// that off at the merge point, which is the only place both this round's
+// fetch AND the carried-over previous round meet, so every path into
+// h.remoteSessions goes through the same guarantee.
+//
 // It is a pure function so the reconciliation logic is unit-testable without
 // SSH or the Bubble Tea event loop.
 func mergeRemoteSessions(prev, fetched map[string][]session.RemoteSessionInfo, failed map[string]bool) map[string][]session.RemoteSessionInfo {
 	merged := make(map[string][]session.RemoteSessionInfo, len(fetched)+len(failed))
 	for name, sess := range fetched {
-		merged[name] = sess
+		merged[name] = dedupeRemoteSessionsByID(sess)
 	}
 	for name := range failed {
 		if _, ok := merged[name]; ok {
@@ -4930,6 +4972,51 @@ func mergeRemoteSessions(prev, fetched map[string][]session.RemoteSessionInfo, f
 		}
 	}
 	return merged
+}
+
+// dedupeRemoteSessionsByID collapses same-id entries within one remote's
+// session slice to exactly one row per id, keeping the LAST occurrence's
+// data (the freshest Status/Group the remote sent this round) while leaving
+// it at its FIRST position, so the row order the remote listed stays stable
+// across a round that happens to repeat an id. Sessions with an empty ID
+// never dedupe against each other — an empty id means "no id was reported",
+// not "the same unidentified session" — matching how the rest of the
+// pipeline already treats RemoteSessionInfo.ID as the join key (buildRemote-
+// FlatItems*, remoteHeaderCounts). A slice with no collisions is returned
+// unchanged (same backing array), so the common case allocates nothing.
+func dedupeRemoteSessionsByID(sess []session.RemoteSessionInfo) []session.RemoteSessionInfo {
+	if len(sess) < 2 {
+		return sess
+	}
+	firstAt := make(map[string]int, len(sess)) // id -> first index seen
+	lastData := make(map[string]session.RemoteSessionInfo, len(sess))
+	hasDup := false
+	for i, s := range sess {
+		if s.ID == "" {
+			continue
+		}
+		if _, seen := firstAt[s.ID]; !seen {
+			firstAt[s.ID] = i
+		} else {
+			hasDup = true
+		}
+		lastData[s.ID] = s
+	}
+	if !hasDup {
+		return sess
+	}
+	out := make([]session.RemoteSessionInfo, 0, len(sess))
+	for i, s := range sess {
+		if s.ID == "" {
+			out = append(out, s)
+			continue
+		}
+		if firstAt[s.ID] != i {
+			continue // a later occurrence's data already replaced this id's kept row
+		}
+		out = append(out, lastData[s.ID])
+	}
+	return out
 }
 
 // shouldFetchRemoteSessions reports whether the periodic tick should kick off
@@ -8320,7 +8407,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.binaryWatch != nil {
 			h.binaryWatch.recordProbe(msg.fingerprint, msg.version, msg.err)
 			if msg.err != nil {
-				uiLog.Debug("binary_version_probe_failed", slog.String("error", msg.err.Error()))
+				// Warn, not Debug: a probe that keeps failing is why a
+				// newer build on disk is never noticed, and the default
+				// log must show it.
+				uiLog.Warn("binary_version_probe_failed", slog.String("error", msg.err.Error()), slog.Int("failures", h.binaryWatch.failures))
 			} else if v := h.binaryWatch.installedVersion; v != "" {
 				uiLog.Info("update_installed_on_disk", slog.String("running", Version), slog.String("installed", v))
 			}
@@ -9704,6 +9794,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		binaryProbeCmd := h.pollBinaryChange()
 		// auto_restart: hand over to an installed newer build once idle.
 		autoRestartCmd := h.maybeAutoRestart()
+		// Tell the fleet watch what this TUI runs and why it has not
+		// restarted (update --check --json).
+		h.maybeWriteHeartbeat(now)
 
 		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd, remoteLatencyCmd, h.syncRemotePaneWatch(), updateCheckCmd, binaryProbeCmd, autoRestartCmd}
 		if h.fullRepaint {
@@ -9711,14 +9804,13 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, tea.Batch(cmds...)
 
-	case globalSearchDebounceMsg, globalSearchResultsMsg:
-		// Route async global search messages to the global search component
-		if h.globalSearch.IsVisible() {
-			var cmd tea.Cmd
-			h.globalSearch, cmd = h.globalSearch.Update(msg)
-			return h, cmd
-		}
-		return h, nil
+	case globalSearchDebounceMsg, globalSearchResultsMsg, recallPreviewMsg, recallRefreshMsg, recallStatusMsg, recallCatchUpMsg:
+		// Route async Recall messages to the overlay whatever is on top: the
+		// catch-up tick must reach it while it is open, and once it is hidden
+		// the overlay drops them itself (Hide ends the catch-up chain).
+		var cmd tea.Cmd
+		h.globalSearch, cmd = h.globalSearch.Update(msg)
+		return h, cmd
 
 	case tea.KeyMsg:
 		// Track user activity for adaptive status updates
@@ -9992,9 +10084,9 @@ func (h *Home) handleSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	h.search, cmd = h.search.Update(msg)
 
 	// Check if user wants to switch to global search
-	if h.search.WantsSwitchToGlobal() && h.globalSearchIndex != nil {
+	if h.search.WantsSwitchToGlobal() && h.globalSearch.HasSource() {
 		h.globalSearch.SetSize(h.width, h.height)
-		h.globalSearch.Show()
+		cmd = tea.Batch(cmd, h.globalSearch.Show())
 	}
 
 	return h, cmd
@@ -10028,21 +10120,54 @@ func (h *Home) handleGlobalSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return h, cmd
 }
 
-// handleGlobalSearchSelection handles selection from global search
+// recallOffNotice is what G says when the index is not open because
+// [recall] is disabled (an open error is quoted instead, see NewHome).
+const recallOffNotice = "Recall is off ([recall] enabled = false in config.toml)"
+
+// openGlobalSearch opens the Recall overlay when the index is available;
+// otherwise the local title search, with a line inside it saying why
+// (the footer is hidden behind the overlay for as long as it is open).
+func (h *Home) openGlobalSearch() tea.Cmd {
+	if !h.globalSearch.HasSource() {
+		notice := h.recallOff
+		if notice == "" {
+			notice = recallOffNotice
+		}
+		h.search.SetNotice(notice + "; showing the local title search instead")
+		h.search.Show()
+		return nil
+	}
+	h.globalSearch.SetSize(h.width, h.height)
+	return h.globalSearch.Show()
+}
+
+// handleGlobalSearchSelection opens a Recall hit the way `recall open`
+// does: jump to the registered session that owns the conversation (the
+// bound deck id, or the Claude session id an instance carries); otherwise
+// register a new Claude session that resumes it. Other harnesses and
+// subagent transcripts are not resumable from the index; the footer says
+// how to read them.
 func (h *Home) handleGlobalSearchSelection(result *GlobalSearchResult) tea.Cmd {
-	// Check if session already exists in Agent Deck
 	h.instancesMu.RLock()
 	for _, inst := range h.instances {
-		if inst.ClaudeSessionID == result.SessionID {
+		if (result.DeckID != "" && inst.ID == result.DeckID) || (result.Harness == reader.HarnessClaude && inst.ClaudeSessionID == result.SessionID) {
 			h.instancesMu.RUnlock()
-			// Jump to existing session
 			h.jumpToSession(inst)
 			return nil
 		}
 	}
 	h.instancesMu.RUnlock()
-
-	// Create new session with this Claude session ID
+	switch {
+	case result.Sidechain:
+		h.setError(fmt.Errorf("a subagent transcript cannot be resumed; open its parent session (agent-deck recall show %s)", query.Ref(result.SessID)))
+		return nil
+	case result.Harness != reader.HarnessClaude:
+		h.setError(fmt.Errorf("%s conversations are searchable but not resumable yet: agent-deck recall show %s", result.Harness, query.Ref(result.SessID)))
+		return nil
+	case result.Missing:
+		h.setError(fmt.Errorf("the transcript file is gone; its text is still in the index: agent-deck recall show %s", query.Ref(result.SessID)))
+		return nil
+	}
 	return h.createSessionFromGlobalSearch(result)
 }
 
@@ -11367,14 +11492,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.markNavigationActivity()
 		return h, h.fetchSelectedPreview()
 
-	case "G": // Open global search (fall back to local search if index not available)
-		if h.globalSearchIndex != nil {
-			h.globalSearch.SetSize(h.width, h.height)
-			h.globalSearch.Show()
-		} else {
-			h.search.Show()
-		}
-		return h, nil
+	case "G": // Recall search over the index (local title search when recall is off)
+		return h, h.openGlobalSearch()
 
 	// Group-scoped navigation layer (v1.7.60): Alt+* keys navigate only within
 	// the cursor's current group. Plain j/k/1-9/g/G// remain unchanged above.
@@ -11992,13 +12111,9 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "/":
-		// Open global search first if available, otherwise local search
-		if h.globalSearchIndex != nil {
-			h.globalSearch.SetSize(h.width, h.height)
-			h.globalSearch.Show()
-		} else {
-			h.search.Show()
-		}
+		// The quick local title filter; Tab from it reaches Recall, and G
+		// opens Recall directly.
+		h.search.Show()
 		return h, nil
 
 	case "?":
@@ -13456,6 +13571,7 @@ func (h *Home) performQuit(shutdownPool bool) tea.Cmd {
 // This is called via quitMsg after the splash screen has had time to render
 func (h *Home) performFinalShutdown(shutdownPool bool) tea.Cmd {
 	return func() tea.Msg {
+		h.removeHeartbeat()
 		// Stop system stats collector
 		if h.sshCollector != nil {
 			h.sshCollector.Stop()
@@ -13508,9 +13624,9 @@ func (h *Home) performFinalShutdown(shutdownPool bool) tea.Cmd {
 		}
 		// Close theme watcher
 		h.stopThemeWatcher()
-		// Close global search index
-		if h.globalSearchIndex != nil {
-			h.globalSearchIndex.Close()
+		// Close the recall index
+		if h.recallSource != nil {
+			h.recallSource.Close()
 		}
 		// Stop watcher engine (D-07: lifecycle tied to TUI)
 		if h.watcherEngine != nil {
@@ -17091,6 +17207,7 @@ func restartWithArchiveTransition(
 // the archived view.
 func (h *Home) restartSession(inst *session.Instance) tea.Cmd {
 	id := inst.ID
+	previewSize := h.detachedRestartPreviewSize(id)
 	mcpUILog.Debug(
 		"restart_session_called",
 		slog.String("id", inst.ID),
@@ -17112,6 +17229,11 @@ func (h *Home) restartSession(inst *session.Instance) tea.Cmd {
 		}
 
 		unarchived, err := restartWithArchiveTransition(current, h.persistArchived, current.Restart)
+		if err == nil {
+			if fitErr := fitRestartedPreview(current, previewSize); fitErr != nil {
+				uiLog.Debug("restart_preview_resize_failed", slog.String("session", id), slog.Any("error", fitErr))
+			}
+		}
 		mcpUILog.Debug("restart_session_result", slog.String("id", id), slog.Any("error", err))
 		return sessionRestartedMsg{
 			sessionID:  id,
@@ -17133,6 +17255,7 @@ func (h *Home) restartSessionFreshWith(
 	restartFresh func(*session.Instance) error,
 ) tea.Cmd {
 	id := inst.ID
+	previewSize := h.detachedRestartPreviewSize(id)
 	mcpUILog.Debug(
 		"restart_session_fresh_called",
 		slog.String("id", inst.ID),
@@ -17154,6 +17277,11 @@ func (h *Home) restartSessionFreshWith(
 		unarchived, err := restartWithArchiveTransition(current, persist, func() error {
 			return restartFresh(current)
 		})
+		if err == nil {
+			if fitErr := fitRestartedPreview(current, previewSize); fitErr != nil {
+				uiLog.Debug("restart_preview_resize_failed", slog.String("session", id), slog.Any("error", fitErr))
+			}
+		}
 		mcpUILog.Debug("restart_session_fresh_result", slog.String("id", id), slog.Any("error", err))
 		return sessionRestartedMsg{
 			sessionID:  id,
@@ -22298,6 +22426,14 @@ func (h *Home) renderRemoteSessionItemAtWidth(b *strings.Builder, item session.I
 	pendingStr := ""
 	if unavailable {
 		pendingStr = " " + DimStyle.Render("· last known")
+	} else if age, stale := h.remoteRowStale(item.RemoteName); stale {
+		// #2331: a poll that answers slowly (the remote's own status pass
+		// ran long under load) is not "unavailable" — it succeeded — but
+		// its snapshot can be tens of seconds old by the time this row
+		// paints, with nothing above to say so. remotePollUnavailable only
+		// catches an outright failed/paused poll; this catches the row that
+		// is quietly stale despite the poll having gone fine.
+		pendingStr = " " + DimStyle.Render(fmt.Sprintf("· status %s old", formatRemoteAge(age)))
 	}
 	if item.RemoteSession != nil {
 		if verb, ok := h.remotePending[item.RemoteSession.ID]; ok {
