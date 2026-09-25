@@ -2,6 +2,7 @@ package ui
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -71,6 +72,8 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 		Updates: session.UpdateSettings{
 			CheckEnabled: boolPtr(false),
 			AutoUpdate:   true,
+			AutoInstall:  boolPtr(false),
+			AutoRestart:  boolPtr(false),
 		},
 		Logs: session.LogSettings{
 			MaxSizeMB:     20,
@@ -99,6 +102,9 @@ func TestSettingsPanel_LoadConfig(t *testing.T) {
 	}
 	if !panel.autoUpdate {
 		t.Error("autoUpdate should be true")
+	}
+	if panel.autoInstall || panel.autoRestart {
+		t.Errorf("autoInstall=%v autoRestart=%v, want both false from config", panel.autoInstall, panel.autoRestart)
 	}
 	if panel.logMaxSizeMB != 20 {
 		t.Errorf("logMaxSizeMB: got %d, want 20", panel.logMaxSizeMB)
@@ -165,6 +171,7 @@ func TestSettingsPanel_LoadConfig_DefaultTool(t *testing.T) {
 		{"pi", "pi", "pi"},
 		{"copilot", "copilot", "copilot"},
 		{"crush", "crush", "crush"},
+		{"muse", "muse", "muse"},
 		{"cursor", "cursor", "cursor"},
 		{"hermes", "hermes", "hermes"},
 		{"empty", "", ""}, // None
@@ -199,8 +206,8 @@ func TestSettingsPanel_LoadConfig_CustomTools(t *testing.T) {
 
 	panel.LoadConfig(config)
 
-	wantNames := []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Cursor", "Hermes", "DeepSeek", "Openclaw", "Zeta", "None"}
-	wantValues := []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek", "openclaw", "zeta", ""}
+	wantNames := []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi", "Openclaw", "Zeta", "None"}
+	wantValues := []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp", "openclaw", "zeta", ""}
 
 	if !reflect.DeepEqual(panel.toolNames, wantNames) {
 		t.Fatalf("toolNames = %#v, want %#v", panel.toolNames, wantNames)
@@ -252,6 +259,8 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	panel.claudeConfigDir = "~/.claude-custom"
 	panel.checkForUpdates = false
 	panel.autoUpdate = true
+	panel.autoInstall = false
+	panel.autoRestart = false
 	panel.logMaxSizeMB = 15
 	panel.logMaxLines = 8000
 	panel.removeOrphans = false
@@ -275,6 +284,12 @@ func TestSettingsPanel_GetConfig(t *testing.T) {
 	}
 	if !config.Updates.AutoUpdate {
 		t.Error("AutoUpdate should be true")
+	}
+	if config.Updates.AutoInstall == nil || *config.Updates.AutoInstall {
+		t.Error("AutoInstall should be *false")
+	}
+	if config.Updates.AutoRestart == nil || *config.Updates.AutoRestart {
+		t.Error("AutoRestart should be *false")
 	}
 	if config.Logs.MaxSizeMB != 15 {
 		t.Errorf("MaxSizeMB: got %d, want 15", config.Logs.MaxSizeMB)
@@ -360,6 +375,7 @@ func TestSettingsPanel_GetConfig_ToolMapping(t *testing.T) {
 		{"pi", "pi", "pi"},
 		{"copilot", "copilot", "copilot"},
 		{"crush", "crush", "crush"},
+		{"muse", "muse", "muse"},
 		{"cursor", "cursor", "cursor"},
 		{"hermes", "hermes", "hermes"},
 		{"none", "", ""},
@@ -709,6 +725,59 @@ func TestSettingsPanel_ThemeToggle(t *testing.T) {
 	// Theme changes should not require restart (applied live)
 	if panel.needsRestart {
 		t.Error("Theme change should not require restart")
+	}
+}
+
+// The embedded layout is bound to the terminal protocol main negotiated at
+// startup, so saving the checkbox stores the value for the next launch and
+// says so, instead of switching a dashboard that has no PTY router into a
+// layout it cannot honor.
+func TestSavedEmbeddedTerminalSettingWaitsForRestart(t *testing.T) {
+	home := NewHome()
+	home.embeddedLayout = false
+	home.sidebarDensity = session.DefaultSidebarDensity
+
+	enabled := true
+	home.applySavedLayoutSettings(session.UISettings{EmbeddedTerminal: &enabled, SidebarDensity: session.SidebarDensityFull})
+	if home.embeddedLayout {
+		t.Fatal("embedded layout switched on live without the startup router")
+	}
+	if home.err == nil || !strings.Contains(home.err.Error(), "restart") {
+		t.Fatalf("user was not told the layout applies at the next launch: %v", home.err)
+	}
+	if home.sidebarDensity != session.SidebarDensityFull {
+		t.Fatalf("sidebar density = %q, want live update to full", home.sidebarDensity)
+	}
+
+	// Saving the value the process already runs with is not a restart event.
+	home.clearError()
+	disabled := false
+	home.applySavedLayoutSettings(session.UISettings{EmbeddedTerminal: &disabled})
+	if home.err != nil {
+		t.Fatalf("unchanged layout raised a notice: %v", home.err)
+	}
+}
+
+func TestSettingsPanelEmbeddedTerminalDefaultsOffAndCanBeEnabled(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.LoadConfig(&session.UserConfig{})
+	if panel.embeddedLayout {
+		t.Fatal("settings panel should preserve the classic layout by default")
+	}
+
+	panel.visible = true
+	panel.cursor = int(SettingEmbeddedTerminal)
+	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed || !panel.embeddedLayout {
+		t.Fatal("embedded terminal checkbox did not toggle on")
+	}
+
+	cfg := panel.GetConfig()
+	if cfg.UI.EmbeddedTerminal == nil || !*cfg.UI.EmbeddedTerminal {
+		t.Fatal("settings panel did not persist explicit embedded_terminal=true")
+	}
+	if view := panel.View(); !containsString(view, "Embedded terminal") {
+		t.Fatal("settings panel does not render the embedded terminal checkbox")
 	}
 }
 
@@ -1068,5 +1137,66 @@ func TestSettingsPanel_ViewShowsUnboundMCPHotkeyHint(t *testing.T) {
 	view := panel.View()
 	if !containsString(view, "MCP Manager hotkey is unbound.") {
 		t.Fatalf("settings view should show unbound MCP key hint, got %q", view)
+	}
+}
+
+// TestSettingsPanel_AutoInstallRestartToggles pins the two auto-update
+// rows: they default on, load from config, toggle with Space and render
+// under UPDATES.
+func TestSettingsPanel_AutoInstallRestartToggles(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+
+	panel := NewSettingsPanel()
+	if !panel.autoInstall || !panel.autoRestart {
+		t.Fatal("both toggles must default to on (nil == true in config)")
+	}
+	panel.cursor = int(SettingAutoInstall)
+	if !panel.toggleValue() || panel.autoInstall {
+		t.Fatal("Space on the auto-install row must turn it off")
+	}
+	panel.cursor = int(SettingAutoRestart)
+	if !panel.toggleValue() || panel.autoRestart {
+		t.Fatal("Space on the auto-restart row must turn it off")
+	}
+	panel.SetSize(100, 80)
+	panel.Show()
+	view := panel.View()
+	for _, want := range []string{"Install updates automatically", "Restart automatically after update", "Offer to install on startup"} {
+		if !containsString(view, want) {
+			t.Errorf("settings view missing %q", want)
+		}
+	}
+}
+
+// RemoteSession: sidebar_density is a layout setting that sizes every row
+// type through sidebarItemRenderHeightDensity; remote rows are measured at
+// min(2, density) and covered by TestEmbeddedRemoteRowMinimalDensityIsOneLineWithoutTool
+// and TestSyncViewportHoldsStillWithRemoteRowsInEmbeddedLayout.
+func TestSettingsPanelSidebarDensityRoundTrips(t *testing.T) {
+	panel := NewSettingsPanel()
+	panel.LoadConfig(&session.UserConfig{})
+	if got := sidebarDensityValues[panel.sidebarDensity]; got != session.DefaultSidebarDensity {
+		t.Fatalf("settings panel default sidebar density = %q, want %q", got, session.DefaultSidebarDensity)
+	}
+
+	panel.LoadConfig(&session.UserConfig{UI: session.UISettings{SidebarDensity: "minimal"}})
+	if got := sidebarDensityValues[panel.sidebarDensity]; got != session.SidebarDensityMinimal {
+		t.Fatalf("settings panel did not load sidebar_density=minimal, got %q", got)
+	}
+
+	panel.visible = true
+	panel.cursor = int(SettingSidebarDensity)
+	_, _, changed := panel.Update(tea.KeyMsg{Type: tea.KeySpace})
+	if !changed {
+		t.Fatal("space did not cycle the sidebar density radio group")
+	}
+	cfg := panel.GetConfig()
+	if cfg.UI.SidebarDensity != sidebarDensityValues[panel.sidebarDensity] {
+		t.Fatalf("settings panel persisted sidebar_density=%q, want %q", cfg.UI.SidebarDensity, sidebarDensityValues[panel.sidebarDensity])
+	}
+	if view := panel.View(); !containsString(view, "Sidebar density") {
+		t.Fatal("settings panel does not render the sidebar density radio group")
 	}
 }

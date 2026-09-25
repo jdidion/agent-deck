@@ -68,6 +68,30 @@ func runAgentDeck(
 	args ...string,
 ) (stdout, stderr string, exitCode int) {
 	t.Helper()
+	return runAgentDeckStdin(t, home, "", args...)
+}
+
+// runAgentDeckStdin is runAgentDeck with a stdin body (e.g. for --note-stdin).
+func runAgentDeckStdin(
+	t *testing.T,
+	home string,
+	stdin string,
+	args ...string,
+) (stdout, stderr string, exitCode int) {
+	t.Helper()
+	return runAgentDeckEnv(t, home, stdin, nil, args...)
+}
+
+// runAgentDeckEnv is runAgentDeckStdin with extra environment entries
+// appended after the isolation set (e.g. AGENTDECK_INSTANCE_ID for a hook).
+func runAgentDeckEnv(
+	t *testing.T,
+	home string,
+	stdin string,
+	extraEnv []string,
+	args ...string,
+) (stdout, stderr string, exitCode int) {
+	t.Helper()
 
 	bin := channelsCLIBinary(t)
 	cmd := exec.Command(bin, args...)
@@ -115,9 +139,11 @@ func runAgentDeck(
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 	)
+	env = append(env, extraEnv...)
 	cmd.Env = env
 
 	var outBuf, errBuf strings.Builder
+	cmd.Stdin = strings.NewReader(stdin)
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 

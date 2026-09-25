@@ -41,6 +41,7 @@ type Search struct {
 	allItems       []*session.Instance
 	switchToGlobal bool   // Flag to signal switch to global search
 	scopedGroup    string // Non-empty => filter items to this exact GroupPath (v1.7.60)
+	notice         string // why G landed here instead of Recall; drawn under the input until Hide
 }
 
 // NewSearch creates a new search overlay
@@ -78,6 +79,13 @@ func (s *Search) SetItems(items []*session.Instance) {
 	s.updateResults()
 }
 
+// SetNotice sets a warning line drawn under the input for as long as the
+// overlay is open (G with the Recall index closed). Hide clears it, so a
+// later `/` opens the plain filter.
+func (s *Search) SetNotice(notice string) {
+	s.notice = notice
+}
+
 // SetScopedGroup restricts SetItems to a single group path. Pass "" to clear.
 func (s *Search) SetScopedGroup(groupPath string) {
 	s.scopedGroup = groupPath
@@ -110,6 +118,7 @@ func (s *Search) Hide() {
 	s.visible = false
 	s.input.Blur()
 	s.scopedGroup = ""
+	s.notice = ""
 }
 
 // IsVisible returns whether the search overlay is visible
@@ -198,8 +207,14 @@ func (s *Search) View() string {
 		Bold(true).
 		Render("🔍 Local Search (Agent Deck sessions)")
 
-	// Build search input box
-	searchBox := searchBoxStyle.Render(s.input.View())
+	// Build search input box at a fixed width. If the box's total width
+	// (border + padding) exceeds the overlay's content budget, lipgloss
+	// hard-wraps the border line and splits a corner glyph onto its own row.
+	overlayWidth := searchOverlayWidth(s.width)
+	innerWidth := overlayWidth - overlayStyle.GetHorizontalFrameSize() - searchBoxStyle.GetHorizontalFrameSize()
+	innerWidth = max(innerWidth, 10)
+	s.input.Width = innerWidth - lipgloss.Width(s.input.Prompt)
+	searchBox := searchBoxStyle.Width(innerWidth).Render(s.input.View())
 
 	// Build results list
 	var resultsStr strings.Builder
@@ -234,11 +249,24 @@ func (s *Search) View() string {
 			Italic(true).
 			Render("  Tip: waiting / running / idle to filter by status")
 	}
+	// The notice (why G opened this overlay) stays for as long as it is
+	// open; the footer would be hidden behind the overlay.
+	if s.notice != "" {
+		notice := lipgloss.NewStyle().
+			Foreground(ColorWarning).
+			Width(innerWidth + searchBoxStyle.GetHorizontalFrameSize()).
+			Render("⚠ " + s.notice)
+		if hintStr != "" {
+			hintStr = notice + "\n" + hintStr
+		} else {
+			hintStr = notice
+		}
+	}
 
 	// Keyboard shortcuts hint
 	keysHint := lipgloss.NewStyle().
 		Foreground(ColorComment).
-		Render("  [Enter] Select  [↑↓] Navigate  [Tab] Global  [Esc] Cancel")
+		Render(glueBracketHintGroups("  [Enter] Select  [↑↓] Navigate  [Tab] Global  [Esc] Cancel"))
 
 	// Combine everything
 	var content string
@@ -249,17 +277,19 @@ func (s *Search) View() string {
 	}
 
 	// Wrap in overlay box - responsive width
-	overlayWidth := 60
-	if s.width > 0 && s.width < overlayWidth+10 {
-		overlayWidth = s.width - 10
-		if overlayWidth < 30 {
-			overlayWidth = 30
-		}
-	}
 	overlay := overlayStyle.Width(overlayWidth).Render(content)
 
 	// Center in the screen
 	return centerInScreen(overlay, s.width, s.height)
+}
+
+// searchOverlayWidth returns the responsive overlay width for a screen width.
+func searchOverlayWidth(screenWidth int) int {
+	const preferred = 60
+	if screenWidth > 0 && screenWidth < preferred+10 {
+		return max(screenWidth-10, 30)
+	}
+	return preferred
 }
 
 // formatCount formats the result count

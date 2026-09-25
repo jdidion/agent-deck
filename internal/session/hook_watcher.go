@@ -17,6 +17,8 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 
+	"github.com/asheshgoplani/agent-deck/internal/fswatch"
+
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
 
@@ -142,6 +144,8 @@ type HookStatus struct {
 	CodexCompletedGeneration string
 	CodexStartedSessionID    string
 	CodexCompletedSessionID  string
+	CodexStartedSequence     uint64
+	CodexCompletedSequence   uint64
 	HookGeneration           string
 	Sequence                 uint64
 	codexCompletionConsumed  bool
@@ -158,6 +162,13 @@ type HookStatus struct {
 	// id may bind — empty (legacy files, agents that send no cwd) means "no
 	// evidence either way" and never blocks.
 	Cwd string
+	// Matcher/Message are the retained ask content (human-ask-queue). Matcher
+	// is the decoded Notification matcher ("permission_prompt"|
+	// "elicitation_dialog"); Message is Claude's human-readable Notification
+	// text. Both empty for records with no ask content. The ask-queue producer
+	// reads a kind and a summary off these without re-parsing anything.
+	Matcher string
+	Message string
 }
 
 // hookGenerationForInstance resolves generation authority by instance, not by
@@ -222,7 +233,7 @@ type StatusFileWatcher struct {
 	// observes these by watching this dir for subdir-create events and adding
 	// a watch on each per-instance subdir.
 	sandboxDir string
-	watcher    *fsnotify.Watcher
+	watcher    *fswatch.Watcher
 
 	mu       sync.RWMutex
 	statuses map[string]*HookStatus // instance_id -> latest hook status
@@ -239,12 +250,18 @@ type StatusFileWatcher struct {
 func NewStatusFileWatcher(onChange func()) (*StatusFileWatcher, error) {
 	hooksDir := GetHooksDir()
 
+	// The hooks root is shared by all profiles. An unreadable registry must
+	// preserve artifacts; polling still bounds descriptors on kqueue.
+	if err := pruneHookArtifactsOnStartup(); err != nil {
+		hookLog.Warn("hook_prune_failed", slog.String("error", err.Error()))
+	}
+
 	// Ensure directory exists
 	if err := os.MkdirAll(hooksDir, 0755); err != nil {
 		return nil, err
 	}
 
-	watcher, err := fsnotify.NewWatcher()
+	watcher, err := fswatch.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
@@ -493,10 +510,14 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			DoneSummary              string `json:"done_summary"`
 			TranscriptPath           string `json:"transcript_path"`
 			Cwd                      string `json:"cwd"`
+			Matcher                  string `json:"matcher"`
+			Message                  string `json:"message"`
 			CodexStartedGeneration   string `json:"codex_started_generation"`
 			CodexCompletedGeneration string `json:"codex_completed_generation"`
 			CodexStartedSessionID    string `json:"codex_started_session_id"`
 			CodexCompletedSessionID  string `json:"codex_completed_session_id"`
+			CodexStartedSequence     uint64 `json:"codex_started_sequence"`
+			CodexCompletedSequence   uint64 `json:"codex_completed_sequence"`
 			HookGeneration           string `json:"hook_generation"`
 			Sequence                 uint64 `json:"sequence"`
 		}
@@ -515,10 +536,14 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			DoneSummary:              raw.DoneSummary,
 			TranscriptPath:           raw.TranscriptPath,
 			Cwd:                      raw.Cwd,
+			Matcher:                  raw.Matcher,
+			Message:                  raw.Message,
 			CodexStartedGeneration:   raw.CodexStartedGeneration,
 			CodexCompletedGeneration: raw.CodexCompletedGeneration,
 			CodexStartedSessionID:    raw.CodexStartedSessionID,
 			CodexCompletedSessionID:  raw.CodexCompletedSessionID,
+			CodexStartedSequence:     raw.CodexStartedSequence,
+			CodexCompletedSequence:   raw.CodexCompletedSequence,
 			HookGeneration:           raw.HookGeneration,
 			Sequence:                 raw.Sequence,
 		}
@@ -662,10 +687,14 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		DoneSummary              string `json:"done_summary"`
 		TranscriptPath           string `json:"transcript_path"`
 		Cwd                      string `json:"cwd"`
+		Matcher                  string `json:"matcher"`
+		Message                  string `json:"message"`
 		CodexStartedGeneration   string `json:"codex_started_generation"`
 		CodexCompletedGeneration string `json:"codex_completed_generation"`
 		CodexStartedSessionID    string `json:"codex_started_session_id"`
 		CodexCompletedSessionID  string `json:"codex_completed_session_id"`
+		CodexStartedSequence     uint64 `json:"codex_started_sequence"`
+		CodexCompletedSequence   uint64 `json:"codex_completed_sequence"`
 		HookGeneration           string `json:"hook_generation"`
 		Sequence                 uint64 `json:"sequence"`
 	}
@@ -691,10 +720,14 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		DoneSummary:              status.DoneSummary,
 		TranscriptPath:           status.TranscriptPath,
 		Cwd:                      status.Cwd,
+		Matcher:                  status.Matcher,
+		Message:                  status.Message,
 		CodexStartedGeneration:   status.CodexStartedGeneration,
 		CodexCompletedGeneration: status.CodexCompletedGeneration,
 		CodexStartedSessionID:    status.CodexStartedSessionID,
 		CodexCompletedSessionID:  status.CodexCompletedSessionID,
+		CodexStartedSequence:     status.CodexStartedSequence,
+		CodexCompletedSequence:   status.CodexCompletedSequence,
 		HookGeneration:           status.HookGeneration,
 		Sequence:                 status.Sequence,
 	}

@@ -56,11 +56,18 @@ func MergePanelConfigOntoDisk(panel *UserConfig) (*UserConfig, error) {
 	merged.Gemini.YoloMode = panel.Gemini.YoloMode
 	merged.Codex.YoloMode = panel.Codex.YoloMode
 
-	// ── Updates (panel manages CheckEnabled + AutoUpdate) ──────────────
+	// ── Updates (panel manages CheckEnabled, AutoUpdate, AutoInstall,
+	// AutoRestart) ─────────────────────────────────────────────────────
 	if panel.Updates.CheckEnabled != nil {
 		merged.Updates.CheckEnabled = panel.Updates.CheckEnabled
 	}
 	merged.Updates.AutoUpdate = panel.Updates.AutoUpdate
+	if panel.Updates.AutoInstall != nil {
+		merged.Updates.AutoInstall = panel.Updates.AutoInstall
+	}
+	if panel.Updates.AutoRestart != nil {
+		merged.Updates.AutoRestart = panel.Updates.AutoRestart
+	}
 
 	// ── Logs (panel manages 3 fields; other Logs.* preserved) ──────────
 	merged.Logs.MaxSizeMB = panel.Logs.MaxSizeMB
@@ -107,8 +114,14 @@ func MergePanelConfigOntoDisk(panel *UserConfig) (*UserConfig, error) {
 	merged.Display.ShowSessionTimestamps = panel.Display.ShowSessionTimestamps
 	merged.Display.ShowPaneTitles = panel.Display.ShowPaneTitles
 
-	// ── UI subset (panel manages show_only_installed_tools; hidden_tools
-	//    is edited via ToolVisibilityPanel) ─────────────────────────────
+	// ── UI subset (panel manages embedded terminal and show_only_installed_tools;
+	//    hidden_tools is edited via ToolVisibilityPanel) ──────────────────────────
+	if panel.UI.EmbeddedTerminal != nil {
+		merged.UI.EmbeddedTerminal = panel.UI.EmbeddedTerminal
+	}
+	if panel.UI.SidebarDensity != "" {
+		merged.UI.SidebarDensity = panel.UI.SidebarDensity
+	}
 	merged.UI.ShowOnlyInstalledTools = panel.UI.ShowOnlyInstalledTools
 
 	// ── SystemStats subset ─────────────────────────────────────────────

@@ -23,18 +23,38 @@ import (
 
 const claudeConfigDirPrefix = "CLAUDE_CONFIG_DIR="
 
-// FilterEnv returns env with every TELEGRAM_* var and any inherited
-// CLAUDE_CONFIG_DIR removed. If childConfigDir is non-empty, a single
-// CLAUDE_CONFIG_DIR=<childConfigDir> is appended so the child is pinned to its
-// own config dir. The input slice is not mutated.
+// mallocStackLoggingPrefixes are macOS libmalloc stack-logging env vars. When any
+// is set (e.g. left behind by Instruments/leaks, or inherited from whatever
+// launched agent-deck), every short-lived child prints "MallocStackLogging:
+// can't turn off malloc stack logging because it was not enabled." to stderr on
+// teardown. A busy agent fires hooks constantly, so its worker's hook-handler
+// children flood the session pane with that line. These are developer debugging
+// vars with no place in a spawned worker, so strip the whole family — the worker
+// inherits a clean env, and so do the hook-handlers it spawns.
+var mallocStackLoggingPrefixes = []string{
+	"MallocStackLogging",   // and ...NoCompact / ...Directory
+	"MALLOC_STACK_LOGGING", // underscore variant
+}
+
+// FilterEnv returns env with every TELEGRAM_* var, any inherited
+// CLAUDE_CONFIG_DIR, and the macOS MallocStackLogging* debugging vars removed. If
+// childConfigDir is non-empty, a single CLAUDE_CONFIG_DIR=<childConfigDir> is
+// appended so the child is pinned to its own config dir. The input slice is not
+// mutated.
 func FilterEnv(env []string, childConfigDir string) []string {
 	out := make([]string, 0, len(env)+1)
+nextVar:
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "TELEGRAM_") { // #1152 logic
 			continue
 		}
 		if strings.HasPrefix(kv, claudeConfigDirPrefix) { // #1163: never inherit parent CCD
 			continue
+		}
+		for _, p := range mallocStackLoggingPrefixes {
+			if strings.HasPrefix(kv, p) {
+				continue nextVar
+			}
 		}
 		out = append(out, kv)
 	}

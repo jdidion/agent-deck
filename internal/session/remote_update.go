@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/procowner"
 	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
@@ -28,9 +29,18 @@ const remoteVersionCacheFile = "remote-versions.json"
 // Found is false when the binary could not be executed (missing, not on
 // $PATH, or the host was unreachable); Version is then empty.
 type RemoteVersionState struct {
-	Version   string    `json:"version,omitempty"`
-	Found     bool      `json:"found"`
-	CheckedAt time.Time `json:"checked_at"`
+	Version       string    `json:"version,omitempty"`
+	InstalledFrom string    `json:"installed_from,omitempty"`
+	Found         bool      `json:"found"`
+	CheckedAt     time.Time `json:"checked_at"`
+	// StatsSupported records whether this remote's `list --json` accepts
+	// --stats, learned by SSHRunner.FetchSessions the first time it tries
+	// the flag against this exact Version (#2333: v1.16.13 and earlier
+	// reject it outright). nil means "not yet probed against this
+	// version" — a poll still sends --stats optimistically and records the
+	// answer. Keyed to Version (see RecordRemoteVersions) so an upgrade
+	// forces one fresh probe instead of inheriting a stale verdict.
+	StatsSupported *bool `json:"stats_supported,omitempty"`
 }
 
 // Outdated reports whether the remote runs something older than controller.
@@ -39,11 +49,82 @@ type RemoteVersionState struct {
 // developer build must not flag every remote. A pre-release controller
 // ("1.16.4-preview.abc") is older than release 1.16.4, so a remote on that
 // release is not flagged either (#2164).
+//
+// Outdated must agree with Compare, i.e. it is exactly
+// Compare(controller) == RemoteVersionOlder. A local build at an identical
+// version number is a separate "redeploy the release binary" signal
+// (localBuildNeedsRelease, still used by PlanRemoteUpdates and the deploy's
+// ReplaceLocal option), not "older": ORing it in here made `remote list
+// --check --json` emit a self-contradictory
+// {"outdated":true,"version_state":"same"}.
 func (s RemoteVersionState) Outdated(controller string) bool {
 	if !s.Found || !isVersionString(s.Version) || !isReleaseVersion(controller) {
 		return false
 	}
 	return update.CompareVersions(s.Version, controller) < 0
+}
+
+// RemoteVersionCompare is how a remote's reported version compares with this
+// controller's, per update.CompareVersions. Build metadata after "+" is
+// stripped before comparing (splitPreRelease), so a "+local" build compares
+// equal to its base version: RemoteVersionSame, not RemoteVersionNewer.
+type RemoteVersionCompare int
+
+const (
+	// RemoteVersionUnknown: the remote never answered, or reported something
+	// CompareVersions cannot order. A first-class state, never a guess.
+	RemoteVersionUnknown RemoteVersionCompare = iota
+	RemoteVersionSame
+	RemoteVersionOlder
+	RemoteVersionNewer
+)
+
+// String renders the compare result the way `remote list --json` and the
+// remote preview panel spell it (version_state).
+func (c RemoteVersionCompare) String() string {
+	switch c {
+	case RemoteVersionSame:
+		return "same"
+	case RemoteVersionOlder:
+		return "older"
+	case RemoteVersionNewer:
+		return "newer"
+	default:
+		return "unknown"
+	}
+}
+
+// Compare reports how s compares with the controller's version. Unlike
+// Outdated (which never flags drift against a non-release controller build,
+// so a developer's "dev"/"0.0.0" build does not report every remote as
+// outdated), Compare answers the plain question the preview panel and
+// `remote list --json` ask: same, older, newer, or unknown when either side
+// cannot be parsed as a version.
+func (s RemoteVersionState) Compare(controller string) RemoteVersionCompare {
+	if !s.Found || !isVersionString(s.Version) || !isVersionString(controller) {
+		return RemoteVersionUnknown
+	}
+	switch update.CompareVersions(s.Version, controller) {
+	case 0:
+		return RemoteVersionSame
+	case -1:
+		return RemoteVersionOlder
+	default:
+		return RemoteVersionNewer
+	}
+}
+
+// BuildDiffers reports whether s and controller describe the same release
+// (RemoteVersionSame) but differ in their raw version string: build metadata
+// after "+", or its presence on only one side. CompareVersions ignores build
+// metadata entirely (so the update decision is unaffected), but a label that
+// only says "same" would overclaim when the two builds are not, in fact,
+// identical (walk defect #1).
+func (s RemoteVersionState) BuildDiffers(controller string) bool {
+	if s.Compare(controller) != RemoteVersionSame {
+		return false
+	}
+	return strings.TrimPrefix(strings.TrimSpace(s.Version), "v") != strings.TrimPrefix(strings.TrimSpace(controller), "v")
 }
 
 // isVersionString reports whether v is something CompareVersions can order:
@@ -56,7 +137,7 @@ func isVersionString(v string) bool {
 }
 
 // versionStringRe is remoteVersionRe anchored to the whole string.
-var versionStringRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+(?:[.\-+][0-9A-Za-z.\-]+)?$`)
+var versionStringRe = regexp.MustCompile(`^v?\d+\.\d+\.\d+(?:[.\-][0-9A-Za-z.\-]+)?(?:\+[0-9A-Za-z.\-]+)?$`)
 
 func isReleaseVersion(v string) bool {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
@@ -70,10 +151,106 @@ func isReleaseVersion(v string) bool {
 
 // remoteVersionCache is the on-disk shape of remoteVersionCacheFile.
 type remoteVersionCache struct {
+	Polls   map[string]RemotePollState    `json:"polls,omitempty"`
 	Remotes map[string]RemoteVersionState `json:"remotes"`
-	// AutoUpdateRanAt throttles the startup auto-update sweep.
-	AutoUpdateRanAt time.Time `json:"auto_update_ran_at,omitempty"`
+	// AutoUpdateRanAt throttles the startup auto-update sweep;
+	// AutoUpdateRanVersion is the controller version that sweep pushed, so
+	// a controller that restarted into a newer release sweeps again at
+	// once instead of waiting out the interval (2026-09-19: the sweep the
+	// install should have run died with its updater, and the stamp from
+	// the morning kept every later start from catching up).
+	AutoUpdateRanAt      time.Time `json:"auto_update_ran_at,omitempty"`
+	AutoUpdateRanVersion string    `json:"auto_update_ran_version,omitempty"`
+	// Sweep marks a sweep this controller is running right now, so a
+	// `remote update --all` started meanwhile waits for it instead of
+	// racing it to the remotes' deploy locks (#2244).
+	Sweep *remoteSweepMarker `json:"sweep,omitempty"`
 }
+
+// remoteSweepMarker is the on-disk shape of RemoteSweep.
+type remoteSweepMarker struct {
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+	Remotes   []string  `json:"remotes"`
+}
+
+// RemoteSweep describes a sweep in progress on this controller.
+type RemoteSweep struct {
+	PID       int
+	StartedAt time.Time
+	Remotes   []string
+}
+
+// Covers reports whether the sweep is updating the named remote.
+func (s RemoteSweep) Covers(name string) bool {
+	for _, r := range s.Remotes {
+		if r == name {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrRemoteSweepRunning is returned by BeginRemoteSweep while another sweep
+// from this controller is still running.
+var ErrRemoteSweepRunning = errors.New("a remote sweep is already in progress on this controller")
+
+// remoteSweepStale bounds how long a marker whose process is still alive is
+// trusted: a sweep hung on SSH for this long is not one to wait for.
+const remoteSweepStale = 30 * time.Minute
+
+// BeginRemoteSweep records that this process is sweeping the named remotes
+// and returns the function that clears the marker. A live marker from
+// another process yields ErrRemoteSweepRunning; a marker whose process is
+// gone or which is older than remoteSweepStale is replaced.
+func BeginRemoteSweep(remotes []string) (end func(), err error) {
+	var running bool
+	err = updateRemoteVersionCache(func(cache *remoteVersionCache) {
+		if _, ok := liveSweep(cache.Sweep); ok {
+			running = true
+			return
+		}
+		names := append([]string(nil), remotes...)
+		sort.Strings(names)
+		cache.Sweep = &remoteSweepMarker{PID: os.Getpid(), StartedAt: time.Now(), Remotes: names}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if running {
+		return nil, ErrRemoteSweepRunning
+	}
+	return func() {
+		_ = updateRemoteVersionCache(func(cache *remoteVersionCache) {
+			if cache.Sweep != nil && cache.Sweep.PID == os.Getpid() {
+				cache.Sweep = nil
+			}
+		})
+	}, nil
+}
+
+// RemoteSweepInProgress reports the sweep this controller is running, if
+// its process is still alive and it started recently.
+func RemoteSweepInProgress() (RemoteSweep, bool) {
+	remoteVersionCacheMu.Lock()
+	defer remoteVersionCacheMu.Unlock()
+	return liveSweep(loadRemoteVersionCache().Sweep)
+}
+
+func liveSweep(m *remoteSweepMarker) (RemoteSweep, bool) {
+	if m == nil || m.PID <= 0 || time.Since(m.StartedAt) > remoteSweepStale || !sweepProcessAlive(m.PID) {
+		return RemoteSweep{}, false
+	}
+	return RemoteSweep{PID: m.PID, StartedAt: m.StartedAt, Remotes: append([]string(nil), m.Remotes...)}, true
+}
+
+// sweepProcessAlive reports whether the marker's process can still finish
+// the sweep. It is procowner.Alive, not a bare kill(pid, 0): a sweep child
+// that died under its re-exec'd parent stays a zombie until something waits
+// for it, and a zombie answers the signal (v1.16.11 rollout: four remotes
+// were "being updated by" a defunct pid). A seam so tests can script the
+// state.
+var sweepProcessAlive = procowner.Alive
 
 var remoteVersionCacheMu sync.Mutex
 
@@ -231,8 +408,39 @@ func RecordRemoteVersions(states map[string]RemoteVersionState) error {
 	}
 	return updateRemoteVersionCache(func(cache *remoteVersionCache) {
 		for name, state := range states {
+			previous := cache.Remotes[name]
+			if state.InstalledFrom == "" && state.Found && strings.Contains(state.Version, "+local.") {
+				state.InstalledFrom = "local-build"
+			}
+			if state.InstalledFrom == "" && previous.Version == state.Version {
+				state.InstalledFrom = previous.InstalledFrom
+			}
+			if state.StatsSupported == nil && previous.Version == state.Version {
+				state.StatsSupported = previous.StatsSupported
+			}
 			cache.Remotes[name] = state
 		}
+	})
+}
+
+// RecordRemoteStatsSupport remembers whether name's `list --json` accepts
+// --stats, keyed to the exact remote Version this was learned against
+// (#2333): a version bump between now and the next probe means a stale
+// verdict for the old binary must not survive the upgrade. If the remote's
+// cached version has moved on since this probe started (a concurrent
+// version check landed first), the answer is dropped rather than pinned to
+// the wrong version — the next poll simply probes again.
+func RecordRemoteStatsSupport(name, version string, supported bool) error {
+	return updateRemoteVersionCache(func(cache *remoteVersionCache) {
+		state, ok := cache.Remotes[name]
+		if !ok {
+			state = RemoteVersionState{Version: version, CheckedAt: time.Now()}
+		}
+		if state.Version != version {
+			return
+		}
+		state.StatsSupported = &supported
+		cache.Remotes[name] = state
 	})
 }
 
@@ -244,9 +452,21 @@ func RemoteAutoUpdateRanAt() time.Time {
 	return loadRemoteVersionCache().AutoUpdateRanAt
 }
 
-// MarkRemoteAutoUpdateRan stamps the sweep time used by ShouldAutoUpdateRemotes.
-func MarkRemoteAutoUpdateRan(at time.Time) error {
-	return updateRemoteVersionCache(func(cache *remoteVersionCache) { cache.AutoUpdateRanAt = at })
+// MarkRemoteAutoUpdateRan stamps the sweep time and the controller version
+// it pushed, both read by ShouldAutoUpdateRemotes.
+func MarkRemoteAutoUpdateRan(at time.Time, version string) error {
+	return updateRemoteVersionCache(func(cache *remoteVersionCache) {
+		cache.AutoUpdateRanAt = at
+		cache.AutoUpdateRanVersion = version
+	})
+}
+
+// RemoteAutoUpdateRanVersion returns the controller version the last sweep
+// pushed ("" when never, or stamped by a build before this field).
+func RemoteAutoUpdateRanVersion() string {
+	remoteVersionCacheMu.Lock()
+	defer remoteVersionCacheMu.Unlock()
+	return loadRemoteVersionCache().AutoUpdateRanVersion
 }
 
 // ClaimRemoteAutoUpdateRun is the startup sweep's check-and-stamp in one
@@ -255,11 +475,12 @@ func MarkRemoteAutoUpdateRan(at time.Time) error {
 // stamp before returning true. Two TUIs starting at once therefore agree on
 // a single sweep, and a stamp that cannot be written yields false, so a
 // broken cache dir never causes a sweep on every startup (#2164).
-func ClaimRemoteAutoUpdateRun(settings UpdateSettings, remoteCount int, now time.Time) bool {
+func ClaimRemoteAutoUpdateRun(settings UpdateSettings, remoteCount int, version string, now time.Time) bool {
 	claimed := false
 	err := updateRemoteVersionCache(func(cache *remoteVersionCache) {
-		if ShouldAutoUpdateRemotes(settings, remoteCount, cache.AutoUpdateRanAt, now) {
+		if ShouldAutoUpdateRemotes(settings, remoteCount, cache.AutoUpdateRanAt, cache.AutoUpdateRanVersion, version, now) {
 			cache.AutoUpdateRanAt = now
+			cache.AutoUpdateRanVersion = version
 			claimed = true
 		}
 	})
@@ -269,13 +490,19 @@ func ClaimRemoteAutoUpdateRun(settings UpdateSettings, remoteCount int, now time
 // ShouldAutoUpdateRemotes is the pure decision behind the startup sweep:
 // the key must not be off (it is on by default), there must be remotes, and
 // the previous sweep must be older than the update check interval (so a TUI
-// restarted ten times in a row does not SSH into every remote ten times). A
-// zero lastRun always runs.
-func ShouldAutoUpdateRemotes(settings UpdateSettings, remoteCount int, lastRun, now time.Time) bool {
+// restarted ten times in a row does not SSH into every remote ten times), or
+// have pushed a different controller version than this one (a controller
+// that just restarted into a new release sweeps at once, even when the
+// sweep its install should have run never happened). A zero lastRun always
+// runs; an empty lastVersion (older stamp) defers to the interval alone.
+func ShouldAutoUpdateRemotes(settings UpdateSettings, remoteCount int, lastRun time.Time, lastVersion, version string, now time.Time) bool {
 	if !settings.GetAutoUpdateRemotes() || remoteCount == 0 {
 		return false
 	}
 	if lastRun.IsZero() {
+		return true
+	}
+	if lastVersion != "" && version != "" && update.CompareVersions(lastVersion, version) != 0 {
 		return true
 	}
 	hours := settings.CheckIntervalHours
@@ -336,7 +563,7 @@ func PlanRemoteUpdates(versions map[string]RemoteVersionState, controller string
 			action.Version = ""
 		case !isVersionString(state.Version):
 			action.Kind = RemoteUpdateUnknown
-		case update.CompareVersions(state.Version, controller) < 0:
+		case update.CompareVersions(state.Version, controller) < 0 || localBuildNeedsRelease(state, controller):
 			action.Kind = RemoteUpdateUpgrade
 		default:
 			action.Kind = RemoteUpdateCurrent
@@ -365,23 +592,36 @@ type RemoteUpdateResult struct {
 	To      string // target version
 	Outcome RemoteUpdateOutcome
 	Err     error
+	// Note is where the deploy put the binary (the installer's report), or
+	// why a remote was left to another run; appended to the report line.
+	Note string
 }
 
 // String renders the one-line report used by the CLI and the log.
 func (r RemoteUpdateResult) String() string {
+	line := ""
 	switch r.Outcome {
 	case RemoteUpdateOutcomeUpdated:
 		if r.From == "" {
-			return fmt.Sprintf("%s: installed v%s", r.Name, r.To)
+			line = fmt.Sprintf("%s: installed v%s", r.Name, r.To)
+		} else {
+			line = fmt.Sprintf("%s: updated v%s -> v%s", r.Name, r.From, r.To)
 		}
-		return fmt.Sprintf("%s: updated v%s -> v%s", r.Name, r.From, r.To)
 	case RemoteUpdateOutcomeCurrent:
-		return fmt.Sprintf("%s: already current (v%s)", r.Name, r.From)
+		line = fmt.Sprintf("%s: already current (v%s)", r.Name, r.From)
 	case RemoteUpdateOutcomeSkipped:
-		return fmt.Sprintf("%s: skipped (%v)", r.Name, r.Err)
+		if r.Err == nil {
+			line = fmt.Sprintf("%s: skipped", r.Name)
+		} else {
+			line = fmt.Sprintf("%s: skipped (%v)", r.Name, r.Err)
+		}
 	default:
-		return fmt.Sprintf("%s: failed (%v)", r.Name, r.Err)
+		line = fmt.Sprintf("%s: failed (%v)", r.Name, r.Err)
 	}
+	if r.Note != "" {
+		line += "; " + r.Note
+	}
+	return line
 }
 
 // CountRemoteUpdateFailures returns how many results failed; callers map a
@@ -404,8 +644,19 @@ type RemoteBinaryInstaller interface {
 	InstallBinary(ctx context.Context, binaryData []byte, expectedVersion string) error
 }
 
+// installReporter is the optional part of an installer that can say where
+// it put the binary; SSHRunner implements it.
+type installReporter interface {
+	LastInstallReport() string
+}
+
 // RemoteUpdateOptions tunes UpdateRemotes.
 type RemoteUpdateOptions struct {
+	LocalBuild *LocalBuild
+	Force      bool
+	DryRun     bool
+	// ReplaceLocal permits replacing a local build with its equal-core release.
+	ReplaceLocal bool
 	// NewRunner builds the installer for one remote. Nil means NewSSHRunner.
 	NewRunner func(name string, rc RemoteConfig) RemoteBinaryInstaller
 	// InstallMissing deploys onto remotes with no runnable binary. The
@@ -473,6 +724,9 @@ func FetchRemoteUpdateRelease(target string) (*update.Release, error) {
 // (#1171). Returns the version the remote now runs.
 func DeployRemoteBinary(ctx context.Context, runner RemoteBinaryInstaller, targetVersion string, opts RemoteUpdateOptions) (string, error) {
 	opts = opts.withDefaults()
+	if opts.LocalBuild != nil {
+		return deployLocalBuild(ctx, runner, opts)
+	}
 	goos, goarch, err := runner.DetectPlatform(ctx)
 	if err != nil {
 		return "", err
@@ -487,7 +741,9 @@ func DeployRemoteBinary(ctx context.Context, runner RemoteBinaryInstaller, targe
 	if deployed == "" {
 		deployed = strings.TrimPrefix(targetVersion, "v")
 	}
-	if current := strings.TrimPrefix(opts.CurrentVersion, "v"); isVersionString(current) && update.CompareVersions(deployed, current) <= 0 {
+	current := strings.TrimPrefix(opts.CurrentVersion, "v")
+	precedence := update.CompareVersions(deployed, current)
+	if isVersionString(current) && !opts.Force && (precedence < 0 || (precedence == 0 && !opts.ReplaceLocal)) {
 		return "", fmt.Errorf("%w: release v%s is not newer than the remote's v%s", ErrRemoteReleaseNotNewer, deployed, current)
 	}
 
@@ -497,9 +753,27 @@ func DeployRemoteBinary(ctx context.Context, runner RemoteBinaryInstaller, targe
 		return "", fmt.Errorf("download/verify failed: %w", err)
 	}
 
+	if opts.DryRun {
+		preview, ok := runner.(installPreviewer)
+		if !ok {
+			return "", fmt.Errorf("SSH runner does not support install preview")
+		}
+		if err := preview.PreviewInstallWithForce(ctx, deployed, opts.Force); err != nil {
+			return "", err
+		}
+		return deployed, nil
+	}
 	opts.Progress("Deploying...")
-	if err := runner.InstallBinary(ctx, binaryData, deployed); err != nil {
-		return "", fmt.Errorf("deploy failed: %w", err)
+	var installErr error
+	if installer, ok := runner.(interface {
+		InstallBinaryWithForce(context.Context, []byte, string, bool) error
+	}); ok {
+		installErr = installer.InstallBinaryWithForce(ctx, binaryData, deployed, opts.Force)
+	} else {
+		installErr = runner.InstallBinary(ctx, binaryData, deployed)
+	}
+	if installErr != nil {
+		return "", fmt.Errorf("deploy failed: %w", installErr)
 	}
 	return deployed, nil
 }
@@ -526,6 +800,10 @@ var ErrRemoteReleaseNotNewer = errors.New("no newer release to deploy")
 func UpdateRemotes(ctx context.Context, remotes map[string]RemoteConfig, targetVersion string, opts RemoteUpdateOptions) []RemoteUpdateResult {
 	opts = opts.withDefaults()
 	target := strings.TrimPrefix(targetVersion, "v")
+	if opts.LocalBuild != nil {
+		target = opts.LocalBuild.Version
+	}
+	cached := LoadRemoteVersions()
 
 	names := make([]string, 0, len(remotes))
 	for name := range remotes {
@@ -534,7 +812,6 @@ func UpdateRemotes(ctx context.Context, remotes map[string]RemoteConfig, targetV
 	sort.Strings(names)
 
 	results := make([]RemoteUpdateResult, 0, len(names))
-	learned := make(map[string]RemoteVersionState, len(names))
 	for _, name := range names {
 		rc := remotes[name]
 		runner := opts.NewRunner(name, rc)
@@ -542,12 +819,18 @@ func UpdateRemotes(ctx context.Context, remotes map[string]RemoteConfig, targetV
 
 		version, found := runner.CheckBinary(ctx)
 		state := RemoteVersionState{Version: version, Found: found, CheckedAt: time.Now()}
+		if cached[name].Version == version {
+			state.InstalledFrom = cached[name].InstalledFrom
+		}
 		plan := PlanRemoteUpdates(map[string]RemoteVersionState{name: state}, target)[0]
 		result.From = plan.Version
 
 		switch {
-		case plan.Kind == RemoteUpdateCurrent:
+		case plan.Kind == RemoteUpdateCurrent && opts.LocalBuild == nil && !opts.Force:
 			result.Outcome = RemoteUpdateOutcomeCurrent
+			if state.BuildDiffers(target) {
+				result.Note = "same release, different build"
+			}
 		case plan.Kind == RemoteUpdateUnknown:
 			result.Outcome = RemoteUpdateOutcomeSkipped
 			result.Err = fmt.Errorf("%w: %q", ErrRemoteVersionUnknown, state.Version)
@@ -557,23 +840,46 @@ func UpdateRemotes(ctx context.Context, remotes map[string]RemoteConfig, targetV
 		default:
 			remoteOpts := opts
 			remoteOpts.CurrentVersion = plan.Version
+			remoteOpts.ReplaceLocal = localBuildNeedsRelease(state, target)
 			deployed, err := DeployRemoteBinary(ctx, runner, target, remoteOpts)
-			if errors.Is(err, ErrRemoteReleaseNotNewer) {
+			if reporter, ok := runner.(installReporter); ok {
+				result.Note = reporter.LastInstallReport()
+			}
+			switch {
+			case errors.Is(err, ErrRemoteReleaseNotNewer), errors.Is(err, ErrRemoteDeployBusy), errors.Is(err, ErrRemoteProbeFailed):
+				// Nothing wrong with this remote: another deploy holds it,
+				// there is nothing newer to give it, or it could not say
+				// what it runs and was left alone (#2244).
 				result.Outcome = RemoteUpdateOutcomeSkipped
 				result.Err = err
-			} else if err != nil {
+			case err != nil:
 				result.Outcome = RemoteUpdateOutcomeFailed
 				result.Err = err
-			} else {
-				result.Outcome = RemoteUpdateOutcomeUpdated
+			default:
 				result.To = deployed
-				state = RemoteVersionState{Version: deployed, Found: true, CheckedAt: time.Now()}
+				if opts.DryRun {
+					result.Outcome = RemoteUpdateOutcomeSkipped
+					result.Note = "dry run: would install v" + deployed + "; " + result.Note
+				} else {
+					result.Outcome = RemoteUpdateOutcomeUpdated
+					source := "release"
+					if opts.LocalBuild != nil {
+						source = "local-build"
+					}
+					state = RemoteVersionState{Version: deployed, Found: true, CheckedAt: time.Now(), InstalledFrom: source}
+				}
 			}
 		}
-		learned[name] = state
+		// Record what this remote runs now, before the next remote and
+		// before the caller hears about it, so `remote list` never shows a
+		// version a finished deploy has already replaced (#2244).
+		if !opts.DryRun {
+			if err := RecordRemoteVersions(map[string]RemoteVersionState{name: state}); err != nil {
+				result.Note += "; could not record remote version cache: " + err.Error()
+			}
+		}
 		results = append(results, result)
 		opts.OnResult(result)
 	}
-	_ = RecordRemoteVersions(learned)
 	return results
 }

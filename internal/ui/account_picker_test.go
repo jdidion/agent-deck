@@ -280,6 +280,16 @@ func TestEditSessionDialogCommitRoutesAccountThroughSwitch(t *testing.T) {
 	home.instancesMu.Unlock()
 	home.groupTree = session.NewGroupTree(home.instances)
 	home.rebuildFlatItems()
+	// The switch now persists its own account mutation atomically with the
+	// transcript install (instead of relying solely on a later, skippable
+	// caller-side commit), so the storage row must exist beforehand exactly
+	// like it would for any real, already-saved session.
+	if home.storage == nil {
+		t.Fatal("test setup requires a real storage instance")
+	}
+	if err := home.storage.Save([]*session.Instance{inst}); err != nil {
+		t.Fatalf("seed storage: %v", err)
+	}
 
 	home.editSessionDialog.SetSize(home.width, home.height)
 	home.editSessionDialog.Show(inst)
@@ -296,9 +306,22 @@ func TestEditSessionDialogCommitRoutesAccountThroughSwitch(t *testing.T) {
 	home.editSessionDialog.focusIndex = idx
 	home.editSessionDialog.Update(tea.KeyMsg{Type: tea.KeyRight}) // personal -> work
 
+	// A same-harness account change is a stop + conversation move + restart:
+	// Enter asks first (the cross-harness path already does), and the Switch
+	// button runs the switch.
 	_, cmd := home.handleEditSessionDialogKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil || !home.confirmDialog.IsVisible() || home.confirmDialog.GetConfirmType() != ConfirmSwitchAccount {
+		t.Fatal("Enter on a changed account row must ask for confirmation before switching")
+	}
+	if !home.editSessionDialog.IsVisible() || inst.Account != "personal" {
+		t.Fatal("while the confirmation is open the dialog stays and nothing is written")
+	}
+	_, cmd = home.handleConfirmDialogKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
 	if cmd == nil {
-		t.Fatal("committing an account change must return the switch command")
+		t.Fatal("confirming the account change must return the switch command")
+	}
+	if home.confirmDialog.IsVisible() {
+		t.Fatal("the confirmation must close once accepted")
 	}
 	// The switch flow captures the SOURCE config dir from the pre-switch
 	// account. If the generic SetField loop wrote the field first, that capture
@@ -402,6 +425,13 @@ func TestEditSessionDialogKeepsUnconfiguredAccountPill(t *testing.T) {
 // untouched and show the explicit loss confirmation before any lifecycle work.
 func TestEditSessionDialogRefusesAccountSwitchWithToolChange(t *testing.T) {
 	cfg := withAccountsConfig(t, "work", "personal")
+	// A cross-harness preview refuses when the target CLI is not on PATH;
+	// this test is about the loss confirmation, so give it a stub codex.
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	work := cfg.Profiles["work"]
 	work.Codex = session.ProfileCodexSettings{ConfigDir: filepath.Join(t.TempDir(), "codex-work")}
 	cfg.Profiles["work"] = work
@@ -522,4 +552,61 @@ func accountFieldIndex(t *testing.T, d *EditSessionDialog) int {
 	}
 	t.Fatal("expected an account row")
 	return -1
+}
+
+// Declining the "Switch Account?" confirmation returns to the Edit Session
+// dialog with focus on the account row and nothing written; the row's footer
+// says that Enter asks first.
+func TestEditSessionDialogAccountSwitchCancelReturnsToRow(t *testing.T) {
+	withAccountsConfig(t, "work", "personal")
+
+	home := NewHome()
+	home.width, home.height = 120, 40
+
+	inst := session.NewInstanceWithTool("acct-cancel", t.TempDir(), "claude")
+	inst.Account = "personal"
+	home.instancesMu.Lock()
+	home.instances = []*session.Instance{inst}
+	home.instanceByID[inst.ID] = inst
+	home.instancesMu.Unlock()
+	home.groupTree = session.NewGroupTree(home.instances)
+	home.rebuildFlatItems()
+
+	home.editSessionDialog.SetSize(home.width, home.height)
+	home.editSessionDialog.Show(inst)
+	idx := accountFieldIndex(t, home.editSessionDialog)
+	home.editSessionDialog.focusIndex = idx
+	if view := stripAnsi(home.editSessionDialog.View()); !strings.Contains(view, "Enter save") || strings.Contains(view, "asks first") {
+		t.Fatalf("unchanged account row must offer a plain save:\n%s", view)
+	}
+	home.editSessionDialog.Update(tea.KeyMsg{Type: tea.KeyRight}) // personal -> work
+	if view := stripAnsi(home.editSessionDialog.View()); !strings.Contains(view, "Enter switch (asks first)") {
+		t.Fatalf("changed account row footer must say Enter asks first:\n%s", view)
+	}
+	home.editSessionDialog.focusIndex = 0 // wander off to Title before saving
+
+	home.handleEditSessionDialogKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if !home.confirmDialog.IsVisible() {
+		t.Fatal("precondition: confirmation open")
+	}
+	view := stripAnsi(home.confirmDialog.View())
+	for _, want := range []string{"Switch Account?", "personal", "work", "acct-cancel", "conversation"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("confirmation lacks %q:\n%s", want, view)
+		}
+	}
+
+	_, cmd := home.handleConfirmDialogKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd != nil {
+		t.Fatal("declining must not start a switch")
+	}
+	if home.confirmDialog.IsVisible() || !home.editSessionDialog.IsVisible() {
+		t.Fatal("decline must close the confirmation and keep the Edit Session dialog open")
+	}
+	if home.editSessionDialog.focusIndex != idx {
+		t.Fatalf("focus after decline = %d, want the account row %d", home.editSessionDialog.focusIndex, idx)
+	}
+	if inst.Account != "personal" {
+		t.Fatalf("account = %q after decline, want personal", inst.Account)
+	}
 }

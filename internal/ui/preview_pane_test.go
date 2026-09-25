@@ -155,6 +155,58 @@ func TestPreviewPane_BothStatuses_PadToHeight(t *testing.T) {
 	}
 }
 
+// TestPreview_HideWorktreeAndClaudeSections pins the [preview] hide_worktree /
+// hide_claude behaviour (and its runtime toggle counterpart): the Worktree
+// section divider must be omitted whenever h.previewHideWorktree is true, and
+// the Claude section divider must be omitted whenever h.previewHideClaude is
+// true, independent of one another.
+func TestPreview_HideWorktreeAndClaudeSections(t *testing.T) {
+	newWorktreeClaudeInstance := func() *session.Instance {
+		inst := session.NewInstance("wt-claude-session", "/repos/app/.worktrees/feature-x")
+		inst.Status = session.StatusRunning
+		inst.Tool = "claude"
+		inst.WorktreePath = "/repos/app/.worktrees/feature-x"
+		inst.WorktreeRepoRoot = "/repos/app"
+		inst.WorktreeBranch = "feature/x"
+		return inst
+	}
+
+	cases := []struct {
+		name         string
+		hideWorktree bool
+		hideClaude   bool
+		wantWorktree bool
+		wantClaude   bool
+	}{
+		{"both shown", false, false, true, true},
+		{"worktree hidden", true, false, false, true},
+		{"claude hidden", false, true, true, false},
+		{"both hidden", true, true, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := homeWithSession(newWorktreeClaudeInstance())
+			h.previewHideWorktree = tc.hideWorktree
+			h.previewHideClaude = tc.hideClaude
+
+			rendered := tmux.StripANSI(h.renderPreviewPane(100, 40))
+
+			gotWorktree := strings.Contains(rendered, "Worktree")
+			if gotWorktree != tc.wantWorktree {
+				t.Errorf("hideWorktree=%v hideClaude=%v: Worktree divider present=%v, want %v\nrendered=%q",
+					tc.hideWorktree, tc.hideClaude, gotWorktree, tc.wantWorktree, rendered)
+			}
+
+			gotClaude := strings.Contains(rendered, "Claude")
+			if gotClaude != tc.wantClaude {
+				t.Errorf("hideWorktree=%v hideClaude=%v: Claude divider present=%v, want %v\nrendered=%q",
+					tc.hideWorktree, tc.hideClaude, gotClaude, tc.wantClaude, rendered)
+			}
+		})
+	}
+}
+
 // Test for VIS-01: stopped sessions appear in flat items list when no filter active
 func TestFlatItems_IncludesStoppedSessions(t *testing.T) {
 	h := NewHome()
