@@ -136,6 +136,7 @@ export const pushConfigSignal = signal(null)        // null or { enabled, vapidP
 export const pushSubscribedSignal = signal(false)
 export const pushBusySignal = signal(false)
 export const pushEndpointSignal = signal('')
+export const pushPermissionSignal = signal('default') // Notification.permission
 
 // Info drawer open/close state (Phase 10: replaces showSettings local state in Topbar)
 export const infoDrawerOpenSignal = signal(false)
@@ -172,6 +173,9 @@ export const visibleToolsSignal = signal([])
 export const toolFilterFallbackSignal = signal(false)
 export const hiddenToolsSignal = signal([])
 export const pickerToolsSignal = signal([])
+// Per-tool model and effort lists from /api/settings `modelCatalog` (#2388).
+// Empty until hydrated; the dialog then uses its built-in tables.
+export const modelCatalogSignal = signal({})
 
 // Web terminal link-open policy (issue #1682), hydrated from /api/settings.
 // trustedDomainsSignal holds the `[web].trusted_domains` hosts whose links

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"al.essio.dev/pkg/shellescape"
 	"github.com/google/uuid"
@@ -24,6 +25,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/ui"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
@@ -38,9 +40,17 @@ func handleSession(profile string, args []string) {
 
 	switch args[0] {
 	case "start":
-		handleSessionStart(profile, args[1:])
+		if coreRegistryEnabled() {
+			cliSessionStart(profile, args[1:])
+		} else {
+			handleSessionStart(profile, args[1:])
+		}
 	case "stop":
-		handleSessionStop(profile, args[1:])
+		if coreRegistryEnabled() {
+			cliSessionStop(profile, args[1:])
+		} else {
+			handleSessionStop(profile, args[1:])
+		}
 	case "remove":
 		handleSessionRemove(profile, args[1:])
 	case "cleanup", "prune":
@@ -50,7 +60,11 @@ func handleSession(profile string, args []string) {
 	case "unarchive":
 		handleSessionUnarchive(profile, args[1:])
 	case "restart":
-		handleSessionRestart(profile, args[1:])
+		if coreRegistryEnabled() {
+			cliSessionRestart(profile, args[1:])
+		} else {
+			handleSessionRestart(profile, args[1:])
+		}
 	case "revive":
 		handleSessionRevive(profile, args[1:])
 	case "fork":
@@ -96,6 +110,10 @@ func handleSession(profile string, args []string) {
 		handleSessionMove(profile, args[1:])
 	case "send":
 		handleSessionSend(profile, args[1:])
+	case "send-status":
+		handleSessionSendStatus(profile, args[1:])
+	case "send-worker":
+		handleSessionSendWorker(profile, args[1:])
 	case "approve":
 		handleSessionApprove(profile, args[1:])
 	case "send-keys":
@@ -154,7 +172,8 @@ func printSessionHelp() {
 	fmt.Println("  switch <id> --to-harness <harness> [--to-account <account>]  Switch account or create a confirmed fresh cross-harness target")
 	fmt.Println("  switch-account <id> <account>  Switch Claude account and migrate the conversation")
 	fmt.Println("  move <id> <path>        Move session to a new path (migrates Claude history)")
-	fmt.Println("  send <id> <message>     Send a message to a running session")
+	fmt.Println("  send <id> <message>     Send a message to a running session (--queue: never silently lost, see send-status; --image <path>)")
+	fmt.Println("  send-status <send-id>   State of a queued send: queued, typed, submitted, landed or failed")
 	fmt.Println("  approve <id> [choice]   Resolve a visible Codex approval prompt")
 	fmt.Println("  output <id>             Get the last response from a session")
 	fmt.Println("  context [id]            Show what is loaded into the agent's context, ranked by cost")
@@ -210,6 +229,7 @@ func printSessionHelp() {
 	fmt.Println("  tool               Tool type (claude, gemini, shell, etc.)")
 	fmt.Println("  wrapper            Wrapper command (use {command} to include tool command)")
 	fmt.Println("  claude-session-id  Claude conversation ID (for fork/resume)")
+	fmt.Println("  favorite           Favourite flag: true or false (favorite in list/show --json)")
 	fmt.Println("  gemini-session-id  Gemini conversation ID (for resume)")
 	fmt.Println("  tool-session-id    Custom [tools.*] conversation ID (resume_flag after reboot)")
 	fmt.Println()
@@ -506,12 +526,14 @@ func handleSessionStop(profile string, args []string) {
 	// during start (e.g., tool started late on slow WSL2 machines).
 	// Must happen before Kill() because tmux show-environment fails on dead sessions.
 	inst.SyncSessionIDsFromTmux()
+	adoptLiveCodexIdentity(storage, inst)
 
 	// Stop the session by killing the tmux session
 	if err := inst.Kill(); err != nil {
 		out.Error(fmt.Sprintf("failed to stop session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	inst.RecordTelemetryEnd(telemetry.EndStop)
 
 	// v1.9.1 queue drain: a slot freed up. If the group has a cap and a
 	// queued sibling is waiting, start the oldest one. Only one drain per
@@ -613,8 +635,13 @@ func handleSessionArchive(profile string, args []string) {
 	// populates. Late-discovered ids are dropped rather than saved via a
 	// non-targeted write that would reintroduce the archive-clobber race. The
 	// session's normal lifecycle already persists its tool ids.
+	//
+	// Codex is the exception: launch left its identity unpersisted, and the
+	// live process is the only evidence of it, so bind it with the targeted
+	// Codex write before the kill destroys that evidence (#2400).
 	killed := false
 	if inst.Exists() {
+		adoptLiveCodexIdentity(storage, inst)
 		if err := inst.Kill(); err != nil {
 			out.Error(fmt.Sprintf("failed to stop session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
@@ -1297,7 +1324,7 @@ func handleSessionFork(profile string, args []string) {
 				// #1708: inherit the PARENT SESSION's sparse state (its own
 				// worktree), not repoRoot's — see git.CaptureSparseCheckout.
 				createdBranch, cwErr := git.CreateWorktreeAtStartPointWithOptions(repoRoot, worktreePath, wtBranch, parentHead,
-					git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), inst.ProjectPath))
+					wtSettings.CreateOptions(inst.ProjectPath))
 				if cwErr != nil {
 					out.Error(fmt.Sprintf("worktree creation failed: %v", cwErr), ErrCodeInvalidOperation)
 					os.Exit(1)
@@ -1369,7 +1396,7 @@ func handleSessionFork(profile string, args []string) {
 				setupErr, cwErr = git.CreateWorktreeWithSetupOptions(
 					repoRoot, worktreePath, wtBranch,
 					git.WorktreeStateOptions{},
-					git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), inst.ProjectPath),
+					wtSettings.CreateOptions(inst.ProjectPath),
 					os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 				if cwErr != nil {
 					out.Error(fmt.Sprintf("worktree creation failed: %v", cwErr), ErrCodeInvalidOperation)
@@ -1382,7 +1409,8 @@ func handleSessionFork(profile string, args []string) {
 					os.Exit(1)
 				}
 			}
-			if setupErr != nil {
+			// A skipped (unapproved) hook already printed its notice above.
+			if setupErr != nil && !errors.Is(setupErr, git.ErrWorktreeScriptNotApproved) {
 				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
 			}
 		}
@@ -1428,6 +1456,7 @@ func handleSessionFork(profile string, args []string) {
 		out.Error(fmt.Sprintf("failed to start forked session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	forkedInst.RecordTelemetryCreate(telemetry.ViaCLIAdd)
 
 	// Capture forked session's new session ID
 	forkedInst.PostStartSync(3 * time.Second)
@@ -1515,10 +1544,12 @@ func handleSessionAttach(profile string, args []string) {
 	// Create context for attach
 	ctx := context.Background()
 
+	attachedAt := time.Now()
 	if err := tmuxSession.Attach(ctx, detachByte); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to attach: %v\n", err)
 		os.Exit(1)
 	}
+	telemetry.Attached(inst.Tool, telemetry.AttachCLI, time.Since(attachedAt))
 }
 
 // errFocusNotFound signals that `session focus` was given an id absent from the
@@ -1923,6 +1954,19 @@ func handleSessionShow(profile string, args []string) {
 	// ambiguous with absence-of-value, and here that ambiguity cost a user a
 	// bug report against the wrong component.
 	jsonData["wrapper"] = inst.Wrapper
+	if inst.Favorite {
+		jsonData["favorite"] = true
+	}
+
+	// macapp-core-needs §3: the live native transcript and every native id
+	// seen for this session (Codex re-creates its rollout after the trust
+	// prompt). Omitted when unknown, so older consumers see no change.
+	if p := session.LiveTranscriptPath(inst, instances); p != "" {
+		jsonData["transcript_path"] = p
+	}
+	if ids := session.TranscriptIDs(inst, instances); len(ids) > 0 {
+		jsonData["transcript_ids"] = ids
+	}
 
 	if session.SupportsNativeFork(inst.Tool) {
 		jsonData["can_fork"] = inst.CanFork()
@@ -2150,6 +2194,7 @@ func handleSessionSet(profile string, args []string) {
 		fmt.Println("  model              Per-session model override (e.g. opus/sonnet/haiku or a gemini model); persists across restart (#1436). Empty clears it.")
 		fmt.Println("  color              Optional TUI row tint: '#RRGGBB' or ANSI '0'..'255' or '' (issue #391)")
 		fmt.Println("  claude-session-id  Claude conversation ID")
+		fmt.Println("  favorite           Favourite flag: true or false (favorite in list/show --json)")
 		fmt.Println("  gemini-session-id  Gemini conversation ID")
 		fmt.Println("  tool-session-id    Custom [tools.*] conversation ID (for resume_flag after reboot)")
 		fmt.Println("  account            Named account slot (#924) — resolves via [profiles.<account>.claude].config_dir; restart required")
@@ -3018,6 +3063,11 @@ func handleSessionSend(profile string, args []string) {
 	streamIdle := fs.Duration("stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
 	streamToolBudget := fs.Int("stream-tool-budget", 3, "Tool-event budget for text flush in --stream mode")
+	codexComposerFallback := fs.Bool("codex-composer-fallback", false, "Codex only: when the session's Codex identity is provably unavailable (fresh composer, rollout re-created after the trust prompt), send through the verified composer path instead of refusing. Never used for --json --wait; every other acceptance error still refuses")
+	queue := fs.Bool("queue", false, "Return at once with a send_id; a background worker delivers when the target is idle, at most once; every send ends landed, failed or settled with a reason (see session send-status)")
+	queueWorker := fs.Bool("queue-worker", false, "Internal: deliver a durable queued send directly")
+	var images imageList
+	fs.Var(&images, "image", "Attach an image (repeatable): Claude Code and Gemini get @<copy under .agentdeck-images/>; Codex and other harnesses exit 2")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session send <id|title> <message> [options]")
@@ -3044,6 +3094,18 @@ func handleSessionSend(profile string, args []string) {
 		fmt.Println("  agent-deck session send my-project --message-file answer.md   # long reply from file")
 		fmt.Println("  git diff | agent-deck session send my-project --message-file -   # message from stdin")
 		fmt.Println("  agent-deck session send parent \"child done\" --defer-if-busy --defer-timeout 30m")
+		fmt.Println("  agent-deck session send my-project --message-file - --json   # returns send_id at once")
+		fmt.Println("  agent-deck session send my-project \"what is this?\" --image shot.png")
+		fmt.Println()
+		fmt.Println("--json (without --wait/--stream/--draft/--no-wait) and --queue return a durable")
+		fmt.Println("  send_id with verdict queued. Claude accepts input while busy; other harnesses wait")
+		fmt.Println("  for idle. send-status and delivery events upgrade the verdict when evidence arrives.")
+		fmt.Println("  The send is watched until its text lands in")
+		fmt.Println("  the transcript (state landed, landed_row_id). Retry budget 30m, then failed with a reason.")
+		fmt.Println("  Exit 0 queued, 1 failed at once (e.g. target not running).")
+		fmt.Println("--image: Claude Code and Gemini receive @path; Codex takes images only at launch (-i), so a")
+		fmt.Println("  running Codex session exits 2, as does any other harness. Exit codes: 0 sent/queued,")
+		fmt.Println("  1 delivery failed, 2 usage error, unknown session or unsupported image.")
 		fmt.Println()
 		fmt.Println("Codex --json --wait:")
 		fmt.Println("  Emits one structured result correlated to the accepted Codex turn.")
@@ -3105,6 +3167,47 @@ func handleSessionSend(profile string, args []string) {
 		}
 		os.Exit(1)
 		return // unreachable, satisfies staticcheck SA5011
+	}
+
+	// Machine callers get a durable id immediately. The worker opts out of
+	// this branch so its own JSON result describes the actual transport.
+	asyncJSON := *jsonOutput && !*queueWorker && !*wait && !*stream && !*draft && !*deferIfBusy && !*noWait
+	// Opt-in telemetry: count the send by tool and length bucket only (no-op
+	// without consent), once it was queued or delivered. A send from inside
+	// a session is automation; the queue worker's delivery was counted when
+	// the message was queued.
+	messageChars := utf8.RuneCountInString(message)
+	recordSent := func() {
+		if *queueWorker {
+			return
+		}
+		via := telemetry.SendCLI
+		if telemetry.InsideSession() {
+			via = telemetry.SendConductor
+		}
+		telemetry.MessageSent(inst.Tool, via, messageChars, *queue)
+	}
+	if len(images) > 0 || *queue || asyncJSON {
+		if *queue && (*wait || *stream || *draft || *noWait || *deferIfBusy) {
+			out.Error("--queue is incompatible with --wait, --stream, --draft, --no-wait and --defer-if-busy", ErrCodeInvalidOperation)
+			os.Exit(2)
+		}
+		var imgErr error
+		var copies []string
+		message, copies, imgErr = attachImages(inst, message, images, time.Now())
+		if imgErr != nil {
+			out.Error(imgErr.Error(), ErrCodeInvalidOperation)
+			os.Exit(2)
+		}
+		if *queue || asyncJSON {
+			if err := inst.PromptDeliveryError(); err != nil {
+				out.Error(err.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+			queueSend(profile, storage, inst, message, copies, out) // exits on failure
+			recordSent()
+			return
+		}
 	}
 
 	// --stream is Claude-only in Phase 1. Non-Claude tools error cleanly
@@ -3172,24 +3275,40 @@ func handleSessionSend(profile string, args []string) {
 	acceptanceFence := codexAcceptanceFence{}
 	var acceptanceGuard *codexAcceptanceGuard
 	if shouldAcquireCodexAcceptanceGuard(inst, *jsonOutput, *wait, *draft) {
-		if err := hydrateLegacyCodexIdentity(inst, instances, storage); err != nil {
-			out.Error(fmt.Sprintf("cannot establish exact Codex turn acceptance: %v", err), ErrCodeInvalidOperation)
+		// Every send keeps the double-send refusal: an unresolved earlier
+		// submission, an identity owned by another session, a held
+		// acceptance lock or a remote rollout all refuse, whatever the
+		// flags. Only --codex-composer-fallback, and only when the identity
+		// is provably unavailable (macapp-core-needs §3: right after the
+		// trust prompt there is no identity, or the stored id has no
+		// rollout), sends through the verified composer path instead.
+		guardErr := hydrateLegacyCodexIdentity(inst, instances, storage)
+		if guardErr == nil {
+			acceptanceGuard, guardErr = acquireCodexAcceptanceGuard(inst, codexAcceptanceLockWait(*timeout))
+		}
+		switch {
+		case guardErr == nil:
+			acceptanceFence = acceptanceGuard.fence
+		case codexComposerFallbackAllowed(guardErr, *codexComposerFallback, structuredCodexWait):
+			acceptanceGuard = nil
+			fmt.Fprintf(os.Stderr, "Note: no Codex accepted-turn receipt yet (%v); sending through the composer (--codex-composer-fallback)\n", guardErr)
+		default:
+			out.ErrorWithData(fmt.Sprintf("cannot establish exact Codex turn acceptance: %v", guardErr), ErrCodeInvalidOperation,
+				map[string]interface{}{"delivery": deliveryAcceptanceRefused})
 			os.Exit(1)
 		}
-		lockWait := codexAcceptanceLockWait(*timeout)
-		acceptanceGuard, err = acquireCodexAcceptanceGuard(inst, lockWait)
-		if err != nil {
-			out.Error(fmt.Sprintf("cannot establish exact Codex turn acceptance: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
-		acceptanceFence = acceptanceGuard.fence
 	}
 
 	// Wait for agent to be ready (unless --no-wait is specified).
 	// Issue #957: honor --timeout for the readiness phase too, not just the
 	// post-ready completion wait. Otherwise --timeout 5m against a busy
 	// recipient silently fails at ~80s.
-	if !*noWait {
+	busyAcceptsInput := !*wait && session.AcceptsInputWhileBusy(inst.Tool)
+	if busyAcceptsInput {
+		status, statusErr := fetchHookDrivenStatus(profile, inst.ID)
+		busyAcceptsInput = statusErr == nil && status == "running"
+	}
+	if !*noWait && !busyAcceptsInput {
 		if err := send.WaitForAgentReady(tmuxSess, inst.Tool, *timeout, send.PromptGates{
 			ClaudeComposer: session.IsClaudeCompatible(inst.Tool),
 			CodexPrompt:    session.IsCodexCompatible(inst.Tool),
@@ -3291,6 +3410,12 @@ func handleSessionSend(profile string, args []string) {
 	if *noWait {
 		tun = noWaitSendTuning()
 	}
+	if *queueWorker || busyAcceptsInput {
+		// A live Claude composer already exists. Startup preflight and the
+		// 30-check idle-turn probe add delay without proving this queued send.
+		tun.preflightWait, tun.settleDelay = 0, 0
+		tun.retry.maxRetries, tun.retry.checkDelay = 10, 100*time.Millisecond
+	}
 	// #2033: give the verification loop the hook-driven busy signal so the
 	// Ctrl+C-and-resend recovery can tell a queued message on a live turn
 	// from a message lost during TUI init. Same signal --defer-if-busy reads.
@@ -3305,6 +3430,9 @@ func handleSessionSend(profile string, args []string) {
 		tun.retry.turnAdvanced = func() bool { return session.TurnAdvanced(turnQuery) }
 	}
 	if acceptanceGuard != nil {
+		// Codex's counterpart: a new turn in the exact rollout past the
+		// acceptance fence, the evidence the accepted-turn receipt rests on.
+		tun.retry.turnAdvanced = func() bool { return codexTurnAdvancedPastFence(inst, acceptanceFence) }
 		if err := validateCodexAcceptanceFence(inst, acceptanceFence); err != nil {
 			acceptanceGuard.Release()
 			out.Error(fmt.Sprintf("cannot submit against changed Codex turn fence: %v", err), ErrCodeInvalidOperation)
@@ -3328,7 +3456,7 @@ func handleSessionSend(profile string, args []string) {
 	// on, so it needs the same lookup closure. performSend only calls it
 	// under --wait, which is the only caller that acts on the answer.
 	hookStatus := func() (string, error) { return fetchHookDrivenStatus(profile, sessionRef) }
-	sendRes, sendErr := performSend(inst, tmuxSess, message, *noWait, tun, sendTransportValue, *wait, hookStatus, nil, nil)
+	sendRes, sendErr := performSend(inst, tmuxSess, message, *noWait || busyAcceptsInput, tun, sendTransportValue, *wait, hookStatus, nil, nil)
 	// Computed now (accurate ack_ms), journaled after the verdict at every
 	// exit path below — never before it, per the same rule applied to
 	// handleSessionStop/handleSessionRestart.
@@ -3386,6 +3514,7 @@ func handleSessionSend(profile string, args []string) {
 		recordSendEvent(profile, inst.ID, sendDetail)
 		os.Exit(1)
 	}
+	recordSent()
 
 	// Self-heal Stage 1: stamp the "we talked to it" clock. A delivered send is
 	// exactly the event the idle_at_empty_prompt dwell is measured from — a
@@ -3645,7 +3774,7 @@ func handleSessionSend(profile string, args []string) {
 		// Codex additionally binds a structured --json --wait reply to its
 		// exact accepted turn generation rather than a freshness scan.
 		if structuredCodexWait {
-			response, responseErr = waitForCodexTurnOutput(inst, acceptedTurn.TurnGeneration)
+			response, responseErr = waitForCodexTurnOutput(inst, acceptedTurn.TurnGeneration, waitDeadline)
 		} else {
 			response, responseErr = waitForFreshOutput(inst, sentAt, instances)
 		}
@@ -3655,7 +3784,7 @@ func handleSessionSend(profile string, args []string) {
 			if _, freshInstances, _, loadErr := loadSessionData(profile); loadErr == nil {
 				if freshInst, _, _ := ResolveSession(sessionRef, freshInstances); freshInst != nil {
 					if structuredCodexWait {
-						response, responseErr = waitForCodexTurnOutput(freshInst, acceptedTurn.TurnGeneration)
+						response, responseErr = waitForCodexTurnOutput(freshInst, acceptedTurn.TurnGeneration, waitDeadline)
 					} else {
 						response, responseErr = waitForFreshOutput(freshInst, sentAt, freshInstances)
 					}
@@ -3677,6 +3806,15 @@ func handleSessionSend(profile string, args []string) {
 		sendData["content"] = response.Content
 		if response.CodexTurnGeneration != "" {
 			sendData["codex_turn_generation"] = response.CodexTurnGeneration
+		}
+		// #2397: the turn this reply is bound to. Its user record's
+		// sessionId overrides the instance's claude_session_id set by
+		// sendSuccessData: it is the conversation the turn landed in.
+		if response.ClaudeTurnUUID != "" {
+			sendData["claude_turn_uuid"] = response.ClaudeTurnUUID
+			if response.SessionID != "" {
+				sendData["claude_session_id"] = response.SessionID
+			}
 		}
 		out.Success(fmt.Sprintf("Sent message to '%s'", inst.Title), sendData)
 	} else {
@@ -3915,6 +4053,11 @@ const (
 	// per-target lock after the bounded wait (messaging audit P2-2, #2104).
 	// Nothing was typed, so a retry is safe.
 	deliveryTargetBusy = "target_busy"
+	// deliveryAcceptanceRefused: no input sent because exact Codex turn
+	// acceptance could not be established (an unresolved earlier
+	// submission, another session owning the identity, the acceptance lock
+	// held by another send). Nothing was typed, so a retry is safe.
+	deliveryAcceptanceRefused = "acceptance_refused"
 	// deliveryQueued: the message was typed and Entered once, and the
 	// target's hook-driven status reports it mid-turn (issue #2033). Claude
 	// holds such input as a queued message and takes it up when the turn
@@ -3993,6 +4136,10 @@ func sendSuccessData(inst *session.Instance, message string, res sendDeliveryRes
 	}
 	for k, v := range res.jsonFields() {
 		data[k] = v
+	}
+	// #2397: name the native Claude conversation, as show/output do.
+	if session.IsClaudeCompatible(inst.Tool) && inst.ClaudeSessionID != "" {
+		data["claude_session_id"] = inst.ClaudeSessionID
 	}
 	if wait {
 		if outcome := socketWaitOutcome(res); outcome != "" {
@@ -4151,8 +4298,10 @@ func (g *codexAcceptanceGuard) ResolveAccepted() error {
 
 // hydrateLegacyCodexIdentity repairs the narrow upgrade case where a live,
 // local Codex pane already owns an exact rollout but its database row predates
-// durable Codex identity tracking. The pane environment is the authority; disk
-// scans and terminal text are deliberately not identity sources here.
+// durable Codex identity tracking. The one thread the pane's live Codex
+// process holds open is the authority (a fresh composer owns its thread before
+// any rollout exists); without it, the pane environment is used. Disk scans and
+// terminal text are deliberately not identity sources here.
 func hydrateLegacyCodexIdentity(
 	inst *session.Instance,
 	peers []*session.Instance,
@@ -4170,8 +4319,13 @@ func hydrateLegacyCodexIdentity(
 	}
 
 	candidate := liveCodexSessionID(inst)
+	processOwned := false
+	// Panes from earlier builds can carry a disk-scan guess (#2394).
+	if live := inst.LiveCodexThreadID(); live != "" {
+		candidate, processOwned = live, true
+	}
 	if candidate == "" {
-		return fmt.Errorf("Codex session identity is unavailable")
+		return errCodexIdentityUnavailable
 	}
 	if _, _, err := session.SetField(inst, session.FieldCodexSessionID, candidate, nil); err != nil {
 		restore()
@@ -4194,7 +4348,7 @@ func hydrateLegacyCodexIdentity(
 		restore()
 		return fmt.Errorf("live Codex session identity has no unique current rollout: %w", err)
 	}
-	if strings.TrimSpace(generation) == "" {
+	if strings.TrimSpace(generation) == "" && !processOwned {
 		restore()
 		return fmt.Errorf("live Codex session identity current turn generation is unavailable")
 	}
@@ -4207,6 +4361,28 @@ func hydrateLegacyCodexIdentity(
 		return fmt.Errorf("persist live Codex session identity: %w", err)
 	}
 	return nil
+}
+
+// The two acceptance errors that mean the Codex identity is provably
+// unavailable, rather than contested: no identity at all, or a stored id
+// with no current rollout generation. Only these may use
+// --codex-composer-fallback.
+var (
+	errCodexIdentityUnavailable   = errors.New("Codex session identity is unavailable")
+	errCodexGenerationUnavailable = errors.New("current rollout generation is unavailable")
+)
+
+// codexComposerFallbackAllowed reports whether a send whose acceptance
+// guard failed with err may go through the composer instead of refusing:
+// only with --codex-composer-fallback, never for a structured --json --wait,
+// and only when the identity is provably unavailable. Contested identity
+// (an unresolved earlier submission, another session's thread, the
+// acceptance lock held by another send, a remote rollout) always refuses.
+func codexComposerFallbackAllowed(err error, flag, structuredWait bool) bool {
+	if err == nil || !flag || structuredWait {
+		return false
+	}
+	return errors.Is(err, errCodexIdentityUnavailable) || errors.Is(err, errCodexGenerationUnavailable)
 }
 
 // liveCodexSessionID reads only the authoritative Codex identity from a live
@@ -4235,7 +4411,7 @@ func acquireCodexAcceptanceGuard(inst *session.Instance, timeout time.Duration) 
 		return nil, fmt.Errorf("exact rollout is unavailable for remote or sandboxed sessions")
 	}
 	if strings.TrimSpace(inst.CodexSessionID) == "" {
-		return nil, fmt.Errorf("Codex session identity is unavailable")
+		return nil, errCodexIdentityUnavailable
 	}
 	lock, err := session.AcquireCodexAcceptanceLock(inst.CodexSessionID, timeout)
 	if err != nil {
@@ -4244,7 +4420,7 @@ func acquireCodexAcceptanceGuard(inst *session.Instance, timeout time.Duration) 
 	fence := captureCodexAcceptanceFence(inst)
 	if !fence.available {
 		lock.Release()
-		return nil, fmt.Errorf("current rollout generation is unavailable")
+		return nil, errCodexGenerationUnavailable
 	}
 	if _, err := session.ReconcileCodexSubmissionMarker(inst.ID, inst.CodexSessionID, fence.priorTurnGeneration); err != nil {
 		lock.Release()
@@ -4293,6 +4469,16 @@ func retryAndRequireStructuredCodexAcceptedTurn(
 		receipt = waitForAcceptedCodexTurn(inst, delivery, acceptedAt, fence)
 	}
 	return receipt, requireStructuredCodexAcceptedTurn(inst, jsonOutput, wait, receipt)
+}
+
+// codexTurnAdvancedPastFence reports whether the exact rollout has started a
+// turn after the acceptance fence was captured.
+func codexTurnAdvancedPastFence(inst *session.Instance, fence codexAcceptanceFence) bool {
+	if inst == nil || !fence.available || inst.CodexSessionID != fence.codexSessionID {
+		return false
+	}
+	generation, err := inst.LatestCodexTurnGeneration()
+	return err == nil && generation != "" && generation != fence.priorTurnGeneration
 }
 
 func captureCodexAcceptanceFence(inst *session.Instance) codexAcceptanceFence {
@@ -5078,10 +5264,12 @@ func sendWithRetryTarget(target sendRetryTarget, message string, skipVerify bool
 			// confirmation unknown: exit 0, and the CLI says so.
 			return deliveryDelivered, nil
 		}
-		// Issue #876: with verifyDelivery, refuse to claim success when no
-		// positive signal was ever observed — the message was very likely
-		// dropped silently. Claude echoes what it is typed, so a pane that
-		// never showed the body after a send is evidence, not silence.
+		// A target known busy before the send may keep the submitted line off
+		// screen until its next turn. No visible echo is an unknown outcome.
+		if hookBusyBeforeSend {
+			return deliveryUnverified, nil
+		}
+		// Idle targets still retain the startup silent-drop guard (#876).
 		return deliveryNoEvidence, fmt.Errorf("send dropped silently: no evidence of delivery after %d checks (issue #876). "+
 			"The agent never transitioned to 'active', no composer/unsent-paste marker appeared, "+
 			"and the message body was not visible in the pane. Verify the inner agent is reading from "+
@@ -5283,7 +5471,11 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	sawBody := false
 	lastContent := ""
 	for i := 0; i < checks; i++ {
-		// Strongest signal first: an idle agent that starts working received
+		// Turn advancement in the harness's own transcript is authoritative.
+		if opts.turnAdvanced != nil && opts.turnAdvanced() {
+			return deliverySubmitted, nil
+		}
+		// Strongest pane signal: an idle agent that starts working received
 		// what it started working on, which is submission, not just arrival.
 		if baseline.statusOK && !baseline.wasActive {
 			if status, err := target.GetStatus(); err == nil && status == "active" {
@@ -5755,30 +5947,36 @@ var freshOutputTestConfig *freshOutputConfig
 // hook and the final rollout append. Content and timestamps are insufficient:
 // consecutive turns can legitimately emit identical replies, so only the
 // exact accepted thread:turn generation can satisfy this read.
-func waitForCodexTurnOutput(inst *session.Instance, generation string) (*session.ResponseOutput, error) {
+//
+// The status heuristic that precedes this read can report a long Codex turn
+// as finished while it is still running (a quiet pane during a long tool
+// call), so the read polls until the caller's --wait deadline rather than a
+// fixed flush window of its own (#2395). task_complete is only written when
+// the turn ends, so a running turn can never satisfy it early.
+func waitForCodexTurnOutput(inst *session.Instance, generation string, deadline time.Time) (*session.ResponseOutput, error) {
 	if inst == nil || generation == "" {
 		return nil, fmt.Errorf("accepted Codex turn identity is unavailable")
 	}
 	pollInterval := 250 * time.Millisecond
-	timeout := 5 * time.Second
 	if cfg := freshOutputTestConfig; cfg != nil {
 		pollInterval = cfg.pollInterval
-		timeout = cfg.timeout
 	}
-	deadline := time.Now().Add(timeout)
 	var lastErr error
-	for time.Now().Before(deadline) {
+	for {
 		resp, err := inst.GetLastResponseBestEffort()
 		if err == nil && resp.CodexTurnGeneration == generation {
 			return resp, nil
 		}
 		lastErr = err
-		time.Sleep(pollInterval)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(min(pollInterval, max(time.Until(deadline), time.Millisecond)))
 	}
 	if lastErr != nil {
-		return nil, fmt.Errorf("read Codex turn %s: %w", generation, lastErr)
+		return nil, fmt.Errorf("Codex turn %s did not complete within the --timeout budget: %w", generation, lastErr)
 	}
-	return nil, fmt.Errorf("Codex turn %s was not flushed before timeout", generation)
+	return nil, fmt.Errorf("Codex turn %s did not complete within the --timeout budget", generation)
 }
 
 // waitForFreshOutput polls the session's JSONL file until it contains an assistant
@@ -6096,6 +6294,10 @@ func handleSessionOutput(profile string, args []string) {
 		out.Print(emitted, jsonData)
 		return
 	}
+
+	// A Codex row launch left unbound reads its exact rollout once the live
+	// process names the thread, instead of falling back to pane text (#2396).
+	adoptLiveCodexIdentity(storage, inst)
 
 	// Get the last response (best-effort fallback for smoother CLI reads).
 	// Collision-checked (#1400): multiple live instances sharing one

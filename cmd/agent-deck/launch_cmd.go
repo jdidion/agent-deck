@@ -11,6 +11,7 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
 
@@ -152,7 +153,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume")
 	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
-	effort := fs.String("effort", "", "Reasoning effort for this session (claude: low, medium, high, xhigh, max; codex: minimal, low, medium, high, xhigh)")
+	effort := fs.String("effort", "", "Reasoning effort for this session (claude: low, medium, high, xhigh, max; codex: minimal, low, medium, high, xhigh, max, ultra)")
 	account := fs.String("account", "", "Named account slot (uses its per-tool config_dir; overrides AGENTDECK_ACCOUNT)")
 	// Parity with `add` and the New Session dialog: sandbox, YOLO and the
 	// Claude Options rows.
@@ -441,7 +442,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 			// Sparse state is inherited from `path` (the directory the user
 			// launched from), never from backend.RepoDir() — see #1708.
 			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
-				git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), path),
+				wtSettings.CreateOptions(path),
 				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
@@ -449,7 +450,8 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 			}
 			ownedPath := worktreePath
 			cleanupSingleWorktree = func() error { return backend.RemoveWorktree(ownedPath, true) }
-			if setupErr != nil {
+			// A skipped (unapproved) hook already printed its notice above.
+			if setupErr != nil && !errors.Is(setupErr, git.ErrWorktreeScriptNotApproved) {
 				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
 			}
 		}
@@ -882,6 +884,7 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 			os.Exit(1)
 		}
 	}
+	newInstance.RecordTelemetryCreate(telemetry.ViaCLILaunch)
 
 	// Capture session ID from tmux
 	newInstance.PostStartSync(3 * time.Second)
@@ -952,6 +955,12 @@ func handleLaunchCommand(profile string, args []string, inspectFlags func(*flag.
 			)
 		}
 	}
+
+	// Codex: persist the thread the new process holds open. PostStartSync
+	// does not wait for Codex, and startup detection ends with this process,
+	// so without this the row stays unbound until a follow-up send (#2396,
+	// #2400).
+	persistLiveCodexIdentity(storage, newInstance, codexLaunchIdentityWait)
 
 	// Build output. v1.9.x issue #1031: surface the new session ID
 	// under an explicit `session_id` key so callers (conductor fleet

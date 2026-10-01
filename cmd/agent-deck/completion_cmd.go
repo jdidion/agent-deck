@@ -113,7 +113,6 @@ var completionTree = []completionNode{
 	{name: "uninstall"},
 	{name: "run-task"},
 	{name: "feedback"},
-	{name: "creds-refresh"},
 	{name: "telegram-doctor"},
 	{name: "version"},
 	{name: "help"},
@@ -238,7 +237,7 @@ var completionTree = []completionNode{
 	},
 	{
 		name: "worktree",
-		subs: []string{"list", "info", "cleanup", "finish", "trust-scripts"},
+		subs: []string{"list", "info", "cleanup", "finish", "trust-hooks"},
 		args: map[string][]argKind{
 			"info":   {argSession},
 			"finish": {argSession},
@@ -246,7 +245,7 @@ var completionTree = []completionNode{
 	},
 	{
 		name: "wt",
-		subs: []string{"list", "info", "cleanup", "finish", "trust-scripts"},
+		subs: []string{"list", "info", "cleanup", "finish", "trust-hooks"},
 		args: map[string][]argKind{
 			"info":   {argSession},
 			"finish": {argSession},

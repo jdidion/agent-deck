@@ -417,7 +417,7 @@ Matches [Claude Code Desktop semantics](https://code.claude.com/docs/en/worktree
 #### Worktree Setup Script
 
 For imperative setup tasks (installing dependencies, running migrations, etc.), create a script at `.agent-deck/worktree-setup.sh`.
-Agent-deck runs it automatically after creating a worktree and processing `.worktreeinclude`.
+Once you have approved it (see [Approving worktree hooks](#approving-worktree-hooks)), agent-deck runs it after creating a worktree and processing `.worktreeinclude`.
 
 ```sh
 #!/bin/sh
@@ -428,19 +428,43 @@ The script receives two environment variables:
 - `AGENT_DECK_REPO_ROOT` — path to the main repository
 - `AGENT_DECK_WORKTREE_PATH` — path to the new worktree
 
-The script runs via `sh -e` with a 60-second timeout. If it fails, the worktree is still created — you'll see a warning but the session proceeds normally.
+It runs in the new worktree with your full environment. An executable script runs directly (its `#!` line picks the interpreter); a non-executable one runs via `sh -e`. Under the default approval policy, agent-deck runs a private copy of the approved bytes, so a hook changed while you answer the prompt cannot execute instead. Use the working directory and the two environment variables above to locate project files; the script's own `$0` path points to that temporary copy. The timeout is 60 seconds (`[worktree] setup_timeout_seconds`). If it fails or is skipped, the worktree is still created: you'll see a warning and the session proceeds normally.
 
 #### Worktree Destruction Script
 
 For imperative teardown tasks (stopping containers, removing volumes, releasing ports, etc.), create a script at `.agent-deck/worktree-destruction.sh`.
-Agent-deck runs it automatically *just before* removing a worktree, while the worktree still exists.
+Once approved, agent-deck runs it *just before* removing a worktree, while the worktree still exists.
 
 ```sh
 #!/bin/sh
 docker compose -p "$(basename "$AGENT_DECK_WORKTREE_PATH")" down
 ```
 
-It receives the same environment variables as the setup script (`AGENT_DECK_REPO_ROOT`, `AGENT_DECK_WORKTREE_PATH`) and runs with the same `sh -e` dispatch and 60-second timeout. If it fails, removal proceeds anyway — you'll see a warning. It does not run for sessions that reuse the main working tree (nothing is removed there).
+It receives the same environment variables as the setup script (`AGENT_DECK_REPO_ROOT`, `AGENT_DECK_WORKTREE_PATH`) and uses the same dispatch and a 60-second timeout. If it fails or is skipped, removal proceeds anyway and you'll see a warning. It does not run for sessions that reuse the main working tree (nothing is removed there).
+
+#### Approving worktree hooks
+
+These two hooks are code from the repository, and they run as you. Creating or removing a worktree does not by itself approve them, so a repository you just cloned cannot run anything on your machine until you say so.
+
+**What is approved.** An approval covers one hook (setup and destruction are separate) in one repository, and is bound to the script's exact bytes (sha256), its real location (symlinks resolved) and how it runs (directly via `#!`, or `sh -e`). Editing the script, retargeting a symlink or flipping its executable bit asks again. Approvals live in agent-deck's data directory (`~/.local/share/agent-deck/worktree-script-consent.json`), never in the repository.
+
+**When you are asked.** The first time a hook would run, and after any change:
+
+- **TUI:** a dialog shows the repository, the hook, the command that will run, its sha256 and up to the first 20 lines (with an omitted-line count when space is tight), with **Run once**, **Always trust this version** and **Skip** (the default).
+- **CLI on a terminal:** the same details, then `[o]nce, [a]lways trust this version, [N]o/skip`.
+- **CLI without a terminal** (scripts, CI, `remote`), and requests from the web UI: the hook is skipped with a one-line notice naming the command that approves it.
+
+**Approving ahead of time.**
+
+```bash
+agent-deck worktree trust-hooks .                          # show each hook, ask y/N
+agent-deck worktree trust-hooks . --hook setup --yes       # scripts: approve after reviewing
+agent-deck worktree trust-hooks . --revoke                 # forget the approvals
+agent-deck launch . -w feat -b --run-hooks                 # run unapproved hooks this once (prints sha256)
+agent-deck launch . -w feat -b --run-hooks --trust         # ...and remember that version
+```
+
+`[worktree] run_repo_scripts` sets the policy: `"prompt"` (default), `"never"` (hooks never run), or `"always"` (every hook runs without asking; only for machines where you own every repository you open, because any repository you create a worktree in can then run code as you). Remote hosts apply their own policy and approvals: run `trust-hooks` on the remote host.
 
 #### Bare repositories and worktrees
 
@@ -817,6 +841,19 @@ profile takes a resume flag — see [docs/tools/deepseek.md](docs/tools/deepseek
 
 Hide tools you don't use from the new-session picker with `[ui].hidden_tools` (applies to TUI and web; `shell` is always available).
 
+#### Vendor terms and logins
+
+**Claude Code.** Agent Deck runs the unmodified `claude` CLI with your own login and never reads, copies or reuses a login token to call Anthropic itself. Plan limits assume ordinary individual use, so for heavy many-session or unattended orchestration use an API key or a Team/Enterprise plan. For long-lived logins in sandboxes or on always-on hosts, create a token with Anthropic's own `claude setup-token` and pass it as `CLAUDE_CODE_OAUTH_TOKEN` through the existing `env_file` setting (a file containing `export CLAUDE_CODE_OAUTH_TOKEN=...`, mode 0600):
+
+```bash
+claude setup-token
+```
+
+```toml
+[claude]
+env_file = "~/.config/agent-deck/claude-token.env"
+```
+
 ### Cost Tracking Dashboard
 
 Track token usage and costs across all your AI agent sessions in real-time.
@@ -1007,12 +1044,12 @@ Feedback posts to a public GitHub Discussion at [Feedback Hub](https://github.co
 
 ### Usage telemetry (opt-in, off by default)
 
-agent-deck can send one small anonymous usage report per day (random install id, version, OS/arch, feature counters) so the maintainer can see which features are used. **It is off until you explicitly say yes** in the one-time TUI prompt or with `agent-deck telemetry enable`; declining is remembered and nothing is ever sent or counted without consent. `AGENTDECK_TELEMETRY=0` or `DO_NOT_TRACK=1` hard-disable it regardless. Full details, the exact payload, and every control: [TELEMETRY.md](TELEMETRY.md).
+Anonymous usage data (tools and features used, session counts and lengths, active hours, error types, version and OS; never prompts, paths, titles or names) is shared with the maintainer via PostHog EU **only after you say yes** to the one-time TUI question; `agent-deck telemetry preview` shows exactly what would be sent, and `agent-deck telemetry off` or `DO_NOT_TRACK=1` turns it off. Details and the full field list: [TELEMETRY.md](TELEMETRY.md).
 
 ```bash
-agent-deck telemetry status      # on/off and why
-agent-deck telemetry show-last   # the exact JSON that was last sent
-agent-deck telemetry disable     # off, install id deleted
+agent-deck telemetry status      # on/off, why, and what is waiting in the local spool
+agent-deck telemetry preview     # the exact request bodies the next upload would send
+agent-deck telemetry off         # off; install id and local data deleted
 ```
 
 ### Remote Instances
@@ -1049,9 +1086,9 @@ By default the controller pushes its version to older remotes on its own: after 
 
 Unattended installs (the daily timer, and any long-running agent-deck's `check_interval` poll — default 90s) work the other way around: the controller *nudges* each remote to check for the release right now instead of pushing bytes to it, so remotes pull and verify themselves, same as `agent-deck update` on that host would (`[updates] sweep_remotes = true` restores the old push behavior). A remote too old to understand the nudge gets a blocking fallback update instead, so it still ends up current either way.
 
-A conductor that launches workers on another host does not get their completions for free: transition notifications are parent-linked, and a `parent_session_id` cannot point across machines. `remote drain <name>` closes that gap by pulling — it reads the remote's records over the same SSH path (consuming nothing there) and writes them into the local inbox, safe to run on every heartbeat and safe to repeat.
+A conductor that launches workers on another host does not get their completions for free: transition notifications are parent-linked, and a `parent_session_id` cannot point across machines. Run `agent-deck remote drain <name> --into <conductor-session-id>` to pull the remote's records over SSH into that conductor's local inbox. The remote records are not consumed, and repeated drains are deduplicated locally. A new inbox record wakes the heartbeat; the heartbeat does not pull remote records automatically.
 
-Remote polling runs in the background. A failed poll shows its reason (`auth failed`, `timeout`, `host down`, or `poll failed`) beside the remote. Authentication failures pause automatic polling across restarts until the remote configuration changes or you authenticate and run `agent-deck remote list --retry`. This clears cached poll state for all configured remotes without opening SSH; add `--check` for an explicit version check. The next TUI refresh resumes polling.
+Remote polling runs in the background. A failed poll shows its reason (`auth failed`, `timeout`, `host down`, or `poll failed`) beside the remote. An authentication failure pauses automatic polling of that remote for 2 minutes, across restarts; after that the next poll tries once more, so a transient failure (for example an ssh-agent that had not loaded its key yet) heals on its own, while a broken credential is tried only once per 2 minutes. Latency and preview probes stay paused until a poll succeeds. To resume at once, authenticate and run `agent-deck remote list --retry`. This clears cached poll state for all configured remotes without opening SSH; add `--check` for an explicit version check. The next TUI refresh resumes polling.
 
 `remote list --json` includes `last_poll_ms`, `last_poll_status`, and `last_poll_error`. An unobserved remote has `null` latency, status `unknown`, and an empty error. Other statuses are `ok`, `auth_failed`, `timeout`, `host_down`, and `error`. These fields describe the last session-list poll, independently of the version cache. To inspect or reset the remotes configured on another host, use `agent-deck remote exec <host> remote list --json` or append `--retry`.
 
@@ -1086,6 +1123,14 @@ agent-deck web --token my-secret
 # then open: http://127.0.0.1:8420/?token=my-secret
 ```
 
+A valid tokened visit stores an HttpOnly, SameSite=Strict cookie, so refreshes
+continue to work with `--token-file`. The server accepts requests addressed to
+localhost, loopback IPs, its listen address, and its machine name when bound
+to a network interface. A wildcard bind also accepts the machine's current
+interface IPs. For a reverse proxy or Tailscale Serve hostname, add
+the exact name with `--allowed-host machine.tailnet.ts.net` (repeatable) or
+`[web] allowed_hosts`. An entry with a port permits only that port.
+
 For headless deployments, read the token from a file instead so it never
 appears in the process arguments, where any local user can read it from
 `/proc`. The file must be a regular file that is not group- or world-readable,
@@ -1102,6 +1147,20 @@ address without one of them is refused, because it would expose an
 unauthenticated remote-code-execution surface. MCP administration over the
 HTTP API is only available when a token is configured; without one those
 routes stay unavailable.
+
+Browser push notifications tell you when a session needs you while the tab is
+in the background:
+
+```bash
+agent-deck web --push
+```
+
+Then open the Tweaks panel (gear icon, top right) and turn on
+**Notifications**. The browser asks for permission once, subscribes with the
+server's VAPID key, and keeps the subscription across reloads; notifications
+only fire while the tab is unfocused. The switch is hidden when the server runs
+without `--push` or the browser has no Push API. Push needs a secure context:
+`http://127.0.0.1` or `localhost`, or HTTPS (for example Tailscale Serve).
 
 The browser UI includes the live Command Center, session terminal, costs, archive, and settings views. See [Command Center](docs/COMMAND-CENTER.md) for the fleet view; use `--read-only` when browser clients should not mutate sessions.
 

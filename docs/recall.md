@@ -151,6 +151,11 @@ never opened. Sources are keyed on `(device, inode)` with the path as an
 attribute, so a transcript reachable through 189 scratch symlinks is one
 row, and each file carries the profile that owns its config dir.
 
+Codex roots include every `[profiles.<name>.codex].config_dir`, the global
+`[codex].config_dir`, `$CODEX_HOME`, and `~/.codex`. Existing directories
+are included once by resolved path, even when two settings refer to the
+same location. `recall status --json` lists these roots.
+
 From a transcript the reader keeps: user prompts and assistant text (each
 message body zstd-compressed and clipped to 8 KiB, the FTS index over the
 full text), every `tool_use` with its name, timestamp, the duration to its
@@ -180,6 +185,8 @@ agent-deck recall status [--json]
 agent-deck recall sessions [--profile work] [--project PATH] [--since 30d] [--hint k=v] [--tag t] [--session ID] [--subagents] [--limit 20] [--json]
 agent-deck recall search "<q>" [same filters] [--role user|assistant] [--phrase] [--phrase-scan-limit 2000] [--limit 20] [--no-sweep] [--json]
 agent-deck recall show <session> [--tier card|excerpt|raw] [--turns 40] [--json]
+agent-deck recall timeline <session> --json
+agent-deck recall follow <session> --after <through_cursor> --jsonl
 agent-deck recall open <session> [--title T] [--dry-run] [--json]
 agent-deck recall gc [--keep-days 30] [--json]
 agent-deck recall rebuild [--force] [--json]

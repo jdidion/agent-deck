@@ -26,6 +26,7 @@ type Config struct {
 	ReadOnly     bool
 	WebMutations bool // When false, POST/PATCH/DELETE endpoints return 403
 	Token        string
+	AllowedHosts []string // Additional exact Host values, optionally including a port.
 	// InsecureBind explicitly acknowledges binding a non-loopback address
 	// with no auth token (an unauthenticated RCE surface). Without it the
 	// server refuses to start in that configuration. See bind.go / report #1.
@@ -69,6 +70,13 @@ var ErrUndoExpired = errors.New("undo window expired")
 // target session id does not resolve to a live instance. The handler maps
 // this to 404. See issue #1126.
 var ErrSessionNotFound = errors.New("session not found")
+
+// ErrGroupNotFound is returned by SessionMutator.SetGroupExpanded when the
+// path does not resolve to a group. The handler maps this to 404. A stale
+// browser tab can easily PATCH a group the TUI has since deleted, and a
+// silent no-op there would leave the sidebar asserting a collapse that was
+// never stored.
+var ErrGroupNotFound = errors.New("group not found")
 
 // ErrNotAWorktree is returned by SessionMutator.FinishWorktree when the
 // target session exists but is not in a git/jujutsu worktree (so there is
@@ -143,7 +151,21 @@ type SessionMutator interface {
 	UpdateSession(sessionID string, updates map[string]string) (updatedFields []string, restartRequired bool, err error)
 	CreateGroup(name, parentPath string) (string, error)
 	RenameGroup(groupPath, newName string) error
+	// MoveSessionToGroup moves a session to another group with the
+	// `agent-deck group move` semantics (see session.GroupTree.
+	// ResolveMoveTargetGroup): "" or "root" is the default group, and a
+	// missing group is created. Returns the group path the session landed in
+	// and whether its resolved Claude config dir changed, which only takes
+	// effect on the next restart (no conversation migration, like the CLI).
+	// Returns ErrSessionNotFound when the id doesn't resolve. See issue #2368.
+	MoveSessionToGroup(sessionID, groupPath string) (movedTo string, restartRequired bool, err error)
 	DeleteGroup(groupPath string) error
+	// SetGroupExpanded persists a group's collapsed/expanded state, the same
+	// flag the TUI writes on its Enter/Tab toggle (home.go saveGroupState ->
+	// Storage.SaveGroupsOnly). The web sidebar keeps its own collapse state,
+	// so without this the two views drift apart permanently. Returns
+	// ErrGroupNotFound when the path does not resolve to a group.
+	SetGroupExpanded(groupPath string, expanded bool) error
 	// FinishWorktree merges (or skips), removes the worktree, optionally
 	// deletes the source branch, kills the tmux session, and removes the
 	// session from storage. Mirrors the TUI W/shift+w hotkey and the
@@ -275,7 +297,7 @@ func NewServer(cfg Config) *Server {
 	// themselves from their handlers_<feature>.go files; see routes.go.
 	s.mountFeatureRoutes(mux)
 
-	handler := s.trackInFlight(withRecover(s.csrfProtect(mux)))
+	handler := s.allowHosts(s.tokenCookie(s.trackInFlight(withRecover(s.csrfProtect(mux)))))
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,

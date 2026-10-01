@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
+	"github.com/asheshgoplani/agent-deck/internal/events"
 	"github.com/asheshgoplani/agent-deck/internal/feedback"
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/health"
@@ -42,7 +44,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/web"
 )
 
-var Version = "1.16.16" // overridden at build time via -ldflags "-X main.Version=..."
+var Version = "1.16.22" // overridden at build time via -ldflags "-X main.Version=..."
 
 // Table column widths for list command output
 const (
@@ -84,35 +86,19 @@ func initTelemetrySettings() {
 	}
 	telemetry.SetConfigDisabled(cfg.Telemetry.Disabled)
 	telemetry.SetEndpoint(cfg.Telemetry.Endpoint)
+	telemetry.SetPostHogKey(cfg.Telemetry.PostHogKey)
+	telemetry.SetConfigLevel(cfg.Telemetry.Level)
 }
 
-// recordCLITelemetry bumps the opt-in usage counters for a CLI subcommand.
-// No-op unless the user has consented (telemetry.Record checks). Hook
-// handlers and daemons are excluded: they fire on every agent turn and
-// would swamp the human-driven counts.
-func recordCLITelemetry(subcommand string, rest []string) {
-	for _, a := range rest {
-		if a == "-h" || a == "--help" || a == "help" {
-			return
-		}
-	}
-	switch subcommand {
-	case "add", "list", "ls", "remove", "rm", "rename", "mv", "status", "profile", "update",
-		"session", "fleet", "mcp", "plugin", "skill", "mcp-proxy", "group", "try", "launch",
-		"accounts", "conductor", "agents", "agent", "telegram-doctor", "watcher", "openclaw", "oc",
-		"remote", "worktree", "wt", "costs", "usage", "web", "uninstall", "migrate-paths", "hooks", "recall",
-		"codex-hooks", "gemini-hooks", "hermes-hooks", "cursor-hooks", "tmux-hooks", "pi-hooks", "deepseek", "feedback", "creds-refresh",
-		"config":
-	default:
-		return
-	}
-	telemetry.Record(telemetry.CounterCLIInvocations)
-	switch subcommand {
-	case "remote":
-		telemetry.Record(telemetry.CounterRemoteUsed)
-	case "conductor":
-		telemetry.Record(telemetry.CounterConductorUsed)
+// telemetrySignalClose flushes the TUI's pending telemetry (activity hour,
+// app.exit) when a signal ends the process; set once the home model exists.
+var telemetrySignalClose atomic.Pointer[func(telemetry.ExitKind)]
 
+func setTelemetrySignalClose(fn func(telemetry.ExitKind)) { telemetrySignalClose.Store(&fn) }
+
+func closeTelemetryOnSignal() {
+	if fn := telemetrySignalClose.Load(); fn != nil {
+		(*fn)(telemetry.ExitSignal)
 	}
 }
 
@@ -317,6 +303,28 @@ func inheritedEnviron() []string {
 	return env
 }
 
+func configureEventProfile(profile string) error {
+	selected, err := session.ResolveProfileForStorage(profile)
+	if err != nil {
+		return err
+	}
+	events.SetProfile(selected)
+	return nil
+}
+
+// credsRefreshRemovedIn is the release that removed the creds-refresh command.
+const credsRefreshRemovedIn = "v1.16.21"
+
+// printCredsRefreshRemoved answers a leftover `agent-deck creds-refresh`
+// invocation, typically an old systemd user unit. It exits 0 on purpose: that
+// unit has Restart=always, so a non-zero exit would crash-loop every 30 s.
+// The command is not in commandRegistry, so it stays out of help, completion
+// and remote-agent dispatch. Drop this stub two releases after
+// credsRefreshRemovedIn.
+func printCredsRefreshRemoved() {
+	fmt.Printf("creds-refresh was removed in %s. Disable any old unit with: systemctl --user disable --now agent-deck-creds-refresh. For long-lived logins use: claude setup-token (see README \"Vendor terms and logins\").\n", credsRefreshRemovedIn)
+}
+
 func main() {
 	// Make bare `tmux` invocations resolve even when launched from a minimal
 	// environment (notably a `terminal-notifier -execute` notification click,
@@ -328,28 +336,40 @@ func main() {
 	// check (printUpdateNotice, `update`, `version`). See the doc comment.
 	initUpdateSettings()
 	initTelemetrySettings()
+	telemetry.SetProcess(Version, telemetry.SurfaceCLI)
 
 	// Extract global -p/--profile flag before subcommand dispatch
 	profile, args := extractProfileFlag(os.Args[1:])
+	if len(args) > 0 && args[0] == "creds-refresh" {
+		printCredsRefreshRemoved()
+		return
+	}
 	applyProfileFlag(profile)
-	// Extract global --allow-repo-scripts before subcommand dispatch (mirrors
-	// -p/--profile above). One-shot, non-persisted bypass of the worktree
-	// script consent gate for non-interactive callers (CI) that can't answer
-	// a prompt and would otherwise fail closed under the "prompt" default.
+	if err := configureEventProfile(profile); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to resolve events profile: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() { _ = events.CloseDefault() }()
+	// Extract global --run-hooks (alias --allow-repo-scripts) and --trust
+	// before subcommand dispatch (mirrors -p/--profile above). One-shot run
+	// of unapproved worktree hooks for non-interactive callers (CI) that
+	// can't answer a prompt and would otherwise skip them under the "prompt"
+	// default; --trust additionally records the version that ran.
 	// Remote arguments belong to the server, including its script-consent flag.
 	if len(args) > 0 && args[0] == "remote" {
 		recordCLITelemetry(args[0], args[1:])
 		handleRemote(profile, args[1:])
 		return
 	}
-	allowRepoScripts, args2 := extractAllowRepoScriptsFlag(args)
+	allowRepoScripts, trustRepoScripts, args2 := extractAllowRepoScriptsFlag(args)
 	args = args2
 	if envVal := strings.TrimSpace(os.Getenv("AGENT_DECK_ALLOW_REPO_SCRIPTS")); envVal != "" {
 		allowRepoScripts = allowRepoScripts || envVal == "1" || strings.EqualFold(envVal, "true")
 	}
 	git.SetScriptConsentConfig(git.ScriptConsentConfig{
-		Policy:        session.GetWorktreeSettings().ScriptConsentPolicy(),
-		AllowOverride: allowRepoScripts,
+		Policy:          session.GetWorktreeSettings().ScriptConsentPolicy(),
+		AllowOverride:   allowRepoScripts,
+		PersistOverride: allowRepoScripts && trustRepoScripts,
 		// True here: every switch case below that can reach a worktree
 		// script (add/remove/worktree/session/etc.) `return`s before the
 		// TUI/web startup code further down, so it's still a real CLI
@@ -414,7 +434,11 @@ func main() {
 			handleAdd(profile, args[1:])
 			return
 		case "list", "ls":
-			handleList(profile, args[1:])
+			if coreRegistryEnabled() {
+				cliList(profile, args[1:])
+			} else {
+				handleList(profile, args[1:])
+			}
 			return
 		case "remove", "rm":
 			handleRemove(profile, args[1:])
@@ -475,6 +499,12 @@ func main() {
 		case "accounts":
 			handleAccounts(args[1:])
 			return
+		case "harness":
+			handleHarness(profile, args[1:])
+			return
+		case "limits":
+			handleLimits(args[1:])
+			return
 		case "conductor":
 			handleConductor(profile, args[1:])
 			return
@@ -507,6 +537,12 @@ func main() {
 			return
 		case "costs":
 			handleCosts(profile, args[1:])
+			return
+		case "events":
+			handleEvents(profile, args[1:])
+			return
+		case "daemon":
+			handleDaemon(profile, args[1:])
 			return
 		case "recall":
 			handleRecall(profile, args[1:])
@@ -578,9 +614,6 @@ func main() {
 			return
 		case "feedback":
 			handleFeedback(args[1:])
-			return
-		case "creds-refresh":
-			handleCredsRefresh(args[1:])
 			return
 		case "debug-dump":
 			if helpRequested(args[1:]) {
@@ -704,6 +737,7 @@ func main() {
 	git.SetScriptConsentConfig(git.ScriptConsentConfig{
 		Policy:                 session.GetWorktreeSettings().ScriptConsentPolicy(),
 		AllowOverride:          allowRepoScripts,
+		PersistOverride:        allowRepoScripts && trustRepoScripts,
 		AllowInteractivePrompt: false,
 	})
 
@@ -855,6 +889,7 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
 		<-sigChan
+		closeTelemetryOnSignal()
 		stopHealth()
 		// Stop interval hooks and wait for their kill to land. Hook commands
 		// run in their own process groups — intentionally detached from the
@@ -884,6 +919,7 @@ func main() {
 		// Hand the outer terminal's cursor and pointer back if the embedded
 		// terminal owned them; deferred releases do not survive os.Exit.
 		runEmbeddedTerminalCleanup()
+		_ = events.CloseDefault()
 		os.Exit(0)
 	}()
 
@@ -975,10 +1011,11 @@ func main() {
 	// min-launches threshold for new users. Non-TUI subcommands (add, list,
 	// feedback, etc.) deliberately skip this so scripted usage doesn't
 	// inflate the counter.
-	// Opt-in usage telemetry: count the TUI launch (no-op without consent).
-	// Headless `web --no-tui` never boots the TUI and is not counted.
+	// Opt-in usage telemetry: from here on this process is the TUI (its
+	// app.start is recorded by the home model once the fleet is loaded).
+	// Headless `web --no-tui` never boots the TUI and records nothing here.
 	if !webHeadless {
-		telemetry.Record(telemetry.CounterTUILaunches)
+		telemetry.SetProcess(Version, telemetry.SurfaceTUI)
 	}
 
 	if fbSt, _ := feedback.LoadState(); fbSt != nil {
@@ -991,6 +1028,7 @@ func main() {
 
 	// Start TUI with the specified profile
 	homeModel := ui.NewHomeWithProfileAndMode(profile)
+	setTelemetrySignalClose(homeModel.CloseTelemetry)
 	// --group / --select were already extracted and validated above, before
 	// the no-TTY gate; apply them to the model now that it exists.
 	if groupScope != "" {
@@ -1268,6 +1306,10 @@ func main() {
 		)
 	}
 	p := tea.NewProgram(homeModel, programOptions...)
+	// Unapproved worktree hooks are asked about in a TUI dialog (the TUI owns
+	// the terminal, so the git layer cannot prompt on stdin here).
+	git.SetScriptConsentPrompter(ui.NewHookTrustPrompter(p.Send))
+	defer git.SetScriptConsentPrompter(nil)
 
 	// Start maintenance worker (background goroutine, respects config toggle)
 	maintenanceCtx, maintenanceCancel := context.WithCancel(context.Background())
@@ -1277,10 +1319,16 @@ func main() {
 	})
 
 	if _, err := p.Run(); err != nil {
+		homeModel.CloseTelemetry(telemetry.ExitPanic)
 		runEmbeddedTerminalCleanup()
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
+	exitKind := telemetry.ExitQuit
+	if _, ok := homeModel.RestartTarget(); ok {
+		exitKind = telemetry.ExitUpdateRestart
+	}
+	homeModel.CloseTelemetry(exitKind)
 
 	// In-place restart (restart_deck hotkey or auto_restart): the TUI has
 	// flushed its state and restored the terminal, so replace this process
@@ -1420,17 +1468,17 @@ var storeRootQuietCommands = map[string]bool{
 // (launch/add --parent, group move --position) is not shadowed by the global
 // profile flag. KEEP IN SYNC with the switch in main().
 var commandRegistry = map[string]bool{
-	"add": true, "accounts": true, "doctor": true, "health": true, "list": true, "ls": true, "remove": true, "rm": true,
+	"add": true, "accounts": true, "harness": true, "limits": true, "doctor": true, "health": true, "list": true, "ls": true, "remove": true, "rm": true,
 	"rename": true, "mv": true, "status": true, "profile": true, "update": true,
 	"session": true, "fleet": true, "mcp": true, "plugin": true, "skill": true, "mcp-proxy": true,
 	"group": true, "try": true, "launch": true, "conductor": true,
 	"agents": true, "agent": true,
 	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
-	"remote": true, "remote-agent": true, "system": true, "worktree": true, "wt": true, "costs": true, "usage": true, "web": true, "config": true, "recall": true,
+	"remote": true, "remote-agent": true, "system": true, "worktree": true, "wt": true, "costs": true, "events": true, "daemon": true, "usage": true, "web": true, "config": true, "recall": true,
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "tmux-hooks": true, "pi-hooks": true, "deepseek": true, "notify-daemon": true,
-	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true, "telemetry": true,
+	"run-task": true, "inbox": true, "feedback": true, "telemetry": true,
 	"debug-dump": true, "version": true, "--version": true, "-v": true,
 	"help": true, "--help": true, "-h": true, "completion": true,
 	"__complete": true,
@@ -1485,25 +1533,43 @@ func extractProfileFlag(args []string) (string, []string) {
 	return profile, remaining
 }
 
-// extractAllowRepoScriptsFlag extracts --allow-repo-scripts from args,
-// returning whether it was present and the args with it removed. Mirrors
-// extractNoTuiFlag's boolean-flag scan (web_cmd.go): supports bare
-// --allow-repo-scripts and --allow-repo-scripts=true/false/1.
-func extractAllowRepoScriptsFlag(args []string) (bool, []string) {
-	allow := false
-	remaining := make([]string, 0, len(args))
+// extractAllowRepoScriptsFlag extracts --run-hooks (and its pre-1.16.22
+// spelling --allow-repo-scripts) plus --trust from args, returning whether
+// each was present and the args with them removed. Mirrors
+// extractNoTuiFlag's boolean-flag scan (web_cmd.go): supports the bare flag
+// and =true/false/1. --trust is only consumed when a run-hooks flag is
+// present, so it never steals a --trust meant for another subcommand.
+func extractAllowRepoScriptsFlag(args []string) (allow, trust bool, remaining []string) {
+	isRunHooks := func(a string) (bool, bool) {
+		for _, name := range []string{"--run-hooks", "--allow-repo-scripts"} {
+			if a == name {
+				return true, true
+			}
+			if v, ok := strings.CutPrefix(a, name+"="); ok {
+				return true, v == "true" || v == "1"
+			}
+		}
+		return false, false
+	}
+	present := false
 	for _, a := range args {
-		switch {
-		case a == "--allow-repo-scripts":
-			allow = true
-		case strings.HasPrefix(a, "--allow-repo-scripts="):
-			v := strings.TrimPrefix(a, "--allow-repo-scripts=")
-			allow = v == "true" || v == "1"
-		default:
-			remaining = append(remaining, a)
+		if ok, _ := isRunHooks(a); ok {
+			present = true
 		}
 	}
-	return allow, remaining
+	remaining = make([]string, 0, len(args))
+	for _, a := range args {
+		if ok, v := isRunHooks(a); ok {
+			allow = v
+			continue
+		}
+		if present && a == "--trust" {
+			trust = true
+			continue
+		}
+		remaining = append(remaining, a)
+	}
+	return allow, trust, remaining
 }
 
 // extractGroupFlag extracts -g or --group from args, returning the group path and remaining args.
@@ -1832,7 +1898,7 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 	// Resume session flag
 	resumeSession := fs.String("resume-session", "", "Claude session ID to resume (skips new session creation)")
 	modelID := fs.String("model", "", "Model ID/version to use for this session (claude, codex, gemini, opencode)")
-	effort := fs.String("effort", "", "Reasoning effort for this session (claude: low, medium, high, xhigh, max; codex: minimal, low, medium, high, xhigh)")
+	effort := fs.String("effort", "", "Reasoning effort for this session (claude: low, medium, high, xhigh, max; codex: minimal, low, medium, high, xhigh, max, ultra)")
 	yoloMode := fs.Bool("yolo", false, "Enable YOLO mode for Gemini, Codex or Hermes sessions")
 	geminiYoloMode := fs.Bool("gemini-yolo", false, "Enable YOLO mode (alias for --yolo)")
 	claudeFlags := registerClaudeOptionFlags(fs) // the dialog's Claude Options rows
@@ -2282,7 +2348,7 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 			// Sparse state is inherited from `path` (the directory the user
 			// pointed at), never from backend.RepoDir() — see #1708.
 			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
-				git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), path),
+				wtSettings.CreateOptions(path),
 				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
 			if err != nil {
 				if isWorktreeAlreadyExistsError(err) {
@@ -2293,7 +2359,8 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 				fmt.Fprintf(os.Stderr, "Error: failed to create worktree: %v\n", err)
 				os.Exit(1)
 			}
-			if setupErr != nil {
+			// A skipped (unapproved) hook already printed its notice above.
+			if setupErr != nil && !errors.Is(setupErr, git.ErrWorktreeScriptNotApproved) {
 				fmt.Fprintf(os.Stderr, "Warning: worktree setup script failed: %v\n", setupErr)
 			}
 
@@ -2640,6 +2707,7 @@ func handleAddCommand(profile string, args []string, inspectFlags func(*flag.Fla
 			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
+		newInstance.RecordTelemetryCreate(telemetry.ViaCLIAdd)
 		newInstance.PostStartSync(3 * time.Second)
 		if err := storage.SaveWithGroups(instances, groupTree); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to save session state: %v\n", err)
@@ -2855,8 +2923,9 @@ func handleList(profile string, args []string) {
 		// reports the same Status the TUI and /api/menu do (issue #610).
 		statusStarted := time.Now()
 		tmuxBefore := tmux.SubprocessStarts()
-		session.RefreshInstancesForCLIStatus(instances)
-		output, err := buildListJSON(storage.Profile(), instances)
+		refresh, cached := session.CLIStatusCandidates(instances)
+		session.RefreshInstancesForCLIStatus(refresh)
+		output, err := buildListJSON(storage.Profile(), instances, cached)
 		statusElapsed := time.Since(statusStarted)
 		tmuxCalls := tmux.SubprocessStarts() - tmuxBefore
 		// #2331: this status pass is the one thing both the poll (`list
@@ -2921,7 +2990,11 @@ func emitListStats(elapsed time.Duration, tmuxCalls int64, sessions int) {
 // so a listing that arrives by push is byte-identical to one that was
 // fetched. Callers warm the status caches first
 // (session.RefreshInstancesForCLIStatus); an empty profile yields "[]".
-func buildListJSON(profileName string, instances []*session.Instance) ([]byte, error) {
+func buildListJSON(profileName string, instances []*session.Instance, cachedStatus ...map[*session.Instance]bool) ([]byte, error) {
+	var cached map[*session.Instance]bool
+	if len(cachedStatus) != 0 {
+		cached = cachedStatus[0]
+	}
 	type sessionJSON struct {
 		ID                string    `json:"id"`
 		ParentSessionID   string    `json:"parent_session_id,omitempty"`
@@ -2936,6 +3009,7 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 		Model             string    `json:"model,omitempty"`
 		ModelVersion      string    `json:"model_version,omitempty"`
 		Status            string    `json:"status"`
+		StatusSource      string    `json:"status_source,omitempty"`
 		Substate          string    `json:"substate,omitempty"`        // Honest Status v2: additive refinement
 		SubstateDetail    string    `json:"substate_detail,omitempty"` // free text for the substate (codex usage-limit retry time)
 		TmuxSession       string    `json:"tmux_session,omitempty"`
@@ -2946,6 +3020,7 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 		Channels          []string  `json:"channels,omitempty"`
 		ExtraArgs         []string  `json:"extra_args,omitempty"`
 		Color             string    `json:"color,omitempty"` // issue #391
+		Favorite          bool      `json:"favorite,omitempty"`
 		Archived          bool      `json:"archived"`
 		ArchivedAt        time.Time `json:"archived_at,omitempty"`
 		SupersededBy      string    `json:"superseded_by,omitempty"`
@@ -2968,11 +3043,16 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 	for i, inst := range instances {
 		// Listings need live status, not native-session discovery. Persisted
 		// rows have no status freshness stamp, so still validate liveness.
-		_ = pass.UpdateStatusOnly(inst)
+		if !cached[inst] {
+			_ = pass.UpdateStatusOnly(inst)
+		}
 		// The substate read is this pass's one pane capture and can settle
 		// the status it reads (hook lag, session/hook_lag.go): take it
 		// before the status so both describe the same frame.
-		substate := string(inst.Substate())
+		substate := ""
+		if !cached[inst] {
+			substate = string(inst.Substate())
+		}
 		parentProjectPath := listParentProjectPath(inst, instances)
 		sj := sessionJSON{
 			ID:                inst.ID,
@@ -2985,6 +3065,7 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 			Account:           inst.Account,
 			Command:           inst.Command,
 			Status:            StatusString(inst.Status),
+			StatusSource:      "live",
 			Substate:          substate,
 			SubstateDetail:    inst.SubstateDetail(),
 			Profile:           profileName,
@@ -2994,6 +3075,7 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 			Channels:          inst.Channels,
 			ExtraArgs:         inst.ExtraArgs,
 			Color:             inst.Color,
+			Favorite:          inst.Favorite,
 			Archived:          inst.IsArchived(),
 			ArchivedAt:        inst.ArchivedAt,
 			SupersededBy:      inst.SupersededBy,
@@ -3001,6 +3083,9 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 			CodexSessionID:    inst.CodexSessionID,
 			ResolvedCodexHome: inst.ResolvedCodexHome(),
 			LastActivityAt:    inst.DisplayLastActivityTime().Format(time.RFC3339Nano),
+		}
+		if cached[inst] {
+			sj.StatusSource = "cached"
 		}
 		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
 			sj.TmuxSession = tmuxSess.Name
@@ -3279,6 +3364,7 @@ func handleRemove(profile string, args []string) {
 		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	inst.RecordTelemetryEnd(telemetry.EndDelete)
 
 	// Best-effort post-removal cleanup for transition-notifier state
 	// (issue #910). Failures are warned but do not block the rm — the
@@ -4086,22 +4172,31 @@ func handleUpdate(args []string) {
 	// Perform update (direct binary replacement or Homebrew upgrade)
 	fmt.Println()
 	warnIfLaunchctlUnavailable()
+	// Opt-in telemetry: the outcome of this manual update (no-op without consent).
+	updateFailed := func() {
+		telemetry.UpdateAttempted(info.CurrentVersion, info.LatestVersion, telemetry.UpdateManual, telemetry.UpdateError, false)
+		telemetry.ErrorOccurred(telemetry.AreaUpdate, telemetry.KindOther, "")
+	}
 	if homebrewManaged {
 		if err := runHomebrewUpgradeWithRefresh(homebrewUpgradeCmd); err != nil {
+			updateFailed()
 			fmt.Printf("Error installing update via Homebrew: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
 		release, err := update.FetchReleaseByTag(info.LatestVersion)
 		if err != nil {
+			updateFailed()
 			fmt.Printf("Error installing update: failed to fetch release info: %v\n", err)
 			os.Exit(1)
 		}
 		if err := update.PerformVerifiedUpdate(release, runtime.GOOS, runtime.GOARCH); err != nil {
+			updateFailed()
 			fmt.Printf("Error installing update: %v\n", err)
 			os.Exit(1)
 		}
 	}
+	telemetry.UpdateAttempted(info.CurrentVersion, info.LatestVersion, telemetry.UpdateManual, telemetry.UpdateOK, false)
 
 	// Update bridge.py if conductor is installed
 	if err := update.UpdateBridgePy(); err != nil {
@@ -4346,6 +4441,8 @@ func printHelp() {
 	fmt.Println("  add <path>       Add a new session")
 	fmt.Println("  launch [path]    Add, start, and optionally send a message in one step")
 	fmt.Println("  accounts         List configured named account slots")
+	fmt.Println("  harness          Installed harnesses, login and hook state, install/login commands [--json]")
+	fmt.Println("  limits           Claude 5h/7d and Codex weekly usage per account [--json] ([macapp] plugins)")
 	fmt.Println("  doctor           Check accounts and runtime health")
 	fmt.Println("  health           Runtime health snapshots and budgets [--json] [--since 1h]")
 	fmt.Println("  try <name>       Quick experiment (create/find dated folder + session)")
@@ -4805,6 +4902,9 @@ func handleUninstall(args []string) {
 		return
 	}
 
+	// Opt-in telemetry: the one synchronous send, only with consent.
+	maybeSendUninstallTelemetry(os.Stdin, os.Stdout, !*yes)
+
 	fmt.Println("Uninstalling...")
 	fmt.Println()
 
@@ -5026,6 +5126,7 @@ func isOuterTmuxWithoutOptIn() bool {
 
 func ensureTmuxInPathOrExit() {
 	if err := ensureTmuxInPath(); err != nil {
+		telemetry.ErrorOccurred(telemetry.AreaTmux, telemetry.KindTmuxMissing, "")
 		fmt.Fprintln(os.Stderr, "Error: tmux not found")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Agent Deck requires tmux. Install with:")

@@ -96,7 +96,9 @@ agent-deck launch -g book-keeper -c claude   # no path: lands on the group's def
 Notes:
 - `[path]` omitted: resolves the target group's `default_path`, then the global `default_path` config key, then cwd — the same chain as `add` (#1303). An explicit `.` always means the current directory.
 - `--account <name>` selects a named slot from `[profiles.<name>.claude].config_dir` for this session, matching `add --account`.
-- `--model <id>` and `--effort <level>` are the per-session overrides behind the TUI's Model ID and Reasoning effort rows (also on `add`). Effort levels: claude `low|medium|high|xhigh|max`, codex `minimal|low|medium|high|xhigh`; other tools refuse the flag. Both are echoed in `--json` output (`model`, `effort`) and by `session show --json`.
+- `--model <id>` and `--effort <level>` are the per-session overrides behind the TUI's Model ID and Reasoning effort rows (also on `add`). Effort levels: claude `low|medium|high|xhigh|max`, codex `minimal|low|medium|high|xhigh|max|ultra` plus any level the installed Codex advertises; other tools refuse the flag. When the installed Codex describes the chosen `--model`, only that model's levels are accepted. Both are echoed in `--json` output (`model`, `effort`) and by `session show --json`.
+- `--model` accepts any ID: the model lists are suggestions, not an allowlist, and an ID the list lacks is passed to the tool as is.
+- `launch -capabilities --json` (and `add -capabilities --json`) prints what this host can create: per tool `models`, `default_model`, `reasoning_efforts` and, when the installed CLI was probed, `model_efforts` (model ID to accepted efforts). For Codex the lists come from `codex debug models` (models with `visibility: list`, by priority) merged in front of the built-in catalog; Claude Code, Gemini and the rest use the built-in catalog. The probe never sends a prompt, times out after about 1s, and its result is cached per CLI binary (path, mtime, size) in the cache dir (`model-probe/<tool>.json`) for up to a day. A missing CLI, a timeout, a non-zero exit or unrecognized output falls back to the built-in catalog; a failed probe is not cached on disk and is retried after about a minute. Remote hosts report their own lists through their own `-capabilities`. Turn the probe off with `[models] probe = false`.
 - `--account` requires an explicit name. If the next token is another launch flag, launch stops with an error before resolving a fallback account or creating a session; use `--account=<name>` when a name intentionally begins with a dash.
 - `--hint/--tag/--ticket/--why` (also on `add`): durable recall hints written to state.db at creation (`docs/recall.md`). `launch` additionally derives `purpose` from the first line of `-m` and both commands derive `parent` for a child; an explicit `--hint purpose=` wins. Echoed in `--json` as `hints` and `tags`.
 - `--no-identity` (also on `add`): skip the harness identity injection for this session only. By default every spawn tells the model it runs inside agent-deck, its session metadata and how to use the CLI (`[launch] inject_identity` in config-reference.md, `documentation/HARNESS_IDENTITY.md`). Persisted, so restarts honour it.
@@ -216,6 +218,7 @@ agent-deck web [options]
 | `--listen` | Listen address (default: `127.0.0.1:8420`) |
 | `--read-only` | Disable terminal input, stream output only |
 | `--token` | Require bearer token for API and WS access |
+| `--push` | Enable browser push notifications (turn them on in the web UI's Tweaks panel → Notifications) |
 | `--open` | Reserved placeholder (currently no-op) |
 
 ```bash
@@ -410,6 +413,8 @@ agent-deck session send <id|title> --message-file <file|-> [--wait|--stream|--no
 
 Use `--message-file` for long or multiline messages, or `--message-file -` for stdin. Do not combine it with an inline message.
 
+`--json` on its own (no `--wait`, `--stream`, `--no-wait`, `--draft` or `--defer-if-busy`) returns at once with the queued record (`send_id`, `state`, `verdict`) plus the sync keys `success`, `delivery:"queued"`, `submitted:false`, `confirmation:"unknown"`; `session send-status <send_id> --json` follows it to `delivered`/`unknown`. Claude accepts the message while busy; Codex, Pi, shell and unknown harnesses are typed when idle.
+
 ```bash
 git diff | agent-deck session send my-project --message-file -
 agent-deck session send my-project --message-file task.md --wait
@@ -433,6 +438,8 @@ Delivery verdict (`--json` also carries `delivery` and a machine-checkable `subm
 - `line_too_long`, `menu_open`, `pane_gone`, `typed_not_submitted`, `no_evidence`, `send_failed`, `composer_blocked`, `socket_write_failed` (exit 1, `confirmation: "failed"`, `code: DELIVERY_FAILED`): not delivered on positive evidence (a gone pane, a composer still holding the body, an open menu) — see the error text for whether a retry is safe. (There is no `typed` verdict — that pre-#1793 catch-all was replaced by `delivered`/`unverified` above so the exit code follows the evidence instead of its absence.)
 
 With `--wait` or `--stream` on a Claude target, the reply is bound to the transcript record of this exact message: a message queued behind a live turn waits for its own turn to start, the read begins after that record, and it stops at the next human prompt (an interrupted turn is reported as incomplete or as a stream error, not as the next turn's answer). Slash commands and non-Claude tools keep the timestamp-based best-effort reply.
+
+Claude conversation identity (additive; Claude-compatible targets only, other tools' receipts are unchanged): `--json` receipts carry `claude_session_id`, the native Claude conversation the message went to (the same value `session show --json` and `session output --json` report), omitted while it is not known yet (a fresh session before Claude writes its transcript). The queued `--json` receipt and `session send-status --json` carry it too; once the send has `landed` it names the conversation whose transcript holds `landed_row_id`. A `--json --wait` reply bound to its transcript record also carries `claude_turn_uuid`, the uuid of that user record, and `claude_session_id` from the same record; it is the Claude counterpart of Codex's `accepted_turn.codex_session_id` + `codex_turn_generation`.
 
 ### session approve
 
@@ -741,6 +748,18 @@ agent-deck worktree cleanup [--force]
 ```
 
 Finds orphaned worktrees/sessions. Dry-run by default; `--force` performs the cleanup.
+
+### worktree trust-hooks
+
+```bash
+agent-deck worktree trust-hooks <repo> [--hook setup|destruction] [--yes] [--revoke]
+```
+
+Reviews and approves the repository's `.agent-deck/worktree-setup.sh` / `worktree-destruction.sh`. Each hook is printed first (path, symlink target, command, sha256, first 20 lines). On a terminal it asks y/N; without one it refuses unless `--yes` is given. `--hook` limits it to one hook; `--revoke` forgets the approvals. `trust-scripts` is the older name and still works.
+
+An approval is bound to the script's bytes, resolved path and interpreter (executable via `#!` vs `sh -e`); any change asks again. Unapproved hooks are skipped by `launch -w`, `add -w`, `worktree finish` and the other worktree commands when there is no terminal to ask on, with a one-line notice naming this command.
+
+Global flags for one invocation: `--run-hooks` (older name `--allow-repo-scripts`, env `AGENT_DECK_ALLOW_REPO_SCRIPTS=1`) runs unapproved hooks after printing their sha256 and records nothing; add `--trust` to record the version that ran.
 
 ## MCP Commands
 

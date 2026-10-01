@@ -80,7 +80,13 @@ func buildCreationCatalog(profile string) (*session.RemoteCreationCatalog, error
 		} else if session.IsCodexCompatible(name) {
 			kind = "codex"
 		}
-		tool := session.RemoteCreationTool{Name: name, Kind: kind, Models: session.KnownModelIDsForTool(kind)}
+		tool := session.RemoteCreationTool{
+			Name:             name,
+			Kind:             kind,
+			Models:           session.KnownModelIDsForTool(kind),
+			ReasoningEfforts: session.LaunchReasoningEffortsForTool(kind),
+			ModelEfforts:     session.LaunchModelEffortsForTool(kind),
+		}
 		switch kind {
 		case "claude":
 			tool.DefaultModel = cfg.Claude.DefaultModel
@@ -226,7 +232,7 @@ func applyCreationExtras(inst *session.Instance, query string, additional []stri
 		}
 	}()
 	if branch != "" {
-		result, createErr := session.CreateMultiRepoWorktreesStrictWithOptions(allPaths, parent, branch, wtSettings.SetupTimeout(), wtSettings.InheritSparseCheckout())
+		result, createErr := session.CreateMultiRepoWorktreesStrictWithOptions(allPaths, parent, branch, wtSettings)
 		inst.MultiRepoWorktrees = result.Worktrees
 		if createErr != nil {
 			return createErr

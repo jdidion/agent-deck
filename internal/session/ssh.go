@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
+	"github.com/asheshgoplani/agent-deck/internal/terminal"
 	"github.com/asheshgoplani/agent-deck/internal/termreply"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
@@ -36,6 +37,12 @@ const sshAttachReplyQuarantine = 500 * time.Millisecond
 
 // Bound draining pipes inherited by a surviving SSH ControlPersist process.
 const sshWaitDelay = 100 * time.Millisecond
+
+// sshMuxFallbackGrace is how long a read-only command waits, after the shared
+// ControlMaster refuses its session, for OpenSSH's own in-call direct fallback
+// before opening a dedicated connection (#2355). A healthy fallback lands in a
+// few seconds even on a saturated master, and racing it only adds a login.
+const sshMuxFallbackGrace = 8 * time.Second
 
 // sshControlDir is the directory for SSH ControlMaster sockets.
 const sshControlDir = "/tmp/agent-deck-ssh"
@@ -205,6 +212,11 @@ type SSHRunner struct {
 
 	// nudgeFn lets tests stub NudgeCheckNow without spawning ssh. nil = real SSH.
 	nudgeFn func(ctx context.Context) error
+
+	// transport and moshServer choose how interactive attaches reach the
+	// host (see RemoteConfig.Transport). Empty transport means SSH.
+	transport  string
+	moshServer string
 }
 
 // NewSSHRunner creates an SSHRunner from a RemoteConfig.
@@ -217,6 +229,8 @@ func NewSSHRunner(name string, rc RemoteConfig) *SSHRunner {
 		commandTimeout: rc.GetCommandTimeout(),
 		name:           name,
 		lastStderr:     &lastStderrBox{},
+		transport:      rc.GetTransport(),
+		moshServer:     strings.TrimSpace(rc.MoshServer),
 	}
 }
 
@@ -308,39 +322,201 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 	_ = os.MkdirAll(sshControlDir, 0700)
 
 	remoteCmd := r.buildRemoteCommand(args...)
-	sshArgs := r.sshBaseArgs(remoteCmd)
+	return r.runExec(ctx, remoteCmd, remoteVerbReadOnly(args))
+}
 
-	cmd := exec.CommandContext(ctx, "ssh", sshArgs...)
-	cmd.WaitDelay = sshWaitDelay
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if detail := strings.TrimSpace(stderr.String()); detail != "" {
-		level := slog.LevelDebug
-		if err != nil {
-			level = slog.LevelWarn
+// runExec runs one remote command over the shared ControlMaster and, when the
+// command is read-only and the master has no channels left, retries once on a
+// dedicated connection.
+//
+// sshd caps concurrent channels per connection at MaxSessions. When its
+// ControlMaster refuses a session, ssh reports that refusal on stderr (#2355).
+//
+// Only read-only verbs are retried. A refusal is not proof that nothing ran:
+// OpenSSH can fall back to a direct connection within the same invocation, so a
+// mutating verb that ran and then exited nonzero would be executed twice. This
+// matches the read-only gate already used when a channel reply is lost
+// (errChannelInterrupted). The status poll's commands (list, costs summary,
+// group list) are all read-only, so this still covers the failure users see.
+func (r *SSHRunner) runExec(ctx context.Context, remoteCmd string, readOnly bool) ([]byte, error) {
+	var stdout, stderr []byte
+	var err error
+	retried := false
+	if readOnly {
+		// OpenSSH may print the mux refusal, then try a fresh connection inside
+		// the same ssh process. That fallback can consume the whole deadline.
+		// Observe stderr while ssh runs so the dedicated attempt still has time.
+		sharedCtx, cancel := context.WithCancel(ctx)
+		type result struct {
+			stdout, stderr []byte
+			err            error
 		}
-		sessionLog.Log(ctx, level, "ssh_command_stderr", slog.String("remote", r.name), slog.String("stderr", detail))
+		finished := make(chan result, 1)
+		refused := make(chan struct{}, 1)
+		go func() {
+			out, detail, runErr := r.execSSH(sharedCtx, r.sshBaseArgs(remoteCmd), refused)
+			finished <- result{out, detail, runErr}
+		}()
+	attempt:
+		select {
+		case first := <-finished:
+			stdout, stderr, err = first.stdout, first.stderr, first.err
+		case <-refused:
+			// Give OpenSSH's own fallback a chance first. A shared attempt that
+			// finishes inside the grace takes the completed-refusal path below,
+			// so a healthy fallback never pays for an extra connection.
+			grace := time.NewTimer(muxFallbackGrace(ctx))
+			select {
+			case first := <-finished:
+				grace.Stop()
+				stdout, stderr, err = first.stdout, first.stderr, first.err
+				break attempt
+			case <-grace.C:
+			case <-ctx.Done():
+				grace.Stop()
+			}
+			if ctx.Err() != nil {
+				first := <-finished
+				stdout, stderr, err = first.stdout, first.stderr, first.err
+				break
+			}
+			retried = true
+			dedicatedCtx, dedicatedCancel := context.WithCancel(ctx)
+			dedicated := make(chan result, 1)
+			go func() {
+				out, detail, runErr := r.execSSH(dedicatedCtx, r.dedicatedSSHArgs(remoteCmd), nil)
+				dedicated <- result{out, detail, runErr}
+			}()
+			var retry result
+			sharedPending, dedicatedPending := true, true
+			recovered := false
+		recovery:
+			for sharedPending || dedicatedPending {
+				select {
+				case first := <-finished:
+					sharedPending = false
+					if first.err == nil {
+						dedicatedCancel()
+						if dedicatedPending {
+							<-dedicated
+						}
+						stdout, stderr, err = first.stdout, first.stderr, nil
+						recovered = true
+						break recovery
+					}
+				case retry = <-dedicated:
+					dedicatedPending = false
+					if retry.err == nil {
+						cancel()
+						if sharedPending {
+							<-finished
+						}
+						stdout, stderr, err = retry.stdout, retry.stderr, nil
+						recovered = true
+						break recovery
+					}
+				}
+			}
+			if !recovered {
+				stdout, stderr, err = retry.stdout, retry.stderr, retry.err
+			}
+			dedicatedCancel()
+		}
+		cancel()
+	} else {
+		stdout, stderr, err = r.execSSH(ctx, r.sshBaseArgs(remoteCmd), nil)
 	}
+	if !retried && err != nil && ctx.Err() == nil && readOnly && isSSHChannelExhaustion(string(stderr)) {
+		out, retryStderr, retryErr := r.execSSH(ctx, r.dedicatedSSHArgs(remoteCmd), nil)
+		if retryErr == nil {
+			r.logSSHStderr(ctx, retryStderr, false)
+			r.setLastStderr(retryStderr)
+			return out, nil
+		}
+		// The dedicated attempt is the one that matters: report its result,
+		// not the superseded shared-master failure it replaced.
+		stdout, stderr, err = out, retryStderr, retryErr
+	}
+	r.logSSHStderr(ctx, stderr, err != nil)
 	if err != nil {
 		// The remote CLI reports refusals such as "path does not exist" on
 		// stdout; fall back to it so the failure is not a bare exit status.
 		// stdout is returned as well: a --json verb that exits non-zero
 		// (switch-preview refusal, switch failure) still answered there.
-		detail := stderr.String()
-		if strings.TrimSpace(detail) == "" {
-			detail = strings.TrimSpace(stdout.String())
+		detail := stderr
+		if strings.TrimSpace(string(detail)) == "" {
+			detail = bytes.TrimSpace(stdout)
 		}
 		if ctx.Err() != nil {
 			err = ctx.Err()
 		}
-		return stdout.Bytes(), fmt.Errorf("ssh command failed: %w: %s", err, detail)
+		return stdout, fmt.Errorf("ssh command failed: %w: %s", err, detail)
 	}
 
-	r.setLastStderr(stderr.Bytes())
-	return stdout.Bytes(), nil
+	r.setLastStderr(stderr)
+	return stdout, nil
+}
+
+// muxFallbackGrace bounds the wait for OpenSSH's own fallback to half the
+// remaining deadline, so the dedicated attempt keeps the other half.
+func muxFallbackGrace(ctx context.Context) time.Duration {
+	grace := sshMuxFallbackGrace
+	if deadline, ok := ctx.Deadline(); ok {
+		grace = min(grace, time.Until(deadline)/2)
+	}
+	return grace
+}
+
+// execSSH runs one ssh invocation and returns stdout, stderr and the exit error.
+func (r *SSHRunner) execSSH(ctx context.Context, args []string, refused chan<- struct{}) ([]byte, []byte, error) {
+	cmd := exec.CommandContext(ctx, "ssh", args...)
+	cmd.WaitDelay = sshWaitDelay
+	var stdout bytes.Buffer
+	stderr := &sshStderrCapture{refused: refused}
+	cmd.Stdout = &stdout
+	cmd.Stderr = stderr
+	err := cmd.Run()
+	return stdout.Bytes(), stderr.buf.Bytes(), err
+}
+
+type sshStderrCapture struct {
+	buf     bytes.Buffer
+	refused chan<- struct{}
+	emitted bool
+}
+
+func (s *sshStderrCapture) Write(p []byte) (int, error) {
+	n, err := s.buf.Write(p)
+	if !s.emitted && s.refused != nil && isSSHChannelExhaustion(s.buf.String()) {
+		s.emitted = true
+		s.refused <- struct{}{}
+	}
+	return n, err
+}
+
+// logSSHStderr records an ssh run's stderr at debug (success) or warn (failure).
+func (r *SSHRunner) logSSHStderr(ctx context.Context, stderr []byte, failed bool) {
+	if detail := strings.TrimSpace(string(stderr)); detail != "" {
+		level := slog.LevelDebug
+		if failed {
+			level = slog.LevelWarn
+		}
+		sessionLog.Log(ctx, level, "ssh_command_stderr", slog.String("remote", r.name), slog.String("stderr", detail))
+	}
+}
+
+// dedicatedSSHArgs keeps the normal connection options and host config while
+// disabling reuse of the saturated ControlMaster for this one attempt.
+func (r *SSHRunner) dedicatedSSHArgs(remoteCmd string) []string {
+	return append([]string{"-o", "ControlPath=none"}, r.sshBaseArgs(remoteCmd)...)
+}
+
+// isSSHChannelExhaustion recognizes the OpenSSH mux client's session-open
+// refusal. Generic "open failed" can describe forwarding or other channels;
+// "no more sessions" is an sshd log message, not proof in client stderr.
+func isSSHChannelExhaustion(stderr string) bool {
+	d := strings.ToLower(stderr)
+	return strings.Contains(d, "mux_client_request_session: session request failed: session open refused by peer")
 }
 
 // lastStderrBox is lastStderr's storage: a pointer field on SSHRunner so
@@ -384,7 +560,7 @@ func (r *SSHRunner) consumeLastStderr() []byte {
 // PTY in sync when the local terminal is resized, and sends SIGWINCH to
 // self on detach so Bubble Tea re-queries the terminal size.
 func (r *SSHRunner) Attach(sessionID string) error {
-	return r.attachSSHArgs(r.buildAttachArgs(sessionID))
+	return r.attachInteractive("session", "attach", sessionID)
 }
 
 // RunInteractiveCreation uses the same PTY flow as ordinary remote attach.
@@ -393,20 +569,66 @@ func (r *SSHRunner) RunInteractiveCreation(args ...string) error {
 	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
 		return fmt.Errorf("remote creation attach requires an interactive terminal")
 	}
-	remoteCmd := "env TERM=" + shellQuote(remoteAttachTERM()) + " " + r.buildRemoteCommand(args...)
-	sshArgs := append([]string{"-tt"}, r.sshConnOpts()...)
-	sshArgs = append(sshArgs, r.Host, remoteCmd)
-	return r.attachSSHArgs(sshArgs)
+	return r.attachInteractive(args...)
 }
 
-func (r *SSHRunner) attachSSHArgs(sshArgs []string) error {
-	if err := ValidateSSHHost(r.Host); err != nil {
+// attachInteractive runs an agent-deck command on the remote in a local PTY,
+// over the remote's configured transport.
+func (r *SSHRunner) attachInteractive(args ...string) error {
+	cmd, transport, err := r.attachCommand(args...)
+	if err != nil {
 		return err
 	}
+	return runRemoteAttach(cmd, transport)
+}
+
+// moshServerProbeTimeout bounds the pre-attach check that the remote can
+// start mosh-server. It runs over the ControlMaster, so it is normally one
+// multiplexed round trip.
+const moshServerProbeTimeout = 10 * time.Second
+
+// attachCommand picks the interactive transport command for args. A mosh
+// remote whose host cannot start mosh-server (not installed, or not on the
+// non-login PATH) attaches over ssh instead of failing with mosh's bootstrap
+// errors; a missing local mosh is still an error because only the user can
+// fix it.
+func (r *SSHRunner) attachCommand(args ...string) (*exec.Cmd, string, error) {
+	if err := ValidateSSHHost(r.Host); err != nil {
+		return nil, "", err
+	}
+	switch r.transport {
+	case "", RemoteTransportSSH:
+	case RemoteTransportMosh:
+		mosh, err := exec.LookPath("mosh")
+		if err != nil {
+			return nil, "", fmt.Errorf("remote %q uses transport = \"mosh\", but mosh is not installed on this machine: %w", r.name, err)
+		}
+		if r.remoteHasMoshServer() {
+			// #nosec G204 -- mosh is resolved from PATH and every operand is a
+			// discrete argv element (no shell); the host was validated above.
+			return exec.Command(mosh, r.moshAttachArgs(args...)...), RemoteTransportMosh, nil
+		}
+		sessionLog.Warn("mosh_server_unavailable_attaching_over_ssh", slog.String("remote", r.name))
+	default:
+		return nil, "", fmt.Errorf("remote %q has unknown transport %q (use \"ssh\" or \"mosh\")", r.name, r.transport)
+	}
 	_ = os.MkdirAll(sshControlDir, 0700)
+	// #nosec G204 -- fixed binary; the host was validated above and the
+	// remote command is built from shellQuote'd operands.
+	return exec.Command("ssh", r.sshAttachArgs(args...)...), RemoteTransportSSH, nil
+}
 
-	cmd := exec.Command("ssh", sshArgs...)
+// remoteHasMoshServer reports whether the remote can start mosh-server.
+func (r *SSHRunner) remoteHasMoshServer() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), moshServerProbeTimeout)
+	defer cancel()
+	_, err := r.remoteExec(ctx, terminal.MoshServerProbe(r.moshServer), nil)
+	return err == nil
+}
 
+// runRemoteAttach runs an interactive transport command (ssh or mosh) in a
+// local PTY until it exits or the user detaches.
+func runRemoteAttach(cmd *exec.Cmd, transport string) error {
 	// Start SSH with a local PTY pre-sized to the controlling terminal so the
 	// remote tmux client connects full-width from frame one (#1167). A bare
 	// pty.Start creates the PTY at the 80x24 default, which can size the remote
@@ -414,9 +636,16 @@ func (r *SSHRunner) attachSSHArgs(sshArgs []string) error {
 	// Shares the local-attach helper so both paths size identically.
 	ptmx, err := tmux.StartAttachPTY(cmd, os.Stdin)
 	if err != nil {
-		return fmt.Errorf("failed to start ssh with pty: %w", err)
+		return fmt.Errorf("failed to start %s with pty: %w", transport, err)
 	}
-	defer ptmx.Close()
+	// A mosh detach hands the PTY to a background quit (see below), which
+	// closes it once mosh-client has exited.
+	ptyHandedOff := false
+	defer func() {
+		if !ptyHandedOff {
+			_ = ptmx.Close()
+		}
+	}()
 
 	// Set the PTY slave to raw mode so all bytes pass through transparently.
 	if _, err := term.MakeRaw(int(ptmx.Fd())); err != nil {
@@ -465,13 +694,14 @@ func (r *SSHRunner) attachSSHArgs(sshArgs []string) error {
 	detachCh := make(chan struct{})
 	input := sshAttachInput{writer: ptmx}
 	outputDone := make(chan struct{})
+	output := &attachOutput{w: os.Stdout}
 
 	// Copy PTY output to stdout.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(outputDone)
-		_, _ = io.Copy(os.Stdout, ptmx)
+		_, _ = io.Copy(output, ptmx)
 	}()
 
 	// Read stdin, intercept Ctrl+Q (all encodings), forward the rest.
@@ -542,9 +772,11 @@ func (r *SSHRunner) attachSSHArgs(sshArgs []string) error {
 
 	// Block until detach or SSH exit.
 	var attachErr error
+	exited := false
 	select {
 	case <-detachCh:
 	case attachErr = <-cmdDone:
+		exited = true
 	}
 
 	// Cleanup: close PTY and wait for output to drain.
@@ -553,14 +785,7 @@ func (r *SSHRunner) attachSSHArgs(sshArgs []string) error {
 	// closed PTY, losing it. Mirrors cleanupAttach in internal/tmux/pty.go,
 	// which cancels the pump before closing the PTY.
 	close(stdinReaderStop)
-	_ = ptmx.Close()
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	select {
-	case <-outputDone:
-	case <-time.After(50 * time.Millisecond):
-	}
+	ptyHandedOff = stopRemoteAttach(cmd, ptmx, cmdDone, outputDone, output, transport, exited, terminal.MoshQuitTimeout)
 	// Hand stdin back to the TUI: drop whatever the remote's teardown left in
 	// the input queue and arm the reply quarantine. The join-before-flush
 	// ordering is the load-bearing invariant here, so this calls the same
@@ -584,9 +809,64 @@ func (r *SSHRunner) attachSSHArgs(sshArgs []string) error {
 	}
 
 	if attachErr = input.result(attachErr); attachErr != nil {
-		return fmt.Errorf("ssh attach failed: %w", attachErr)
+		return fmt.Errorf("%s attach failed: %w", transport, attachErr)
 	}
 	return nil
+}
+
+// stopRemoteAttach ends the transport once the attach loop has returned. It
+// reports whether it handed the PTY to a background quit, which then owns
+// closing it.
+func stopRemoteAttach(cmd *exec.Cmd, ptmx *os.File, cmdDone <-chan error, outputDone <-chan struct{}, output *attachOutput, transport string, exited bool, quitTimeout time.Duration) bool {
+	if transport == RemoteTransportMosh && !exited && cmd.Process != nil {
+		// SIGTERM, not a kill (see terminal.MoshQuitTimeout). The quit takes a
+		// network round trip, so finish it in the background with the output
+		// discarded and hand the terminal back now.
+		output.discard()
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+		go func() {
+			select {
+			case <-cmdDone:
+			case <-time.After(quitTimeout):
+				_ = cmd.Process.Kill()
+			}
+			_ = ptmx.Close()
+		}()
+		return true
+	}
+	_ = ptmx.Close()
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	select {
+	case <-outputDone:
+	case <-time.After(50 * time.Millisecond):
+	}
+	return false
+}
+
+// attachOutput forwards attach output to the terminal until discard is
+// called, after which it swallows it so a transport winding down in the
+// background cannot draw over the dashboard.
+type attachOutput struct {
+	mu        sync.Mutex
+	w         io.Writer
+	discarded bool
+}
+
+func (o *attachOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.discarded {
+		return len(p), nil
+	}
+	return o.w.Write(p)
+}
+
+func (o *attachOutput) discard() {
+	o.mu.Lock()
+	o.discarded = true
+	o.mu.Unlock()
 }
 
 // sshAttachInput owns input forwarding and intentional-detach state for one attach.
@@ -683,6 +963,15 @@ func (r *SSHRunner) buildRemoteCommand(args ...string) string {
 		parts = append(parts, shellQuote(arg))
 	}
 	return strings.Join(parts, " ")
+}
+
+// remoteArgv is buildRemoteCommand's command as unquoted argv.
+func (r *SSHRunner) remoteArgv(args ...string) []string {
+	argv := []string{r.AgentDeckPath}
+	if r.Profile != "" && r.Profile != "default" {
+		argv = append(argv, "-p", r.Profile)
+	}
+	return append(argv, args...)
 }
 
 // FetchSessions retrieves the session list from the remote agent-deck
@@ -2056,9 +2345,21 @@ func remoteVerbReadOnly(args []string) bool {
 // ConnectTimeout, so an unknown host key could hang on a prompt instead of
 // failing fast). "-tt" forces a remote PTY.
 func (r *SSHRunner) buildAttachArgs(sessionID string) []string {
-	remoteCmd := "env TERM=" + shellQuote(remoteAttachTERM()) + " " + r.buildRemoteCommand("session", "attach", sessionID)
-	args := append([]string{"-tt"}, r.sshConnOpts()...)
-	return append(args, r.Host, remoteCmd)
+	return r.sshAttachArgs("session", "attach", sessionID)
+}
+
+// sshAttachArgs is the ssh argv that runs an agent-deck command on a remote PTY.
+func (r *SSHRunner) sshAttachArgs(args ...string) []string {
+	remoteCmd := "env TERM=" + shellQuote(remoteAttachTERM()) + " " + r.buildRemoteCommand(args...)
+	sshArgs := append([]string{"-tt"}, r.sshConnOpts()...)
+	return append(sshArgs, r.Host, remoteCmd)
+}
+
+// moshAttachArgs is the mosh argv that runs an agent-deck command on the
+// remote. TERM is left to mosh-server, which names the terminal mosh emulates
+// rather than whatever the local one is.
+func (r *SSHRunner) moshAttachArgs(args ...string) []string {
+	return terminal.MoshArgs(r.Host, r.moshServer, r.remoteArgv(args...))
 }
 
 // Modern local terminals may name terminfo entries absent on the SSH host.

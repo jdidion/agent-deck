@@ -18,6 +18,8 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/asheshgoplani/agent-deck/internal/harness"
+
 	dark "github.com/thiagokokada/dark-mode-go"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
@@ -172,6 +174,9 @@ type UserConfig struct {
 	// Codex defines Codex CLI integration settings
 	Codex CodexSettings `toml:"codex,omitempty"`
 
+	// Models controls how model and reasoning-effort suggestions are built (#2388)
+	Models ModelsSettings `toml:"models,omitempty"`
+
 	// Cursor defines Cursor Agent CLI integration settings (Issue #1672)
 	Cursor CursorSettings `toml:"cursor,omitempty"`
 
@@ -299,6 +304,42 @@ type UserConfig struct {
 
 	// Performance holds opt-in resource tuning for multi-instance setups.
 	Performance PerformanceSettings `toml:"performance,omitempty"`
+
+	// Core holds the one-core registry and daemon switches (docs/core-registry.md).
+	Core CoreSettings `toml:"core,omitempty"`
+
+	// Macapp holds the switches for the Mac app surface (docs/macapp-core.md).
+	Macapp MacappSettings `toml:"macapp,omitempty"`
+
+	// Harnesses overrides the core install/login table per harness
+	// ([harnesses.<name>] binary, install_command, login_command, docs_url).
+	Harnesses map[string]harness.Override `toml:"harnesses,omitempty"`
+}
+
+// MacappSettings is the [macapp] section. Everything is off by default.
+type MacappSettings struct {
+	// Plugins enables the plugin-facing commands: `limits --json` and the
+	// macapp.* namespace of `events publish`.
+	Plugins bool `toml:"plugins,omitempty"`
+
+	// TranscriptEvents makes the notify daemon publish a session.transcript
+	// bus frame whenever a live session's native transcript grows, so a
+	// client never stats transcript files itself.
+	TranscriptEvents bool `toml:"transcript_events,omitempty"`
+
+	// StatusEvents makes every status owner (TUI poller, notify daemon)
+	// publish session.status and session.turn bus frames when it writes a
+	// status transition to state.db.
+	StatusEvents bool `toml:"status_events,omitempty"`
+}
+
+// CoreSettings is the [core] section.
+type CoreSettings struct {
+	// Daemon routes --json=envelope requests of registry commands through the
+	// profile's `agent-deck daemon serve` when one answers; the CLI runs them
+	// in process when none does. Default false: direct mode, the socket is
+	// never dialled (docs/daemon-protocol.md).
+	Daemon bool `toml:"daemon,omitempty"`
 }
 
 // SelfHealSettings controls the self-heal supervision policy (SELF-HEAL-DESIGN.md
@@ -935,6 +976,9 @@ func (u UISettings) GetRemoteLatencyRefreshSecs(fallbackSecs int) int {
 
 // WebSettings configures the `agent-deck web` HTTP server.
 type WebSettings struct {
+	// AllowedHosts adds exact HTTP Host names for reverse proxies and Serve.
+	// An entry may include a port; no port allows any port on that host.
+	AllowedHosts []string `toml:"allowed_hosts,omitempty"`
 	// MutationsEnabled controls whether POST/PATCH/DELETE endpoints accept
 	// requests. nil (omitted) defaults to true. Forced off by --read-only.
 	MutationsEnabled *bool `toml:"mutations_enabled,omitempty"`
@@ -969,9 +1013,18 @@ type TelemetrySettings struct {
 	// AGENTDECK_TELEMETRY=0. It cannot enable telemetry.
 	Disabled bool `toml:"disabled,omitempty"`
 
-	// Endpoint overrides the HTTPS receiver URL for self-hosting. Plain http
-	// is accepted only for localhost. Empty uses the compiled-in default.
+	// Endpoint overrides the receiver base URL (default PostHog Cloud EU,
+	// https://eu.i.posthog.com; uploads go to <endpoint>/batch/). Plain http
+	// is accepted only for localhost. Changing it requires fresh consent.
 	Endpoint string `toml:"endpoint,omitempty"`
+
+	// PostHogKey is the PostHog project API key (phc_...), used only by
+	// builds without a compiled-in key, after AGENTDECK_POSTHOG_KEY; with
+	// none, events stay in the local spool and nothing is uploaded.
+	PostHogKey string `toml:"posthog_key,omitempty"`
+
+	// Level is "full" (default) or "basic". Config can only lower the level.
+	Level string `toml:"level,omitempty"`
 }
 
 // OpenClawSettings configures the OpenClaw gateway connection.
@@ -1007,6 +1060,34 @@ type RemoteConfig struct {
 	// old hardcoded 10s silently killed fetches from hosts with many sessions,
 	// making the whole remote look unavailable (#1859 family).
 	CommandTimeoutSeconds int `toml:"command_timeout_seconds,omitempty"`
+
+	// Transport carries interactive attaches: "ssh" (default) or "mosh".
+	// Mosh answers keystrokes locally and survives roaming, which matters on
+	// high-latency links such as a relayed tailnet path. Listing, polling,
+	// and every other command stay on SSH regardless.
+	Transport string `toml:"transport,omitempty"`
+
+	// MoshServer is the command that starts mosh-server on the remote, for
+	// hosts where it is not on the non-login SSH PATH (e.g.
+	// "/opt/homebrew/bin/mosh-server"). Empty uses mosh's default.
+	MoshServer string `toml:"mosh_server,omitempty"`
+}
+
+// Remote attach transports accepted by RemoteConfig.Transport.
+const (
+	RemoteTransportSSH  = "ssh"
+	RemoteTransportMosh = "mosh"
+)
+
+// GetTransport returns the normalized interactive transport, defaulting to
+// "ssh". An unrecognized value is returned as written so attach can refuse it
+// instead of silently falling back to a transport the user did not choose.
+func (rc RemoteConfig) GetTransport() string {
+	t := strings.ToLower(strings.TrimSpace(rc.Transport))
+	if t == "" {
+		return RemoteTransportSSH
+	}
+	return t
 }
 
 // GetAgentDeckPath returns the agent-deck binary path, defaulting to "agent-deck".
@@ -2392,6 +2473,22 @@ type OpenCodeSettings struct {
 	DisableSSEStatus bool `toml:"disable_sse_status,omitempty"`
 }
 
+// ModelsSettings controls the model catalog shown by the new-session dialogs,
+// `launch -capabilities` and reasoning-effort validation.
+type ModelsSettings struct {
+	// Probe asks installed CLIs that can list their own models (today:
+	// `codex debug models`) for their model and effort lists, cached per CLI
+	// binary, merged in front of the built-in catalog. Set false to use only
+	// the built-in catalog.
+	// Default: true
+	Probe *bool `toml:"probe,omitempty"`
+}
+
+// ProbeEnabled reports whether installed CLIs may be probed. Defaults to true.
+func (m ModelsSettings) ProbeEnabled() bool {
+	return m.Probe == nil || *m.Probe
+}
+
 // CodexSettings defines Codex CLI configuration
 type CodexSettings struct {
 	// Command is the Codex CLI command or alias to use (e.g., "codex", "codex-v2")
@@ -2819,9 +2916,26 @@ type WorktreeSettings struct {
 	//   "always" → pre-gate behavior: run unconditionally, no prompt. Opt-in.
 	//   "never"  → never run these scripts, trusted or not.
 	// Unknown values are treated as "prompt" so a typo can never downgrade
-	// to "always". See --allow-repo-scripts / AGENT_DECK_ALLOW_REPO_SCRIPTS
-	// for a one-shot, non-persisted bypass (CI).
+	// to "always". See --run-hooks (--allow-repo-scripts) /
+	// AGENT_DECK_ALLOW_REPO_SCRIPTS for a one-shot, non-persisted run (CI).
 	RunRepoScripts string `toml:"run_repo_scripts,omitempty"`
+
+	// CheckoutGitConfig is a list of "key=value" git config entries passed as
+	// `git -c` to the commands that materialize a new worktree (#2366), e.g.
+	// ["core.hooksPath=/dev/null"] to skip post-checkout hooks, or
+	// ["checkout.workers=8"]. Applied only to that creation; nothing is
+	// written to the worktree's config. Global config only: a directory-local
+	// .agent-deck/config.toml cannot set it (its allowlist rejects the key).
+	CheckoutGitConfig []string `toml:"checkout_git_config,omitempty"`
+}
+
+// CreateOptions returns the git worktree-creation options these settings
+// select for a worktree created from sourceDir: sparse-checkout inheritance
+// and the checkout_git_config entries.
+func (w WorktreeSettings) CreateOptions(sourceDir string) git.WorktreeCreateOptions {
+	opts := git.SparseInheritOptions(w.InheritSparseCheckout(), sourceDir)
+	opts.GitConfig = w.CheckoutGitConfig
+	return opts
 }
 
 // ScriptConsentPolicy returns the parsed [worktree] run_repo_scripts value.
@@ -3281,6 +3395,15 @@ type TmuxSettings struct {
 	// creation and the separate EnableMouseMode() path used on reconnect.
 	// Default: true (nil = use default true, preserves pre-#730 behavior)
 	Mouse *bool `toml:"mouse,omitempty"`
+
+	// IndicZeroWidthMarks gives Indic spacing vowel signs (ा ि ी ो) zero width
+	// on the tmux server so glibc tmux (Linux packages) lays out Hindi,
+	// Bengali or Tamil text the way Claude Code does (#2334). It aligns
+	// Claude Code but misaligns Codex, the shell and vim for Indic text, it
+	// applies to the whole tmux server (the user's default one unless
+	// socket_name is set), and it needs tmux >= 3.6. Turning it back off
+	// removes exactly the entries agent-deck added. Default: false.
+	IndicZeroWidthMarks bool `toml:"indic_zero_width_marks,omitempty"`
 
 	// LaunchInUserScope starts new tmux servers via `systemd-run --user --scope`
 	// so the tmux server lives under the user's systemd manager instead of the
@@ -3915,6 +4038,9 @@ func LoadUserConfig() (*UserConfig, error) {
 
 	userConfigCacheMu.Lock()
 	defer userConfigCacheMu.Unlock()
+	// Every (re)load re-applies the [macapp] status_events gate, so an
+	// edited config.toml turns the session.status tap on or off live.
+	defer func() { applyStatusBusGate(userConfigCache) }()
 
 	// Re-check under write lock: another goroutine may have refreshed the
 	// cache to match currentMtime between our RLock drop and Lock acquire.
@@ -4560,6 +4686,15 @@ func GetWebTrustedDomains() []string {
 		return nil
 	}
 	return NormalizeTrustedDomains(config.Web.TrustedDomains)
+}
+
+// GetWebAllowedHosts returns the configured Host allowlist additions.
+func GetWebAllowedHosts() []string {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return nil
+	}
+	return config.Web.AllowedHosts
 }
 
 // GetWebConfirmLinkOpen reports whether the web terminal confirms before
@@ -5297,11 +5432,12 @@ auto_cleanup = true
 #   {branch}         -> sanitized (human-friendly, may collide)
 #   {branch-escaped} -> URL-escaped (collision-resistant, reversible)
 # path_template = "../worktrees/{repo-name}/{branch}"
-# Whether .agent-deck/worktree-setup.sh and worktree-destruction.sh may run
-# automatically: "prompt" (default, ask once per repo root + script content,
-# re-asks if the content changes), "always" (run unconditionally, pre-gate
-# behavior), or "never" (block them entirely). Non-interactive callers under
-# "prompt" fail closed instead of hanging; see --allow-repo-scripts for CI.
+# Whether .agent-deck/worktree-setup.sh and worktree-destruction.sh may run:
+# "prompt" (default: ask before a hook's first run and after it changes; the
+# approval covers its content, resolved path and interpreter), "never" (block
+# them), or "always" (run every hook without asking; risky unless you own every
+# repo you open). Without a terminal "prompt" skips the hook with a notice;
+# approve with "agent-deck worktree trust-hooks <repo>" or use --run-hooks.
 # run_repo_scripts = "prompt"
 
 # Default scope for MCP operations: "local", "global", or "user"

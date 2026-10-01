@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -397,12 +398,51 @@ func (s *fixtureStore) LoadMenuSnapshot() (*web.MenuSnapshot, error) {
 
 	items := make([]web.MenuItem, 0, len(s.groups)+len(s.sessions))
 	idx := 0
-	for _, g := range s.groups {
-		items = append(items, web.MenuItem{
-			Index: idx, Type: web.MenuItemTypeGroup, Path: g.Path, Group: g, Level: 0,
-		})
-		idx++
+	// Emit groups as a TREE WALK, the way the real server does
+	// (BuildMenuSnapshot over the hierarchically-sorted GroupTree.GroupList):
+	// every parent immediately ahead of its descendants, siblings ordered by
+	// Order with the path as tie-breaker.
+	//
+	// Ranging the map directly leaked Go's randomized iteration order into the
+	// payload. The client used to hide that by re-sorting on MenuGroup.Order,
+	// and no longer does — Order is only meaningful BETWEEN SIBLINGS, so a
+	// global sort by it interleaves unrelated subtrees. Sorting globally here
+	// would reproduce, in the fixture, exactly the bug the client just stopped
+	// committing.
+	childrenOf := make(map[string][]string, len(s.groups))
+	for path := range s.groups {
+		parent := ""
+		if i := strings.LastIndex(path, "/"); i != -1 {
+			parent = path[:i]
+		}
+		childrenOf[parent] = append(childrenOf[parent], path)
 	}
+	for parent := range childrenOf {
+		siblings := childrenOf[parent]
+		sort.Slice(siblings, func(i, j int) bool {
+			a, b := s.groups[siblings[i]], s.groups[siblings[j]]
+			if a.Order != b.Order {
+				return a.Order < b.Order
+			}
+			return siblings[i] < siblings[j]
+		})
+	}
+	var emitGroups func(parent string)
+	emitGroups = func(parent string) {
+		for _, path := range childrenOf[parent] {
+			g := s.groups[path]
+			items = append(items, web.MenuItem{
+				// Level is the path depth, as GetGroupLevel computes it
+				// server-side. It was hardcoded to 0, so a nested group
+				// claimed to be a root.
+				Index: idx, Type: web.MenuItemTypeGroup, Path: g.Path, Group: g,
+				Level: strings.Count(g.Path, "/"),
+			})
+			idx++
+			emitGroups(path)
+		}
+	}
+	emitGroups("")
 	active := 0
 	for _, id := range s.order {
 		sess, ok := s.sessions[id]
@@ -411,7 +451,11 @@ func (s *fixtureStore) LoadMenuSnapshot() (*web.MenuSnapshot, error) {
 		}
 		active++
 		items = append(items, web.MenuItem{
-			Index: idx, Type: web.MenuItemTypeSession, Session: sess, Level: 1,
+			// groupLevel + 1, matching GroupTree.Flatten. Hardcoding 1 meant a
+			// session in `work/innotrade` claimed the depth of a root-group
+			// session, so the fixture never exercised the nested payload.
+			Index: idx, Type: web.MenuItemTypeSession, Session: sess,
+			Level: strings.Count(sess.GroupPath, "/") + 1,
 		})
 		idx++
 	}
@@ -647,6 +691,17 @@ func (s *fixtureStore) RenameGroup(groupPath, newName string) error {
 	return nil
 }
 
+func (s *fixtureStore) SetGroupExpanded(groupPath string, expanded bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.groups[groupPath]
+	if !ok {
+		return web.ErrGroupNotFound
+	}
+	g.Expanded = expanded
+	return nil
+}
+
 func (s *fixtureStore) DeleteGroup(groupPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -655,6 +710,53 @@ func (s *fixtureStore) DeleteGroup(groupPath string) error {
 	}
 	delete(s.groups, groupPath)
 	return nil
+}
+
+// fixtureConfigDirGroup stands in for a group with its own
+// [groups."X".claude].config_dir: moving a claude session into or out of it
+// reports restartRequired, so e2e can cover the web UI's warning (#2368).
+const fixtureConfigDirGroup = "personal"
+
+// MoveSessionToGroup mirrors session.GroupTree.ResolveMoveTargetGroup on the
+// in-memory store (#2368): "" or "root" is the default group, then an exact
+// match, a case-insensitive match, and otherwise a new group.
+func (s *fixtureStore) MoveSessionToGroup(id, groupPath string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok {
+		return "", false, web.ErrSessionNotFound
+	}
+	target := groupPath
+	switch {
+	case target == "" || target == "root":
+		target = session.DefaultGroupPath
+		if s.groups[target] == nil {
+			s.groups[target] = &web.MenuGroup{Name: session.DefaultGroupName, Path: target, Expanded: true, Order: len(s.groups)}
+		}
+	case s.groups[target] != nil:
+	default:
+		matched := false
+		for path := range s.groups {
+			if strings.EqualFold(path, target) {
+				target, matched = path, true
+				break
+			}
+		}
+		if !matched {
+			s.groups[target] = &web.MenuGroup{Name: target, Path: target, Expanded: true, Order: len(s.groups)}
+		}
+	}
+	if old := s.groups[sess.GroupPath]; old != nil && old.SessionCount > 0 {
+		old.SessionCount--
+	}
+	if g := s.groups[target]; g != nil {
+		g.SessionCount++
+	}
+	restartRequired := session.IsClaudeCompatible(sess.Tool) &&
+		(sess.GroupPath == fixtureConfigDirGroup) != (target == fixtureConfigDirGroup)
+	sess.GroupPath = target
+	return target, restartRequired, nil
 }
 
 // FinishWorktree implements web.SessionMutator for issue #1126. Without a

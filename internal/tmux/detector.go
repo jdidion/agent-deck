@@ -66,10 +66,11 @@ func (d *PromptDetector) HasPrompt(content string) bool {
 
 	case "codex":
 		// Codex/OpenAI CLI patterns.
-		// Busy indicators take priority over prompt markers.
-		lower := strings.ToLower(content)
-		if strings.Contains(lower, "esc to interrupt") ||
-			strings.Contains(lower, "ctrl+c to interrupt") {
+		// Busy indicators take priority over prompt markers, but only when the
+		// phrase has the shape of Codex's live status UI. Assistant prose and
+		// quoted examples remain in the pane above the current composer.
+		if codexLiveStatusLine(content) ||
+			hasCodexInterruptBusyProvenance(content, codexInterruptPhrases...) {
 			return false
 		}
 		// Direct prompt strings
@@ -144,6 +145,13 @@ func (d *PromptDetector) hasDeepSeekPrompt(content string) bool {
 // serving. Mirrors the prompt pattern in the deepseek preset (patterns.go) so
 // the two cannot drift.
 var deepSeekWebReadyLine = regexp.MustCompile(`(?mi)^dsh web:\s+https?://`)
+
+// isHorizontalRuleLine reports whether line is one of the box rules Claude
+// draws above and below its input box (optionally carrying the session title
+// at the right edge: "──────── account ─").
+func isHorizontalRuleLine(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(StripANSI(line)), "─────")
+}
 
 // hasClaudePrompt detects if Claude Code is waiting for input
 // Handles BOTH normal mode AND --dangerously-skip-permissions mode
@@ -325,13 +333,22 @@ func (d *PromptDetector) hasClaudePrompt(content string) bool {
 	if len(checkLines) > 8 {
 		checkLines = checkLines[len(checkLines)-8:]
 	}
-	for _, line := range checkLines {
+	for idx, line := range checkLines {
 		cleanLine := strings.TrimSpace(StripANSI(line))
 		// Normalize non-breaking spaces (U+00A0) to regular spaces
 		// Claude Code uses NBSP after the prompt character
 		cleanLine = strings.ReplaceAll(cleanLine, "\u00A0", " ")
 		// Check for standalone prompt character (user hasn't typed yet)
 		if cleanLine == ">" || cleanLine == "❯" || cleanLine == "> " || cleanLine == "❯ " {
+			return true
+		}
+		// Prompt with an unsent draft: "❯ migrate all" drawn between the two
+		// horizontal rules of the input box. The rules tell it apart from an
+		// echoed earlier prompt ("❯ text" followed by a ⏺ reply) and from a
+		// menu option ("❯ 1. Leave it"). 11 of 46 audited idle Claude panes
+		// carried a draft; without this they had no prompt verdict at all.
+		if strings.HasPrefix(cleanLine, "❯ ") && idx > 0 && idx+1 < len(checkLines) &&
+			isHorizontalRuleLine(checkLines[idx-1]) && isHorizontalRuleLine(checkLines[idx+1]) {
 			return true
 		}
 		// Check for prompt with suggestion (Claude shows "❯ Try..." when waiting)
@@ -559,6 +576,126 @@ func (d *PromptDetector) hasCodexPromptMarker(content string) bool {
 		}
 	}
 	return false
+}
+
+var codexInterruptPhrases = []string{"esc to interrupt", "ctrl+c to interrupt"}
+
+const codexLegacySpinnerGlyphs = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+// hasCodexInterruptBusyProvenance reports whether a recent line is a live
+// Codex busy status rather than assistant/user prose that merely repeats an
+// interrupt phrase. Codex renders either an older standalone instruction
+// ("esc to interrupt" / "press esc to interrupt") or an activity label with
+// a parenthesized elapsed/interrupt status, optionally followed by inline
+// context ("Working (3s • esc to interrupt) · 1 background terminal running").
+//
+// Current Codex renders this structure in status_indicator_widget.rs: a
+// user-facing header, fmt_elapsed_compact output, a bullet and interrupt hint,
+// then optional ` · `-prefixed inline messages. A legacy braille-spinner form
+// without elapsed time is retained. Requiring one of those structures avoids
+// treating arbitrary "-ing" prose as activity.
+func hasCodexInterruptBusyProvenance(content string, phrases ...string) bool {
+	return hasCodexInterruptBusyProvenanceLines(lastNLines(content, 3), phrases...)
+}
+
+func hasCodexInterruptBusyProvenanceLines(lines []string, phrases ...string) bool {
+	for _, line := range lines {
+		clean := strings.ToLower(strings.TrimSpace(StripANSI(line)))
+		if clean == "" {
+			continue
+		}
+
+		for _, phrase := range phrases {
+			phrase = strings.ToLower(strings.TrimSpace(phrase))
+			if phrase == "" || !strings.Contains(clean, phrase) {
+				continue
+			}
+			if clean == phrase || clean == "press "+phrase {
+				return true
+			}
+
+			for searchFrom := 0; searchFrom < len(clean); {
+				phraseStart := strings.Index(clean[searchFrom:], phrase)
+				if phraseStart < 0 {
+					break
+				}
+				phraseStart += searchFrom
+				phraseEnd := phraseStart + len(phrase)
+				searchFrom = phraseEnd
+
+				if phraseEnd >= len(clean) || clean[phraseEnd] != ')' {
+					continue
+				}
+				remainder := clean[phraseEnd+1:]
+				if remainder != "" && !strings.HasPrefix(remainder, " · ") {
+					continue
+				}
+
+				openParen := strings.LastIndex(clean[:phraseStart], "(")
+				if openParen <= 0 {
+					continue
+				}
+				lead := strings.TrimSpace(clean[:openParen])
+				if lead == "" {
+					continue
+				}
+				interruptPrefix := strings.TrimSpace(clean[openParen+1 : phraseStart])
+				if isCodexElapsedInterruptPrefix(interruptPrefix) {
+					return true
+				}
+
+				first, _ := utf8.DecodeRuneInString(lead)
+				if strings.ContainsRune(codexLegacySpinnerGlyphs, first) &&
+					strings.TrimSpace(strings.TrimPrefix(lead, string(first))) != "" &&
+					interruptPrefix == "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func isCodexElapsedInterruptPrefix(prefix string) bool {
+	prefix = strings.TrimSpace(prefix)
+	separator := strings.LastIndexAny(prefix, "•·")
+	if separator <= 0 {
+		return false
+	}
+	if trailing := strings.TrimSpace(prefix[separator:]); trailing != "•" && trailing != "·" {
+		return false
+	}
+
+	elapsed := strings.TrimSpace(prefix[:separator])
+	first, rest, found := strings.Cut(elapsed, " ")
+	if !found {
+		return isCodexElapsedPart(first, 's', 0)
+	}
+	second, third, found := strings.Cut(rest, " ")
+	if !found {
+		return isCodexElapsedPart(first, 'm', 0) &&
+			isCodexElapsedPart(second, 's', 2)
+	}
+	return !strings.Contains(third, " ") &&
+		isCodexElapsedPart(first, 'h', 0) &&
+		isCodexElapsedPart(second, 'm', 2) &&
+		isCodexElapsedPart(third, 's', 2)
+}
+
+func isCodexElapsedPart(part string, unit byte, exactDigits int) bool {
+	if len(part) < 2 || part[len(part)-1] != unit {
+		return false
+	}
+	digits := part[:len(part)-1]
+	if exactDigits > 0 && len(digits) != exactDigits {
+		return false
+	}
+	for i := range len(digits) {
+		if digits[i] < '0' || digits[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // hasCursorPrompt detects when the Cursor Agent CLI is waiting for input.

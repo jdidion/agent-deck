@@ -50,6 +50,11 @@ func (h *Home) seedRemotePolls(remotes map[string]session.RemoteConfig) {
 	}
 }
 
+// remoteAuthBlocked holds auxiliary SSH probes (latency, preview) for as long
+// as the last poll failed authentication, even past RemoteAuthRetryBackoff:
+// only the session poll re-attempts the credential (beginRemotePoll), so a
+// broken key is tried once per backoff window rather than on every latency
+// tick. A successful poll or an explicit retry clears the status.
 func (h *Home) remoteAuthBlocked(name string, rc session.RemoteConfig) bool {
 	h.remoteSessionsMu.RLock()
 	defer h.remoteSessionsMu.RUnlock()
@@ -61,7 +66,7 @@ func (h *Home) beginRemotePoll(name string, rc session.RemoteConfig) bool {
 	h.remoteSessionsMu.Lock()
 	defer h.remoteSessionsMu.Unlock()
 	state := h.remotePolls[name]
-	if h.ctx.Err() != nil || h.remotePollActive[name] || (state.Matches(rc) && state.LastPollStatus == "auth_failed") {
+	if h.ctx.Err() != nil || h.remotePollActive[name] || (state.Matches(rc) && state.AuthBlocked(time.Now())) {
 		return false
 	}
 	if h.remotePollActive == nil {
@@ -119,8 +124,14 @@ const remoteRowStaleAge = remoteSessionsCacheSaveInterval
 // through the same "how old is this" path instead of two separate labels.
 func (h *Home) remoteRowAge(name string) (time.Duration, bool) {
 	h.remoteSessionsMu.RLock()
+	defer h.remoteSessionsMu.RUnlock()
+	return h.remoteRowAgeLocked(name)
+}
+
+// remoteRowAgeLocked is remoteRowAge for callers already holding
+// remoteSessionsMu.
+func (h *Home) remoteRowAgeLocked(name string) (time.Duration, bool) {
 	fetched, known := h.remoteFetchedAt[name]
-	h.remoteSessionsMu.RUnlock()
 	if !known || fetched.IsZero() {
 		return 0, false
 	}
