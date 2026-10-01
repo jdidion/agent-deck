@@ -1393,6 +1393,17 @@ const (
 	startupStateWindow  = 2 * time.Minute
 )
 
+// envNegativeCacheTTLOverride, when positive, replaces envNegativeCacheTTL.
+// Set only through HoldEnvNegativeCacheForTest.
+var envNegativeCacheTTLOverride atomic.Int64
+
+func negativeEnvCacheTTL() time.Duration {
+	if d := envNegativeCacheTTLOverride.Load(); d > 0 {
+		return time.Duration(d)
+	}
+	return envNegativeCacheTTL
+}
+
 func sanitizeSystemdUnitComponent(raw string) string {
 	var b strings.Builder
 	for _, r := range raw {
@@ -2412,7 +2423,7 @@ func (s *Session) GetEnvironment(key string) (string, error) {
 		if entry, ok := s.envCache[key]; ok {
 			ttl := envCacheTTL
 			if !entry.found {
-				ttl = envNegativeCacheTTL
+				ttl = negativeEnvCacheTTL()
 			}
 			if time.Since(entry.time) < ttl {
 				s.envCacheMu.RUnlock()

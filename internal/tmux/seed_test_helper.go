@@ -93,3 +93,14 @@ func ExpirePaneInfoCacheForTest(t testing.TB) {
 		paneCacheMu.Unlock()
 	})
 }
+
+// HoldEnvNegativeCacheForTest keeps cached environment misses fresh for the
+// rest of the test. A fixture whose status passes span several seconds under
+// load would otherwise cross envNegativeCacheTTL between passes, and the
+// legitimate re-read that follows would be indistinguishable from a duplicate
+// read within one pass.
+func HoldEnvNegativeCacheForTest(t testing.TB) {
+	t.Helper()
+	envNegativeCacheTTLOverride.Store(int64(time.Hour))
+	t.Cleanup(func() { envNegativeCacheTTLOverride.Store(0) })
+}

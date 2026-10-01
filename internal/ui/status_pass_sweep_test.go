@@ -14,6 +14,9 @@ import (
 
 // Drive the actual ten-worker sweep. Delayed per-instance env reads make the
 // sweep exceed ownership's TTL; a fresh pass per worker would repeat the scan.
+// The second tick re-polls rows the first tick already read; their cached env
+// misses are held fresh so a slow machine crossing envNegativeCacheTTL between
+// ticks does not add legitimate re-reads to the count.
 func TestBackgroundStatusPassOwnershipLinear(t *testing.T) {
 	const n = 40
 	dir := t.TempDir()
@@ -62,6 +65,7 @@ esac
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	tmux.ResetSocketSessionCacheForTest()
 	t.Cleanup(tmux.ResetSocketSessionCacheForTest)
+	tmux.HoldEnvNegativeCacheForTest(t)
 	started := time.Now()
 	h.backgroundStatusUpdate()
 	firstPass, err := os.ReadFile(filepath.Join(dir, "calls"))
@@ -84,6 +88,11 @@ esac
 	}
 	if reads != n {
 		t.Fatalf("environment reads=%d, want %d (one own read per instance)", reads, n)
+	}
+	for tick, calls := range []string{string(firstPass), string(data[len(firstPass):])} {
+		if scans := strings.Count(calls, "CODEX_SESSION_ID}"); scans > 1 {
+			t.Errorf("tick %d enumerated Codex ownership %d times, want at most 1 per sweep", tick+1, scans)
+		}
 	}
 	snapshot := h.getSessionRenderSnapshot()
 	for _, inst := range h.instances {
