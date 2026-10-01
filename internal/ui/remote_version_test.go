@@ -59,7 +59,7 @@ agent_deck_path = "/usr/local/bin/agent-deck"
 
 func renderRemoteHeader(home *Home) string {
 	var b strings.Builder
-	home.renderRemoteGroupItem(&b, home.flatItems[0], false)
+	home.renderRemoteGroupItem(&b, home.flatItems[0], false, 0)
 	return b.String()
 }
 
@@ -103,6 +103,147 @@ func TestRemoteVersionMarker(t *testing.T) {
 		if got := remoteVersionMarker(tc.state, tc.controller); got != tc.want {
 			t.Errorf("remoteVersionMarker(%+v, %q) = %q, want %q", tc.state, tc.controller, got, tc.want)
 		}
+	}
+}
+
+// TestRemoteVersionPreviewLine pins the remote preview panel's version-compare
+// line for its four states, including the "+local build compares equal to
+// its base version" rule (BACKGROUND): a +local build on the controller's own
+// release reads "same", not "newer".
+func TestRemoteVersionPreviewLine(t *testing.T) {
+	cases := []struct {
+		name       string
+		state      session.RemoteVersionState
+		controller string
+		want       string
+	}{
+		{
+			"same",
+			session.RemoteVersionState{Version: "1.16.10", Found: true},
+			"1.16.10",
+			"agent-deck v1.16.10 · same as here",
+		},
+		{
+			"older",
+			session.RemoteVersionState{Version: "1.16.9", Found: true},
+			"1.16.10",
+			"agent-deck v1.16.9 · older than here (update available)",
+		},
+		{
+			"newer",
+			session.RemoteVersionState{Version: "1.16.11", Found: true},
+			"1.16.10",
+			"agent-deck v1.16.11 · newer than here",
+		},
+		{
+			"unknown, never checked",
+			session.RemoteVersionState{},
+			"1.16.10",
+			"version unknown (last checked never)",
+		},
+		{
+			// walk defect #1: build metadata differs but the release is the
+			// same; CompareVersions still calls it "same" (update decisions
+			// are unaffected), but the label must not claim the builds are
+			// identical.
+			"+local build on the controller's release reads same release, different build",
+			session.RemoteVersionState{Version: "1.16.10+local.abc123", Found: true},
+			"1.16.10",
+			"agent-deck v1.16.10+local.abc123 · same release, different build",
+		},
+		{
+			"controller +local build, remote plain release reads same release, different build",
+			session.RemoteVersionState{Version: "1.16.10", Found: true},
+			"1.16.10+local.20260917f",
+			"agent-deck v1.16.10 · same release, different build",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := remoteVersionPreviewLine(tc.state, tc.controller); got != tc.want {
+				t.Errorf("remoteVersionPreviewLine(%+v, %q) = %q, want %q", tc.state, tc.controller, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRemoteVersionPreviewLine_UnknownShowsLastCheckedWhen pins that an
+// unknown state still reports when it was last (unsuccessfully) asked,
+// instead of always saying "never".
+func TestRemoteVersionPreviewLine_UnknownShowsLastCheckedWhen(t *testing.T) {
+	checkedAt := time.Now().Add(-90 * time.Minute)
+	state := session.RemoteVersionState{Found: false, CheckedAt: checkedAt}
+	got := remoteVersionPreviewLine(state, "1.16.10")
+	want := "version unknown (last checked " + humanizeSince(time.Since(checkedAt)) + ")"
+	if got != want {
+		t.Errorf("remoteVersionPreviewLine = %q, want %q", got, want)
+	}
+}
+
+// TestRemotePreviewStatsLines_UnknownWhenNoResult pins the "stats unknown"
+// fallback line: no poll answer yet (or an older remote without `system
+// stats`) renders the explicit unknown line instead of a guess, while the
+// sessions-by-status and harnesses lines (derived from the already-fetched
+// session list, no extra round trip) are always present.
+func TestRemotePreviewStatsLines_UnknownWhenNoResult(t *testing.T) {
+	sessions := []session.RemoteSessionInfo{
+		{Status: "running", Tool: "claude"},
+		{Status: "waiting", Tool: "claude"},
+		{Status: "idle", Tool: "codex"},
+	}
+	same := session.RemoteVersionState{Version: "1.16.10", Found: true}
+	lines := remoteStatsPreviewLines(sessions, remoteHostStatsResult{}, false, same, "1.16.10")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3: %+v", len(lines), lines)
+	}
+	if lines[0] != "Sessions  1 running · 1 waiting · 1 idle · 0 stopped · 0 error" {
+		t.Errorf("sessions line = %q", lines[0])
+	}
+	if lines[1] != "Harnesses  claude:2 · codex:1" {
+		t.Errorf("harnesses line = %q", lines[1])
+	}
+	// walk defect #1: a same-release remote must never be told it is older.
+	if lines[2] != "stats unknown (remote does not report stats)" {
+		t.Errorf("stats line = %q, want the same-release unknown fallback", lines[2])
+	}
+
+	older := session.RemoteVersionState{Version: "1.16.9", Found: true}
+	olderLines := remoteStatsPreviewLines(sessions, remoteHostStatsResult{}, false, older, "1.16.10")
+	if olderLines[2] != "stats unknown (remote runs an older agent-deck)" {
+		t.Errorf("stats line = %q, want the older fallback", olderLines[2])
+	}
+}
+
+// TestRemotePreviewStatsLines_PresentWhenResultOk pins the populated stats
+// block: the host's load/memory/disk (sysinfo.FormatBytes-formatted) and the
+// last poll's latency/time.
+func TestRemotePreviewStatsLines_PresentWhenResultOk(t *testing.T) {
+	fetchedAt := time.Now().Add(-5 * time.Minute)
+	result := remoteHostStatsResult{
+		Stats: session.RemoteHostStats{
+			Ok:              true,
+			CPUAvailable:    true,
+			CPUUsagePercent: 28,
+			MemAvailable:    true,
+			MemUsedBytes:    38_200_000_000,
+			MemTotalBytes:   48_000_000_000,
+			DiskAvailable:   true,
+			DiskUsedBytes:   715_000_000_000,
+			DiskTotalBytes:  926_000_000_000,
+		},
+		Latency:   250 * time.Millisecond,
+		FetchedAt: fetchedAt,
+	}
+	lines := remoteStatsPreviewLines(nil, result, true, session.RemoteVersionState{Version: "1.16.10", Found: true}, "1.16.10")
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4: %+v", len(lines), lines)
+	}
+	if lines[2] != "28% · 35.6G/44.7G · 665.9G/862.4G" {
+		t.Errorf("load line = %q", lines[2])
+	}
+	wantPoll := "Last poll 250ms · " + humanizeSince(time.Since(fetchedAt))
+	if lines[3] != wantPoll {
+		t.Errorf("poll line = %q, want %q", lines[3], wantPoll)
 	}
 }
 
@@ -270,5 +411,23 @@ func TestRemoteSessionsFetchedMsg_RecordsVersions(t *testing.T) {
 	_, _ = home.Update(remoteSessionsFetchedMsg{sessions: map[string][]session.RemoteSessionInfo{"lab": {}}})
 	if state, _ := home.remoteVersionState("lab"); state.Version != "1.16.0" {
 		t.Errorf("a poll without a version answer must keep the previous one: %+v", state)
+	}
+}
+
+// #2244: a failed remote update shows its full message in a dialog; the
+// one-line footer truncates the remedy at the terminal edge.
+func TestRemoteUpdatedMsg_FailureOpensNoticeWithFullMessage(t *testing.T) {
+	home := armHomeOnRemoteHeader(t, "1.15.0")
+	long := errors.New("deployed v1.16.6 to /usr/local/bin/agent-deck, but the remote runs v1.16.5 from $PATH; set agent_deck_path to the binary the remote's PATH finds (command -v agent-deck) or fix the remote's PATH")
+	_, _ = home.Update(remoteUpdatedMsg{remoteName: "lab", from: "1.15.0", to: "1.16.6", err: long})
+	if !home.confirmDialog.IsVisible() || home.confirmDialog.GetConfirmType() != ConfirmNotice {
+		t.Fatal("a failed update must open the notice dialog")
+	}
+	// Collapse the box drawing and wrapping so the whole sentence is checked.
+	flat := strings.Join(strings.Fields(strings.NewReplacer("│", " ", "╭", " ", "╮", " ", "╰", " ", "╯", " ", "─", " ").Replace(stripANSIForGroupNesting(home.confirmDialog.View()))), " ")
+	for _, want := range []string{"deployed v1.16.6 to /usr/local/bin/agent-deck,", "(command -v agent-deck) or fix the remote's PATH"} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("dialog must carry the whole remedy; missing %q in:\n%s", want, home.confirmDialog.View())
+		}
 	}
 }

@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
@@ -24,6 +26,7 @@ type Config struct {
 	ReadOnly     bool
 	WebMutations bool // When false, POST/PATCH/DELETE endpoints return 403
 	Token        string
+	AllowedHosts []string // Additional exact Host values, optionally including a port.
 	// InsecureBind explicitly acknowledges binding a non-loopback address
 	// with no auth token (an unauthenticated RCE surface). Without it the
 	// server refuses to start in that configuration. See bind.go / report #1.
@@ -67,6 +70,13 @@ var ErrUndoExpired = errors.New("undo window expired")
 // target session id does not resolve to a live instance. The handler maps
 // this to 404. See issue #1126.
 var ErrSessionNotFound = errors.New("session not found")
+
+// ErrGroupNotFound is returned by SessionMutator.SetGroupExpanded when the
+// path does not resolve to a group. The handler maps this to 404. A stale
+// browser tab can easily PATCH a group the TUI has since deleted, and a
+// silent no-op there would leave the sidebar asserting a collapse that was
+// never stored.
+var ErrGroupNotFound = errors.New("group not found")
 
 // ErrNotAWorktree is returned by SessionMutator.FinishWorktree when the
 // target session exists but is not in a git/jujutsu worktree (so there is
@@ -141,7 +151,21 @@ type SessionMutator interface {
 	UpdateSession(sessionID string, updates map[string]string) (updatedFields []string, restartRequired bool, err error)
 	CreateGroup(name, parentPath string) (string, error)
 	RenameGroup(groupPath, newName string) error
+	// MoveSessionToGroup moves a session to another group with the
+	// `agent-deck group move` semantics (see session.GroupTree.
+	// ResolveMoveTargetGroup): "" or "root" is the default group, and a
+	// missing group is created. Returns the group path the session landed in
+	// and whether its resolved Claude config dir changed, which only takes
+	// effect on the next restart (no conversation migration, like the CLI).
+	// Returns ErrSessionNotFound when the id doesn't resolve. See issue #2368.
+	MoveSessionToGroup(sessionID, groupPath string) (movedTo string, restartRequired bool, err error)
 	DeleteGroup(groupPath string) error
+	// SetGroupExpanded persists a group's collapsed/expanded state, the same
+	// flag the TUI writes on its Enter/Tab toggle (home.go saveGroupState ->
+	// Storage.SaveGroupsOnly). The web sidebar keeps its own collapse state,
+	// so without this the two views drift apart permanently. Returns
+	// ErrGroupNotFound when the path does not resolve to a group.
+	SetGroupExpanded(groupPath string, expanded bool) error
 	// FinishWorktree merges (or skips), removes the worktree, optionally
 	// deletes the source branch, kills the tmux session, and removes the
 	// session from storage. Mirrors the TUI W/shift+w hotkey and the
@@ -175,6 +199,11 @@ type Server struct {
 	// whose hook file is present on disk. Defaults to defaultLoadHookStatuses
 	// (which reads ~/.agent-deck/hooks/) but is injectable for tests.
 	hookStatusLoader func() map[string]*session.HookStatus
+
+	// inFlight counts requests inside a handler, excluding the event
+	// streams (see trackInFlight). It is what Idle reports for the
+	// headless self-restart.
+	inFlight atomic.Int64
 }
 
 // NewServer creates a new web server with base routes and middleware.
@@ -216,6 +245,7 @@ func NewServer(cfg Config) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/s/", s.handleIndex)
+	mux.HandleFunc("/g/", s.handleIndex)
 	mux.HandleFunc("/manifest.webmanifest", s.handleManifest)
 	mux.HandleFunc("/sw.js", s.handleServiceWorker)
 	mux.Handle("/static/", gzipAndCacheStatic(http.StripPrefix("/static/", s.staticFileServer())))
@@ -263,36 +293,11 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
 
-	// Command Center (the embedded live fleet god-view — see
-	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
-	// one write endpoint, all behind the existing authorize/CSRF/mutation gates.
-	mux.HandleFunc("/api/command-center/status", s.handleCommandCenterStatus)
-	mux.HandleFunc("/events/command-center", s.handleCommandCenterEvents)
-	mux.HandleFunc("POST /api/command-center/ask", s.handleCommandCenterAsk)
+	// Feature routes (command center, costs, system, skills, MCPs) register
+	// themselves from their handlers_<feature>.go files; see routes.go.
+	s.mountFeatureRoutes(mux)
 
-	mux.HandleFunc("/api/costs/summary", s.handleCostsSummary)
-	mux.HandleFunc("/api/costs/daily", s.handleCostsDaily)
-	mux.HandleFunc("/api/costs/sessions", s.handleCostsSessions)
-	mux.HandleFunc("/api/costs/models", s.handleCostsModels)
-	mux.HandleFunc("/api/costs/export", s.handleCostsExport)
-	mux.HandleFunc("/api/costs/groups", s.handleCostsGroups)
-	mux.HandleFunc("/api/costs/session", s.handleCostsSessionDetail)
-	mux.HandleFunc("/api/costs/batch", s.handleCostsBatch)
-	mux.HandleFunc("/api/costs/stream", s.handleCostsStream)
-
-	mux.HandleFunc("/api/system/stats", s.handleSystemStats)
-
-	mux.HandleFunc("/api/skills", s.handleSkillsCatalog)
-
-	// MCP management (Web UI parity with TUI `m` key dialog). Closes the
-	// four MISSING rows under "MCP MANAGEMENT" in PARITY_MATRIX.md.
-	mux.HandleFunc("/api/mcps", s.handleMCPsCatalog)
-	mux.HandleFunc("GET /api/sessions/{id}/mcps", s.handleSessionMCPsRouter)
-	mux.HandleFunc("POST /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
-
-	handler := withRecover(s.csrfProtect(mux))
+	handler := s.allowHosts(s.tokenCookie(s.trackInFlight(withRecover(s.csrfProtect(mux)))))
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -384,6 +389,46 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// streamPathPrefixes are the long-lived responses that never count as
+// in-flight work: the browser's EventSource reconnects on its own the
+// moment the connection drops, so an open event stream must not keep a
+// headless server from restarting into a new build. A terminal WebSocket
+// (/ws/session/) is not on this list: someone is typing into it.
+var streamPathPrefixes = []string{"/events/", "/api/costs/stream"}
+
+func isStreamPath(path string) bool {
+	for _, p := range streamPathPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// trackInFlight counts requests from handler entry to exit so Idle can
+// tell when it is safe to hand the process over.
+func (s *Server) trackInFlight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStreamPath(r.URL.Path) {
+			s.inFlight.Add(1)
+			defer s.inFlight.Add(-1)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// InFlightRequests is the number of requests currently inside a handler,
+// event streams excluded.
+func (s *Server) InFlightRequests() int64 {
+	return s.inFlight.Load()
+}
+
+// Idle reports whether no request (event streams excluded) is being
+// served right now. `web --no-tui` uses it as the self-restart gate.
+func (s *Server) Idle() bool {
+	return s.inFlight.Load() == 0
 }
 
 func withRecover(next http.Handler) http.Handler {

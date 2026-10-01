@@ -28,16 +28,16 @@ func homeWithSession(inst *session.Instance) *Home {
 	return h
 }
 
-// Test 1: Stopped session preview contains "Session Stopped" header
-func TestPreviewPane_Stopped_HasSessionStoppedHeader(t *testing.T) {
+// Test 1: A stopped session can follow a clean process exit.
+func TestPreviewPane_Stopped_HasProcessExitedHeader(t *testing.T) {
 	inst := session.NewInstance("stopped-session", t.TempDir())
 	inst.Status = session.StatusStopped
 
 	h := homeWithSession(inst)
 	rendered := h.renderPreviewPane(80, 30)
 
-	if !strings.Contains(rendered, "Session Stopped") {
-		t.Fatalf("expected 'Session Stopped' in stopped-session preview\nrendered=%q", rendered)
+	if !strings.Contains(rendered, "Process Exited") {
+		t.Fatalf("expected 'Process Exited' in stopped-session preview\nrendered=%q", rendered)
 	}
 	if strings.Contains(rendered, "Session Inactive") {
 		t.Fatalf("stopped-session preview should not contain 'Session Inactive'\nrendered=%q", rendered)
@@ -80,7 +80,7 @@ func TestPreviewPane_Error_PromotesRestartBesideStateLine(t *testing.T) {
 	}
 }
 
-// Test 3: Stopped session preview contains user-intentional language
+// Test 3: Stopped session preview preserves recovery guidance without claiming intent.
 func TestPreviewPane_Stopped_HasResumeOrientedText(t *testing.T) {
 	inst := session.NewInstance("stopped-resume", t.TempDir())
 	inst.Status = session.StatusStopped
@@ -92,14 +92,11 @@ func TestPreviewPane_Stopped_HasResumeOrientedText(t *testing.T) {
 		t.Fatalf("stopped-session preview should contain 'stopped'\nrendered=%q", rendered)
 	}
 
-	// Must have intentional/user-oriented language
-	hasIntentionalLanguage := strings.Contains(rendered, "intentionally") ||
-		strings.Contains(rendered, "by user") ||
-		strings.Contains(rendered, "preserved") ||
-		strings.Contains(rendered, "resuming")
-
-	if !hasIntentionalLanguage {
-		t.Fatalf("stopped-session preview should contain user-intentional language (intentionally/by user/preserved/resuming)\nrendered=%q", rendered)
+	if strings.Contains(rendered, "intentionally") || strings.Contains(rendered, "by user") {
+		t.Fatalf("stopped-session preview must not claim user intent\nrendered=%q", rendered)
+	}
+	if !strings.Contains(rendered, "preserved") || !strings.Contains(rendered, "Resume") {
+		t.Fatalf("stopped-session preview should retain recovery guidance\nrendered=%q", rendered)
 	}
 }
 
@@ -152,6 +149,58 @@ func TestPreviewPane_BothStatuses_PadToHeight(t *testing.T) {
 	if lineCounts[0] != lineCounts[1] {
 		t.Fatalf("stopped and error preview produced different line counts: stopped=%d error=%d",
 			lineCounts[0], lineCounts[1])
+	}
+}
+
+// TestPreview_HideWorktreeAndClaudeSections pins the [preview] hide_worktree /
+// hide_claude behaviour (and its runtime toggle counterpart): the Worktree
+// section divider must be omitted whenever h.previewHideWorktree is true, and
+// the Claude section divider must be omitted whenever h.previewHideClaude is
+// true, independent of one another.
+func TestPreview_HideWorktreeAndClaudeSections(t *testing.T) {
+	newWorktreeClaudeInstance := func() *session.Instance {
+		inst := session.NewInstance("wt-claude-session", "/repos/app/.worktrees/feature-x")
+		inst.Status = session.StatusRunning
+		inst.Tool = "claude"
+		inst.WorktreePath = "/repos/app/.worktrees/feature-x"
+		inst.WorktreeRepoRoot = "/repos/app"
+		inst.WorktreeBranch = "feature/x"
+		return inst
+	}
+
+	cases := []struct {
+		name         string
+		hideWorktree bool
+		hideClaude   bool
+		wantWorktree bool
+		wantClaude   bool
+	}{
+		{"both shown", false, false, true, true},
+		{"worktree hidden", true, false, false, true},
+		{"claude hidden", false, true, true, false},
+		{"both hidden", true, true, false, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := homeWithSession(newWorktreeClaudeInstance())
+			h.previewHideWorktree = tc.hideWorktree
+			h.previewHideClaude = tc.hideClaude
+
+			rendered := tmux.StripANSI(h.renderPreviewPane(100, 40))
+
+			gotWorktree := strings.Contains(rendered, "Worktree")
+			if gotWorktree != tc.wantWorktree {
+				t.Errorf("hideWorktree=%v hideClaude=%v: Worktree divider present=%v, want %v\nrendered=%q",
+					tc.hideWorktree, tc.hideClaude, gotWorktree, tc.wantWorktree, rendered)
+			}
+
+			gotClaude := strings.Contains(rendered, "Claude")
+			if gotClaude != tc.wantClaude {
+				t.Errorf("hideWorktree=%v hideClaude=%v: Claude divider present=%v, want %v\nrendered=%q",
+					tc.hideWorktree, tc.hideClaude, gotClaude, tc.wantClaude, rendered)
+			}
+		})
 	}
 }
 

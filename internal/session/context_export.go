@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -267,11 +268,23 @@ func canonicalClaudeExactTranscriptPath(inst *Instance) (string, error) {
 	if workingDir == "" {
 		return "", fmt.Errorf("source Claude effective working directory is empty")
 	}
-	encoded := ConvertToClaudeDirName(workingDir)
-	if encoded == "" {
-		encoded = "-"
+	// Claude keys the project directory by the cwd it sees, which is the
+	// symlink-resolved path; the lexical spelling of the same cwd is the
+	// fallback. Both name this working directory, never a neighbour.
+	path := ""
+	for _, encoded := range conversationProjectDirNames(workingDir) {
+		if encoded == "" {
+			encoded = "-"
+		}
+		candidate := filepath.Join(dir, "projects", encoded, inst.ClaudeSessionID+".jsonl")
+		if path == "" {
+			path = candidate
+		}
+		if _, err := os.Lstat(candidate); err == nil {
+			path = candidate
+			break
+		}
 	}
-	path := filepath.Join(dir, "projects", encoded, inst.ClaudeSessionID+".jsonl")
 	if err := ensureNoSymlinkPath(path); err != nil {
 		return "", fmt.Errorf("unsafe exact Claude source path: %w", err)
 	}
@@ -309,6 +322,8 @@ func exactCodexRolloutMatches(sessionID, home string) ([]string, error) {
 	return matches, nil
 }
 
+var errNoExactContextArtifact = errors.New("no exact context artifact found")
+
 func uniqueRegularArtifact(paths []string, label string) (string, error) {
 	var found []string
 	for _, path := range paths {
@@ -328,7 +343,7 @@ func uniqueRegularArtifact(paths []string, label string) (string, error) {
 		found = append(found, path)
 	}
 	if len(found) == 0 {
-		return "", fmt.Errorf("no exact context artifact found for %s", label)
+		return "", fmt.Errorf("%w for %s", errNoExactContextArtifact, label)
 	}
 	if len(found) > 1 {
 		return "", fmt.Errorf("ambiguous exact context artifact for %s (%d matches)", label, len(found))
