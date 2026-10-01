@@ -11,7 +11,7 @@ import (
 // same tree, so global-config resolution is testable too) and returns it.
 func setupDirLocalHome(t *testing.T) string {
 	t.Helper()
-	tempDir := t.TempDir()
+	tempDir := evalSymlinksT(t, t.TempDir())
 	originalHome := os.Getenv("HOME")
 	t.Setenv("HOME", tempDir)
 	t.Cleanup(func() { os.Setenv("HOME", originalHome) })

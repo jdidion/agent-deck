@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -598,14 +599,47 @@ func ensureNoSymlinkPath(path string) error {
 		if statErr != nil {
 			return statErr
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
+		if info.Mode()&os.ModeSymlink != 0 && !rootPinnedSymlink(current, info) {
 			return fmt.Errorf("path component is a symlink: %s", current)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if info, statErr = os.Stat(current); statErr != nil {
+				return statErr
+			}
 		}
 		if !info.IsDir() && current != abs {
 			return fmt.Errorf("path component is not a directory: %s", current)
 		}
 	}
 	return nil
+}
+
+// rootPinnedSymlink reports whether a symlink was placed by root and cannot be
+// replaced by an unprivileged process: the link is root-owned and sits in a
+// root-owned directory without group/other write. System aliases such as
+// macOS /var, /tmp and /etc (to /private/...) and an admin-provisioned /home
+// alias qualify; any link in a user-writable directory does not. The link must
+// also live on the root filesystem's device: uid 0 is not proof of root on a
+// filesystem whose ownership an attacker controls (NFS no_root_squash, FUSE,
+// a disk image, or a rootful container writing into a bind mount).
+func rootPinnedSymlink(link string, info os.FileInfo) bool {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != 0 {
+		return false
+	}
+	rootInfo, err := os.Stat("/")
+	if err != nil {
+		return false
+	}
+	if rs, ok := rootInfo.Sys().(*syscall.Stat_t); !ok || rs.Dev != st.Dev {
+		return false
+	}
+	parent, err := os.Stat(filepath.Dir(link))
+	if err != nil || parent.Mode().Perm()&0o022 != 0 {
+		return false
+	}
+	ps, ok := parent.Sys().(*syscall.Stat_t)
+	return ok && ps.Uid == 0
 }
 
 func fileIsRegular(path string) bool {

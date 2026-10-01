@@ -42,7 +42,7 @@ type remoteLayout struct {
 
 func newRemoteLayout(t *testing.T) remoteLayout {
 	t.Helper()
-	root := t.TempDir()
+	root := evalSymlinksT(t, t.TempDir())
 	l := remoteLayout{home: filepath.Join(root, "home"), pathDir: filepath.Join(root, "pathbin")}
 	for _, d := range []string{l.home, l.pathDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {

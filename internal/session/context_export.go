@@ -268,11 +268,23 @@ func canonicalClaudeExactTranscriptPath(inst *Instance) (string, error) {
 	if workingDir == "" {
 		return "", fmt.Errorf("source Claude effective working directory is empty")
 	}
-	encoded := ConvertToClaudeDirName(workingDir)
-	if encoded == "" {
-		encoded = "-"
+	// Claude keys the project directory by the cwd it sees, which is the
+	// symlink-resolved path; the lexical spelling of the same cwd is the
+	// fallback. Both name this working directory, never a neighbour.
+	path := ""
+	for _, encoded := range conversationProjectDirNames(workingDir) {
+		if encoded == "" {
+			encoded = "-"
+		}
+		candidate := filepath.Join(dir, "projects", encoded, inst.ClaudeSessionID+".jsonl")
+		if path == "" {
+			path = candidate
+		}
+		if _, err := os.Lstat(candidate); err == nil {
+			path = candidate
+			break
+		}
 	}
-	path := filepath.Join(dir, "projects", encoded, inst.ClaudeSessionID+".jsonl")
 	if err := ensureNoSymlinkPath(path); err != nil {
 		return "", fmt.Errorf("unsafe exact Claude source path: %w", err)
 	}

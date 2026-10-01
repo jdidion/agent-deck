@@ -25,6 +25,9 @@ func TestPiHookExtension_OrderedEmit(t *testing.T) {
 	if err != nil {
 		t.Skip("node not available in PATH, skipping extension ordering test")
 	}
+	if out, err := exec.Command(nodePath, "--experimental-strip-types", "-e", "").CombinedOutput(); err != nil {
+		t.Skipf("node at %s cannot run TypeScript (--experimental-strip-types needs node >= 22.6): %v\n%s", nodePath, err, out)
+	}
 
 	agentDeckBin, err := exec.LookPath("agent-deck")
 	if err != nil {
