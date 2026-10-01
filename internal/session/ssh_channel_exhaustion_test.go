@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -217,6 +218,11 @@ exit 255
 	if err := os.WriteFile(filepath.Join(dir, "ssh"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// macOS assesses a newly written executable on its first exec (~100ms),
+	// which would otherwise consume the whole deadline below.
+	warm := exec.Command(filepath.Join(dir, "ssh"), "warm-up")
+	warm.Env = append(os.Environ(), "SSH_CALL_LOG="+os.DevNull)
+	_ = warm.Run()
 	t.Setenv("SSH_CALL_LOG", logPath)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	r := &SSHRunner{Host: "fixture.example"}

@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -136,9 +138,27 @@ func uniqueShellTestTitle(tag string) string {
 // alphabet our titles use ([A-Za-z0-9-] passes through unchanged).
 func sanitizeTitleForPrefix(title string) string { return title }
 
+// cleanupShellSessions kills the test's tmux sessions and waits for their pane
+// processes to exit. kill-session returns before the SIGHUP'd shell is gone,
+// and a shell writes its history file into the test's temp HOME on the way
+// out, which races t.TempDir's RemoveAll ("directory not empty").
 func cleanupShellSessions(title string) {
+	var pids []int
 	for _, name := range listTmuxSessionsWithPrefix(tmux.SessionPrefix + sanitizeTitleForPrefix(title) + "_") {
+		if out, err := exec.Command("tmux", "list-panes", "-s", "-t", name, "-F", "#{pane_pid}").Output(); err == nil {
+			for _, f := range strings.Fields(string(out)) {
+				if pid, err := strconv.Atoi(f); err == nil && pid > 0 {
+					pids = append(pids, pid)
+				}
+			}
+		}
 		_ = exec.Command("tmux", "kill-session", "-t", name).Run()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for _, pid := range pids {
+		for time.Now().Before(deadline) && syscall.Kill(pid, 0) == nil {
+			time.Sleep(20 * time.Millisecond)
+		}
 	}
 }
 

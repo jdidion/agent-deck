@@ -90,7 +90,7 @@ func TestDeployScript_UnwritableDirWithoutSudoNamesPathAndUser(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write anywhere; the permission failure cannot be reproduced")
 	}
-	dir := filepath.Join(t.TempDir(), "bin")
+	dir := filepath.Join(evalSymlinksT(t, t.TempDir()), "bin")
 	if err := os.Mkdir(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestDeployScript_UnwritableDirUsesPasswordlessSudo(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write anywhere; the sudo branch is never reached")
 	}
-	dir := filepath.Join(t.TempDir(), "bin")
+	dir := filepath.Join(evalSymlinksT(t, t.TempDir()), "bin")
 	if err := os.Mkdir(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestDeployScript_SudoRefusesRealCommandKeepsRemedy(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write anywhere; the sudo branch is never reached")
 	}
-	dir := filepath.Join(t.TempDir(), "bin")
+	dir := filepath.Join(evalSymlinksT(t, t.TempDir()), "bin")
 	if err := os.Mkdir(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}

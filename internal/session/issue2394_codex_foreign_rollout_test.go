@@ -89,7 +89,7 @@ func TestIssue2394_BootstrapBindsTheThreadTheLiveProcessOwns(t *testing.T) {
 
 	// Fresh composer: the thread exists only as the writer lock it holds.
 	stubCodexPaneProcessPIDs(t, []int{4242}, nil)
-	stubCodexPaneOpenPaths(t, []string{filepath.Join(codexHome, "thread-writer-locks", own+".lock")}, nil)
+	stubCodexPaneOpenPaths(t, []string{filepath.Join(evalSymlinksT(t, codexHome), "thread-writer-locks", own+".lock")}, nil)
 
 	inst.UpdateCodexSession(map[string]bool{})
 	if inst.CodexSessionID != own {
