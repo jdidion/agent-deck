@@ -159,6 +159,14 @@ func TestViewersCached_DeadSocketIsRateLimited(t *testing.T) {
 	}
 	assert.Equal(t, int32(1), calls.Load(), "one listing per socket per TTL, even when it fails")
 
+	// calls counts listings started; the entry is written after the stub
+	// returns, so wait for the listing to land before reading it.
+	landed := func() bool {
+		viewersCacheMu.Lock()
+		defer viewersCacheMu.Unlock()
+		return !viewersCache["dead"].refreshing
+	}
+	require.Eventually(t, landed, 2*time.Second, 5*time.Millisecond)
 	viewersCacheMu.Lock()
 	entry := viewersCache["dead"]
 	firstDelay := entry.nextRefresh.Sub(entry.refreshedAt)
@@ -171,7 +179,7 @@ func TestViewersCached_DeadSocketIsRateLimited(t *testing.T) {
 	for _, n := range []int32{2, 3, 4, 5, 6} {
 		expireViewersCacheForTest("dead")
 		ViewersCached("dead", "agentdeck_x")
-		require.Eventually(t, func() bool { return calls.Load() == n }, 2*time.Second, 5*time.Millisecond)
+		require.Eventually(t, func() bool { return calls.Load() == n && landed() }, 2*time.Second, 5*time.Millisecond)
 		want = min(want*2, viewersCacheMaxBackoff)
 		viewersCacheMu.Lock()
 		got := entry.nextRefresh.Sub(entry.refreshedAt)
