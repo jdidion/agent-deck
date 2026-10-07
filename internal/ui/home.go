@@ -461,6 +461,15 @@ type Home struct {
 	// Window toggle state — sessions with collapsed window sub-items
 	windowsCollapsed map[string]bool // sessionID -> true if windows hidden
 
+	// subSessionsFolded records an explicit fold/unfold of a parent session's
+	// sub-sessions (parentID -> folded). A parent with no entry uses
+	// subSessionsFoldedDefault ([ui] collapse_sub_sessions). subSessionCount is
+	// the number of visible sub-sessions per parent, recomputed by
+	// rebuildFlatItems before folded children are dropped.
+	subSessionsFolded        map[string]bool
+	subSessionsFoldedDefault bool
+	subSessionCount          map[string]int
+
 	// Remote tree fold state — headers the user collapsed, keyed by Item.Path
 	// ("remotes/<name>" or "remotes/<name>/<group>"). Remote groups are
 	// synthetic UI buckets, not rows in groupTree, so they need their own
@@ -1357,6 +1366,11 @@ func (h *Home) collapseOrNavUp() {
 	} else if item.Type == session.ItemTypeSession && h.sessionHasWindows(item) && !h.windowsCollapsed[item.Session.ID] {
 		h.windowsCollapsed[item.Session.ID] = true
 		h.rebuildFlatItems()
+	} else if item.Type == session.ItemTypeSession && h.sessionHasSubSessions(item) && !h.subSessionsAreFolded(item.Session.ID) {
+		h.setSubSessionsFolded(item.Session.ID, true)
+	} else if item.Type == session.ItemTypeSession && item.IsSubSession && item.Session != nil && item.Session.ParentSessionID != "" &&
+		h.subSessionCount[item.Session.ParentSessionID] > 0 {
+		h.setSubSessionsFolded(item.Session.ParentSessionID, true)
 	} else if item.Type == session.ItemTypeSession {
 		h.groupTree.CollapseGroup(item.Path)
 		h.rebuildFlatItems()
@@ -2044,6 +2058,8 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		creatingSessions:          make(map[string]*CreatingSession),
 		lastLogActivity:           make(map[string]time.Time),
 		windowsCollapsed:          make(map[string]bool),
+		subSessionsFolded:         make(map[string]bool),
+		subSessionCount:           make(map[string]int),
 		remoteGroupsCollapsed:     make(map[string]bool),
 		remoteSessionOrder:        make(remoteOrder),
 		worktreeDirtyCache:        make(map[string]bool),
@@ -2103,6 +2119,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.previewHideWorktree = cfg.Preview.GetHideWorktree()
 		h.previewHideClaude = cfg.Preview.GetHideClaude()
 		h.compact = cfg.UI.GetCompact()
+		h.subSessionsFoldedDefault = cfg.UI.GetCollapseSubSessions()
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
 		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
@@ -3098,6 +3115,65 @@ func (h *Home) sessionHasWindows(item session.Item) bool {
 	return len(tmux.GetCachedWindows(tmuxSess.Name)) >= 2
 }
 
+// subSessionsAreFolded reports whether a parent session's sub-sessions are
+// hidden: an explicit fold/unfold wins, otherwise [ui] collapse_sub_sessions.
+func (h *Home) subSessionsAreFolded(parentID string) bool {
+	if folded, ok := h.subSessionsFolded[parentID]; ok {
+		return folded
+	}
+	return h.subSessionsFoldedDefault
+}
+
+// sessionHasSubSessions reports whether the session row has sub-sessions in the
+// current view (counted before folding, so a folded parent still qualifies).
+func (h *Home) sessionHasSubSessions(item session.Item) bool {
+	return item.Session != nil && h.subSessionCount[item.Session.ID] > 0
+}
+
+// dropFoldedSubSessions counts each parent's visible sub-sessions, then removes
+// the sub-session rows of folded parents.
+func (h *Home) dropFoldedSubSessions(items []session.Item) []session.Item {
+	if h.subSessionCount == nil {
+		h.subSessionCount = make(map[string]int)
+	}
+	clear(h.subSessionCount)
+	for _, item := range items {
+		if item.Type == session.ItemTypeSession && item.IsSubSession && item.Session != nil && item.Session.ParentSessionID != "" {
+			h.subSessionCount[item.Session.ParentSessionID]++
+		}
+	}
+	out := items[:0:0]
+	for _, item := range items {
+		if item.Type == session.ItemTypeSession && item.IsSubSession && item.Session != nil &&
+			item.Session.ParentSessionID != "" && h.subSessionsAreFolded(item.Session.ParentSessionID) &&
+			h.subSessionCount[item.Session.ParentSessionID] > 0 && h.parentRowVisible(items, item.Session.ParentSessionID) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// parentRowVisible reports whether the parent session has its own row in items.
+// A sub-session whose parent is filtered out (or lives elsewhere) is shown as an
+// orphan rather than vanishing behind a fold nobody can open.
+func (h *Home) parentRowVisible(items []session.Item, parentID string) bool {
+	for _, it := range items {
+		if it.Type == session.ItemTypeSession && it.Session != nil && it.Session.ID == parentID {
+			return true
+		}
+	}
+	return false
+}
+
+// setSubSessionsFolded folds or unfolds a parent's sub-sessions and keeps the
+// cursor on the parent row.
+func (h *Home) setSubSessionsFolded(parentID string, folded bool) {
+	h.subSessionsFolded[parentID] = folded
+	h.rebuildFlatItems()
+	h.moveCursorToSession(parentID)
+}
+
 // moveCursorToSession moves the cursor to the flat item matching the given session ID.
 func (h *Home) moveCursorToSession(sessionID string) {
 	for i, fi := range h.flatItems {
@@ -3491,6 +3567,7 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
 	// filtering and view-mode partitioning above can drop or reorder the
 	// trailing rows. Runs before window injection so injected windows inherit
 	// the corrected flags.
+	h.flatItems = h.dropFoldedSubSessions(h.flatItems)
 	h.flatItems = session.RecomputeTreeConnectors(h.flatItems)
 
 	// Inject window items after sessions that have 2+ windows
@@ -11844,11 +11921,15 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.noteGroupToggled(groupPath)
 			} else if item.Type == session.ItemTypeRemoteGroup {
 				h.toggleRemoteGroup(item.RemoteName, item.Path)
+			} else if item.Type == session.ItemTypeSession && h.sessionHasSubSessions(item) && h.subSessionsAreFolded(item.Session.ID) {
+				h.setSubSessionsFolded(item.Session.ID, false)
 			} else if item.Type == session.ItemTypeSession && h.sessionHasWindows(item) {
 				sid := item.Session.ID
 				h.windowsCollapsed[sid] = !h.windowsCollapsed[sid]
 				h.rebuildFlatItems()
 				h.moveCursorToSession(sid)
+			} else if item.Type == session.ItemTypeSession && h.sessionHasSubSessions(item) {
+				h.setSubSessionsFolded(item.Session.ID, true)
 			}
 		}
 		return h, nil
@@ -22174,9 +22255,10 @@ func (h *Home) renderSessionItem(
 
 	// Window expand/collapse chevron for sessions with 2+ windows
 	windowChevron := " " // space placeholder to keep status icons aligned
-	if h.sessionHasWindows(item) {
+	hasWindows, hasSubs := h.sessionHasWindows(item), h.sessionHasSubSessions(item)
+	if hasWindows || hasSubs {
 		chevronChar := "▾"
-		if h.windowsCollapsed[inst.ID] {
+		if (hasWindows && h.windowsCollapsed[inst.ID]) || (!hasWindows && h.subSessionsAreFolded(inst.ID)) {
 			chevronChar = "▸"
 		}
 		chevronStyle := TreeConnectorStyle
@@ -22202,6 +22284,10 @@ func (h *Home) renderSessionItem(
 	// Maestro (fleet supervisor): ⬢ glyph leads the title.
 	if isMaestro {
 		displayTitle = "⬢ " + displayTitle
+	}
+	// A folded parent says how many sub-sessions it is hiding.
+	if hasSubs && h.subSessionsAreFolded(inst.ID) {
+		displayTitle += fmt.Sprintf(" +%d", h.subSessionCount[inst.ID])
 	}
 	// Include the stored slot in the existing badge/title cell budget. Normal
 	// titles need the same reservation as auto-names so the badge stays visible.

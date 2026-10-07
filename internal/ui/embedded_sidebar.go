@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -296,6 +297,11 @@ func (h *Home) renderEmbeddedSessionItem(
 		chevron = "▾ "
 		if h.windowsCollapsed[inst.ID] {
 			chevron = "▸ "
+		}
+	} else if h.sessionHasSubSessions(item) {
+		chevron = "▾ "
+		if h.subSessionsAreFolded(inst.ID) {
+			chevron = "▸+" + strconv.Itoa(h.subSessionCount[inst.ID]) + " "
 		}
 	}
 	rowLines := h.sidebarRowLines()

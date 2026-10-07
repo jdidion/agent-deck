@@ -455,6 +455,10 @@ type UISettings struct {
 	// Distinct from SidebarDensity, which controls per-session ROW height.
 	Compact *bool `toml:"compact,omitempty"`
 
+	// CollapseSubSessions starts every parent session with its sub-sessions
+	// folded in the session list (h/left folds, l/right unfolds). Default false.
+	CollapseSubSessions *bool `toml:"collapse_sub_sessions,omitempty"`
+
 	// SidebarDensity controls how many lines one session occupies in the
 	// embedded-layout sidebar. It has no effect on the classic layout. Valid
 	// values:
@@ -715,6 +719,12 @@ func (u UISettings) GetEmbeddedTerminal() bool {
 // GetCompact reports whether the tightened vertical layout is on. Default false.
 func (u UISettings) GetCompact() bool {
 	return u.Compact != nil && *u.Compact
+}
+
+// GetCollapseSubSessions reports whether parent sessions start with their
+// sub-sessions folded. Default false.
+func (u UISettings) GetCollapseSubSessions() bool {
+	return u.CollapseSubSessions != nil && *u.CollapseSubSessions
 }
 
 // Sidebar densities for the embedded layout. See UISettings.SidebarDensity.
