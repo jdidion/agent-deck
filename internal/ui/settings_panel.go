@@ -10,6 +10,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 )
 
 // SettingType identifies which setting is being edited
@@ -25,6 +26,8 @@ const (
 	SettingHermesYoloMode
 	SettingCheckForUpdates
 	SettingAutoUpdate
+	SettingAutoInstall
+	SettingAutoRestart
 	SettingLogMaxSize
 	SettingLogMaxLines
 	SettingRemoveOrphans
@@ -50,10 +53,13 @@ const (
 	SettingShowPaneTitles
 	SettingShowOnlyInstalledTools
 	SettingVisibleTools
+	SettingEmbeddedTerminal
+	SettingSidebarDensity
+	SettingPrivacy
 )
 
 // Total number of navigable settings.
-const settingsCount = 34
+const settingsCount = 39
 
 // SettingsPanel displays and edits user configuration
 type SettingsPanel struct {
@@ -79,6 +85,8 @@ type SettingsPanel struct {
 	hermesYoloMode      bool
 	checkForUpdates     bool
 	autoUpdate          bool
+	autoInstall         bool
+	autoRestart         bool
 	logMaxSizeMB        int
 	logMaxLines         int
 	removeOrphans       bool
@@ -104,7 +112,11 @@ type SettingsPanel struct {
 	showSessionTimestamps  bool
 	showPaneTitles         bool
 	showOnlyInstalledTools bool
+	embeddedLayout         bool
+	sidebarDensity         int // index into sidebarDensityValues
 	pendingToolVisibility  bool
+	pendingPrivacy         bool   // Enter/Space on the Privacy row: home opens consent or turns it off
+	privacyLabel           string // "on (full)" / "off", read from telemetry state on Show
 
 	// Text input state
 	editingText bool
@@ -120,8 +132,8 @@ type SettingsPanel struct {
 // builtinToolNames and builtinToolValues are the built-in tools. Custom tools
 // from config are appended dynamically in LoadConfig.
 var (
-	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Cursor", "Hermes", "DeepSeek"}
-	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek"}
+	builtinToolNames  = []string{"Claude", "Gemini", "OpenCode", "Codex", "Pi", "Copilot", "Crush", "Muse", "Cursor", "Hermes", "DeepSeek", "Oh My Pi"}
+	builtinToolValues = []string{"claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp"}
 )
 
 // Search tier names for radio selection
@@ -135,6 +147,28 @@ var (
 	themeNames  = []string{"Dark", "Light", "System"}
 	themeValues = []string{"dark", "light", "system"}
 )
+
+// Embedded sidebar density names for radio selection. Index order must match
+// sidebarDensityValues.
+var (
+	sidebarDensityNames  = []string{"Full", "Compact", "Minimal", "Auto"}
+	sidebarDensityValues = []string{
+		session.SidebarDensityFull,
+		session.SidebarDensityCompact,
+		session.SidebarDensityMinimal,
+		session.SidebarDensityAuto,
+	}
+)
+
+// defaultSidebarDensityIndex is the radio index of session.DefaultSidebarDensity.
+func defaultSidebarDensityIndex() int {
+	for i, val := range sidebarDensityValues {
+		if val == session.DefaultSidebarDensity {
+			return i
+		}
+	}
+	return 0
+}
 
 // Stats format names for radio selection
 var (
@@ -151,6 +185,8 @@ func NewSettingsPanel() *SettingsPanel {
 		logMaxLines:         10000,
 		removeOrphans:       true,
 		checkForUpdates:     true,
+		autoInstall:         true,
+		autoRestart:         true,
 		globalSearchEnabled: true,
 		recentDays:          90,
 		showOutput:          true,  // Default: output ON (shows launch animation)
@@ -163,6 +199,8 @@ func NewSettingsPanel() *SettingsPanel {
 		statsShowRAM:        true,
 		statsShowDisk:       true,
 		statsShowNetwork:    true,
+		embeddedLayout:      false,
+		sidebarDensity:      defaultSidebarDensityIndex(),
 	}
 }
 
@@ -173,6 +211,7 @@ func (s *SettingsPanel) Show() {
 	s.scrollOffset = 0
 	s.editingText = false
 	s.needsRestart = false
+	s.privacyLabel = telemetryPrivacyLabel()
 
 	// Load current config
 	config, _ := session.LoadUserConfig()
@@ -270,6 +309,8 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	// Update settings
 	s.checkForUpdates = config.Updates.GetCheckEnabled()
 	s.autoUpdate = config.Updates.AutoUpdate
+	s.autoInstall = config.Updates.GetAutoInstall()
+	s.autoRestart = config.Updates.GetAutoRestart()
 
 	// Log settings
 	s.logMaxSizeMB = config.Logs.MaxSizeMB
@@ -339,7 +380,15 @@ func (s *SettingsPanel) LoadConfig(config *session.UserConfig) {
 	s.showSessionTimestamps = config.Display.ShowSessionTimestamps
 	s.showPaneTitles = config.Display.ShowPaneTitles
 
-	// UI tool picker settings
+	// UI settings
+	s.embeddedLayout = config.UI.GetEmbeddedTerminal()
+	s.sidebarDensity = defaultSidebarDensityIndex()
+	for i, val := range sidebarDensityValues {
+		if val == config.UI.GetSidebarDensity() {
+			s.sidebarDensity = i
+			break
+		}
+	}
 	s.showOnlyInstalledTools = config.UI.ShowOnlyInstalledTools
 }
 
@@ -352,7 +401,7 @@ func (s *SettingsPanel) buildToolLists(config *session.UserConfig) {
 			"claude": true, "gemini": true, "opencode": true,
 			"codex": true, "pi": true, "crush": true, "copilot": true,
 			"shell": true, "cursor": true, "aider": true, "hermes": true,
-			"deepseek": true,
+			"deepseek": true, "muse": true, "omp": true,
 		}
 		var custom []string
 		for name := range config.Tools {
@@ -413,6 +462,10 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	checkForUpdates := s.checkForUpdates
 	config.Updates.CheckEnabled = &checkForUpdates
 	config.Updates.AutoUpdate = s.autoUpdate
+	autoInstall := s.autoInstall
+	config.Updates.AutoInstall = &autoInstall
+	autoRestart := s.autoRestart
+	config.Updates.AutoRestart = &autoRestart
 
 	// Log settings
 	config.Logs.MaxSizeMB = s.logMaxSizeMB
@@ -476,7 +529,12 @@ func (s *SettingsPanel) GetConfig() *session.UserConfig {
 	config.Display.ShowSessionTimestamps = s.showSessionTimestamps
 	config.Display.ShowPaneTitles = s.showPaneTitles
 
-	// UI tool picker settings
+	// UI settings
+	embeddedLayout := s.embeddedLayout
+	config.UI.EmbeddedTerminal = &embeddedLayout
+	if s.sidebarDensity >= 0 && s.sidebarDensity < len(sidebarDensityValues) {
+		config.UI.SidebarDensity = sidebarDensityValues[s.sidebarDensity]
+	}
 	config.UI.ShowOnlyInstalledTools = s.showOnlyInstalledTools
 
 	// Preserve original MCPs, Tools, and Docker settings.
@@ -551,10 +609,18 @@ func (s *SettingsPanel) Update(msg tea.KeyMsg) (*SettingsPanel, tea.Cmd, bool) {
 		valueChanged = s.adjustValue(1)
 
 	case " ":
+		if SettingType(s.cursor) == SettingPrivacy {
+			s.pendingPrivacy = true
+			s.Hide()
+			break
+		}
 		valueChanged = s.toggleValue()
 
 	case "enter":
-		if s.isTextSetting() {
+		if SettingType(s.cursor) == SettingPrivacy {
+			s.pendingPrivacy = true
+			s.Hide()
+		} else if s.isTextSetting() {
 			s.startTextEdit()
 		} else if SettingType(s.cursor) == SettingVisibleTools {
 			s.pendingToolVisibility = true
@@ -573,6 +639,25 @@ func (s *SettingsPanel) ConsumeToolVisibilityRequest() bool {
 	}
 	s.pendingToolVisibility = false
 	return true
+}
+
+// ConsumePrivacyRequest reports whether the user activated the Privacy row
+// and clears the latch.
+func (s *SettingsPanel) ConsumePrivacyRequest() bool {
+	if !s.pendingPrivacy {
+		return false
+	}
+	s.pendingPrivacy = false
+	return true
+}
+
+// telemetryPrivacyLabel renders the Privacy row value from telemetry state.
+func telemetryPrivacyLabel() string {
+	st := telemetry.LoadState()
+	if ok, _ := telemetry.Enabled(st); ok {
+		return "on (" + string(telemetry.EffectiveLevel(st)) + ")"
+	}
+	return "off"
 }
 
 // adjustValue changes a radio or number value by delta
@@ -649,6 +734,13 @@ func (s *SettingsPanel) adjustValue(delta int) bool {
 			s.statsFormat = newVal
 			changed = true
 		}
+
+	case SettingSidebarDensity:
+		newVal := s.sidebarDensity + delta
+		if newVal >= 0 && newVal < len(sidebarDensityNames) {
+			s.sidebarDensity = newVal
+			changed = true
+		}
 	}
 
 	return changed
@@ -681,6 +773,14 @@ func (s *SettingsPanel) toggleValue() bool {
 
 	case SettingAutoUpdate:
 		s.autoUpdate = !s.autoUpdate
+		return true
+
+	case SettingAutoInstall:
+		s.autoInstall = !s.autoInstall
+		return true
+
+	case SettingAutoRestart:
+		s.autoRestart = !s.autoRestart
 		return true
 
 	case SettingRemoveOrphans:
@@ -750,6 +850,16 @@ func (s *SettingsPanel) toggleValue() bool {
 
 	case SettingShowOnlyInstalledTools:
 		s.showOnlyInstalledTools = !s.showOnlyInstalledTools
+		return true
+
+	case SettingEmbeddedTerminal:
+		s.embeddedLayout = !s.embeddedLayout
+		return true
+
+	case SettingSidebarDensity:
+		// Space cycles the radio group, so the density is reachable without
+		// remembering that h/l adjust multi-value settings.
+		s.sidebarDensity = (s.sidebarDensity + 1) % len(sidebarDensityNames)
 		return true
 	}
 
@@ -943,8 +1053,20 @@ func (s *SettingsPanel) View() string {
 	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n")
 
-	line = s.renderCheckbox("Auto-install updates", s.autoUpdate)
+	line = s.renderCheckbox("Offer to install on startup", s.autoUpdate)
 	if s.cursor == int(SettingAutoUpdate) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Install updates automatically", s.autoInstall)
+	if s.cursor == int(SettingAutoInstall) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = s.renderCheckbox("Restart automatically after update", s.autoRestart)
+	if s.cursor == int(SettingAutoRestart) {
 		line = highlightStyle.Render(line)
 	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
@@ -1149,6 +1271,33 @@ func (s *SettingsPanel) View() string {
 	}
 	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
 
+	// INTERFACE
+	content.WriteString(sectionStyle.Render("INTERFACE"))
+	content.WriteString("\n")
+
+	line = s.renderCheckbox("Embedded terminal", s.embeddedLayout) + " - Persistent sidebar with an interactive tmux pane (applies at next launch)"
+	if s.cursor == int(SettingEmbeddedTerminal) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+
+	line = "Sidebar density: " + s.renderRadioGroup(sidebarDensityNames, s.sidebarDensity, s.cursor == int(SettingSidebarDensity))
+	if s.cursor == int(SettingSidebarDensity) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n")
+	content.WriteString(dimStyle.Render("    Lines per session in the embedded sidebar: 3 / 2 / 1 (1 keeps the tool marker)") + "\n")
+	content.WriteString(dimStyle.Render("    Auto: the most lines that still fit every open session on screen") + "\n\n")
+
+	// PRIVACY
+	content.WriteString(sectionStyle.Render("PRIVACY"))
+	content.WriteString("\n")
+	line = "Usage data: " + s.privacyLabel + "  (Enter to change)"
+	if s.cursor == int(SettingPrivacy) {
+		line = highlightStyle.Render(line)
+	}
+	content.WriteString("  " + labelStyle.Render(line) + "\n\n")
+
 	// MCP & TOOLS
 	content.WriteString(sectionStyle.Render("MCP SERVERS & CUSTOM TOOLS"))
 	content.WriteString("\n")
@@ -1163,22 +1312,44 @@ func (s *SettingsPanel) View() string {
 	content.WriteString(dimStyle.Render(mcpHint))
 	content.WriteString("\n\n")
 
-	// Help bar
-	content.WriteString(dimStyle.Render("j/k Navigate  Space Toggle  h/l Adjust  Enter Edit  Esc Close"))
+	// Help bar, broken between hints (never mid-hint) when the box is
+	// narrower than the bar.
+	helpBar := dimStyle.Render(renderDialogFooterRows(dialogWidth-4, 2, "  ",
+		[]string{"j/k Navigate", "Space Toggle", "h/l Adjust", "Enter Edit", "Esc Close"}))
+	content.WriteString(helpBar)
 
 	// Apply scroll windowing if content overflows available terminal height.
 	// The dialog box adds 4 lines of chrome: border (top+bottom) + padding (top+bottom).
 	contentStr := content.String()
 	const dialogChrome = 4
 	availHeight := s.height - dialogChrome
-	if availHeight < 10 {
-		availHeight = 10
+	if availHeight < 5 {
+		availHeight = 5
 	}
 
-	contentLines := strings.Split(strings.TrimRight(contentStr, "\n"), "\n")
+	// Window the rows the box actually draws: a long line (the DEFAULT TOOL
+	// pills, the embedded-terminal hint) wraps inside the box, so counting
+	// source lines let the box grow past the screen and lose its top rows.
+	// rowOf maps a source line to its first drawn row.
+	sourceLines := strings.Split(strings.TrimRight(contentStr, "\n"), "\n")
+	wrapStyle := lipgloss.NewStyle().Width(dialogWidth - 4) // the box's Padding(1, 2)
+	rowOf := make([]int, len(sourceLines))
+	var contentLines []string
+	for i, line := range sourceLines {
+		rowOf[i] = len(contentLines)
+		contentLines = append(contentLines, strings.Split(wrapStyle.Render(line), "\n")...)
+	}
 	totalLines := len(contentLines)
 
 	if totalLines > availHeight && s.height > 0 {
+		// The help bar (the last source lines) is pinned below the window,
+		// so Esc stays on screen however far the settings scroll.
+		helpStart := rowOf[len(sourceLines)-lipgloss.Height(helpBar)]
+		helpRows := contentLines[helpStart:]
+		contentLines = contentLines[:helpStart]
+		totalLines = len(contentLines)
+		availHeight = max(availHeight-len(helpRows), 3)
+
 		// Map cursor index to content line number (based on the fixed layout above).
 		// Update this mapping if settings are added/removed/reordered.
 		cursorToLine := [settingsCount]int{
@@ -1191,33 +1362,38 @@ func (s *SettingsPanel) View() string {
 			21, // SettingHermesYoloMode
 			24, // SettingCheckForUpdates
 			25, // SettingAutoUpdate
-			28, // SettingLogMaxSize
-			28, // SettingLogMaxLines (shares line with LogMaxSize)
-			29, // SettingRemoveOrphans
-			32, // SettingGlobalSearchEnabled
-			33, // SettingSearchTier
-			34, // SettingRecentDays
-			37, // SettingShowOutput
-			38, // SettingShowAnalytics
-			39, // SettingShowNotes
-			40, // SettingNotesOutputSplit
-			43, // SettingMaintenanceEnabled
-			46, // SettingStatsEnabled
-			47, // SettingStatsRefresh
-			48, // SettingStatsFormat
-			50, // SettingStatsShowCPU (row with RAM, Disk)
-			50, // SettingStatsShowRAM
-			50, // SettingStatsShowDisk
-			51, // SettingStatsShowNetwork (row with GPU, Load)
-			51, // SettingStatsShowGPU
-			51, // SettingStatsShowLoad
-			54, // SettingSyncTitle (SESSIONS section, after stats)
-			57, // SettingShowSessionTimestamps (DISPLAY section, after SESSIONS)
-			58, // SettingShowPaneTitles (DISPLAY section, after timestamps)
-			61, // SettingShowOnlyInstalledTools (TOOL PICKER section)
-			62, // SettingVisibleTools
+			26, // SettingAutoInstall
+			27, // SettingAutoRestart
+			30, // SettingLogMaxSize
+			30, // SettingLogMaxLines (shares line with LogMaxSize)
+			31, // SettingRemoveOrphans
+			34, // SettingGlobalSearchEnabled
+			35, // SettingSearchTier
+			36, // SettingRecentDays
+			39, // SettingShowOutput
+			40, // SettingShowAnalytics
+			41, // SettingShowNotes
+			42, // SettingNotesOutputSplit
+			45, // SettingMaintenanceEnabled
+			48, // SettingStatsEnabled
+			49, // SettingStatsRefresh
+			50, // SettingStatsFormat
+			52, // SettingStatsShowCPU (row with RAM, Disk)
+			52, // SettingStatsShowRAM
+			52, // SettingStatsShowDisk
+			53, // SettingStatsShowNetwork (row with GPU, Load)
+			53, // SettingStatsShowGPU
+			53, // SettingStatsShowLoad
+			56, // SettingSyncTitle (SESSIONS section, after stats)
+			59, // SettingShowSessionTimestamps (DISPLAY section, after SESSIONS)
+			60, // SettingShowPaneTitles (DISPLAY section, after timestamps)
+			63, // SettingShowOnlyInstalledTools (TOOL PICKER section)
+			64, // SettingVisibleTools
+			67, // SettingEmbeddedTerminal (INTERFACE section)
+			68, // SettingSidebarDensity
+			73, // SettingPrivacy (PRIVACY section)
 		}
-		cursorLine := cursorToLine[s.cursor]
+		cursorLine := rowOf[cursorToLine[s.cursor]]
 
 		// Ensure cursor is visible with 2 lines of context
 		if cursorLine-2 < s.scrollOffset {
@@ -1234,14 +1410,15 @@ func (s *SettingsPanel) View() string {
 			s.scrollOffset = maxOff
 		}
 		// When the cursor sits on the last navigable setting, scroll all the
-		// way to the bottom so the trailing info lines (MCP config-path hint +
-		// help bar) come into view and the "▼ more below" indicator clears.
+		// way to the bottom so the trailing info lines (MCP config-path hint)
+		// come into view and the "▼ more below" indicator clears.
 		// Scrolling is cursor-anchored, so without this the tail is
-		// unreachable (issue #1659). Never scroll past the cursor's context
-		// window, in case the tail ever grows taller than the viewport.
+		// unreachable (issue #1659). Never scroll the cursor's row out of
+		// view (it may sit right under "▲ more above"), in case the tail
+		// ever grows taller than the viewport.
 		if s.cursor == settingsCount-1 && s.scrollOffset < maxOff {
 			bottomOff := maxOff
-			if lim := cursorLine - 2; bottomOff > lim {
+			if lim := cursorLine - 1; bottomOff > lim {
 				bottomOff = lim
 			}
 			if s.scrollOffset < bottomOff {
@@ -1272,6 +1449,7 @@ func (s *SettingsPanel) View() string {
 		if showScrollDown {
 			scrolled.WriteString("\n" + dimStyle.Render("  ▼ more below"))
 		}
+		scrolled.WriteString("\n" + strings.Join(helpRows, "\n"))
 		contentStr = scrolled.String()
 	}
 

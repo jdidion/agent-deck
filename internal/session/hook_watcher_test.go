@@ -115,6 +115,59 @@ func TestStatusFileWatcher_LoadExisting(t *testing.T) {
 	}
 }
 
+// TestStatusFileWatcher_RetainsMatcherAndMessage verifies the human-ask-queue
+// content is threaded through the file->HookStatus decode: a status file
+// carrying matcher/message json keys yields a HookStatus with both populated
+// (alongside Status=="waiting"), for both the permission and elicitation
+// matchers.
+func TestStatusFileWatcher_RetainsMatcherAndMessage(t *testing.T) {
+	cases := []struct {
+		id      string
+		matcher string
+		message string
+	}{
+		{"inst-perm", "permission_prompt", "Claude wants to run: rm -rf build"},
+		{"inst-elic", "elicitation_dialog", "Which migration should I apply?"},
+	}
+
+	tmpDir := t.TempDir()
+	hooksDir := filepath.Join(tmpDir, "hooks")
+	_ = os.MkdirAll(hooksDir, 0755)
+
+	w := &StatusFileWatcher{
+		hooksDir: hooksDir,
+		statuses: make(map[string]*HookStatus),
+	}
+
+	for _, tc := range cases {
+		data, _ := json.Marshal(map[string]any{
+			"status":     "waiting",
+			"session_id": "sess-" + tc.id,
+			"event":      "Notification",
+			"ts":         time.Now().Unix(),
+			"matcher":    tc.matcher,
+			"message":    tc.message,
+		})
+		filePath := filepath.Join(hooksDir, tc.id+".json")
+		_ = os.WriteFile(filePath, data, 0644)
+		w.processFile(filePath)
+
+		hs := w.GetHookStatus(tc.id)
+		if hs == nil {
+			t.Fatalf("%s: expected hook status to be set", tc.id)
+		}
+		if hs.Status != "waiting" {
+			t.Errorf("%s: Status = %q, want waiting", tc.id, hs.Status)
+		}
+		if hs.Matcher != tc.matcher {
+			t.Errorf("%s: Matcher = %q, want %q", tc.id, hs.Matcher, tc.matcher)
+		}
+		if hs.Message != tc.message {
+			t.Errorf("%s: Message = %q, want %q", tc.id, hs.Message, tc.message)
+		}
+	}
+}
+
 func TestStatusFileWatcher_NonExistentInstance(t *testing.T) {
 	w := &StatusFileWatcher{
 		statuses: make(map[string]*HookStatus),

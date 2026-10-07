@@ -29,6 +29,32 @@ func TestFilterEnv_StripsTelegramAndCCD(t *testing.T) {
 	assert.Contains(t, out, "HOME=/home/u")
 }
 
+// The macOS malloc stack-logging debug vars must be stripped so a spawned
+// worker (and the hook-handlers it spawns) does not flood the pane with
+// "MallocStackLogging: can't turn off ..." on every short-lived child.
+func TestFilterEnv_StripsMallocStackLogging(t *testing.T) {
+	in := []string{
+		"PATH=/usr/bin",
+		"MallocStackLogging=1",
+		"MallocStackLoggingNoCompact=1",
+		"MallocStackLoggingDirectory=/tmp/x",
+		"MALLOC_STACK_LOGGING=1",
+		"HOME=/home/u",
+	}
+
+	out := FilterEnv(in, "")
+
+	for _, kv := range out {
+		assert.False(t, strings.HasPrefix(kv, "MallocStackLogging"),
+			"MallocStackLogging* must be stripped, got %q", kv)
+		assert.False(t, strings.HasPrefix(kv, "MALLOC_STACK_LOGGING"),
+			"MALLOC_STACK_LOGGING must be stripped, got %q", kv)
+	}
+	// Unrelated vars pass through.
+	assert.Contains(t, out, "PATH=/usr/bin")
+	assert.Contains(t, out, "HOME=/home/u")
+}
+
 // Empty childConfigDir drops the inherited CCD without re-adding one.
 func TestFilterEnv_EmptyChildDir(t *testing.T) {
 	out := FilterEnv([]string{"CLAUDE_CONFIG_DIR=/parent", "PATH=/bin"}, "")

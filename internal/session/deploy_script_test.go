@@ -90,7 +90,7 @@ func TestDeployScript_UnwritableDirWithoutSudoNamesPathAndUser(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write anywhere; the permission failure cannot be reproduced")
 	}
-	dir := filepath.Join(t.TempDir(), "bin")
+	dir := filepath.Join(evalSymlinksT(t, t.TempDir()), "bin")
 	if err := os.Mkdir(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestDeployScript_UnwritableDirUsesPasswordlessSudo(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write anywhere; the sudo branch is never reached")
 	}
-	dir := filepath.Join(t.TempDir(), "bin")
+	dir := filepath.Join(evalSymlinksT(t, t.TempDir()), "bin")
 	if err := os.Mkdir(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestDeployScript_SudoRefusesRealCommandKeepsRemedy(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root can write anywhere; the sudo branch is never reached")
 	}
-	dir := filepath.Join(t.TempDir(), "bin")
+	dir := filepath.Join(evalSymlinksT(t, t.TempDir()), "bin")
 	if err := os.Mkdir(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
@@ -175,9 +175,11 @@ func pipeRunner(t *testing.T, prelude string, payload io.Reader) *SSHRunner {
 	return &SSHRunner{
 		Host:          "tester@remote",
 		AgentDeckPath: "agent-deck",
-		remoteExecFn: func(ctx context.Context, remoteCmd string, _ []byte) ([]byte, error) {
+		remoteExecFn: func(ctx context.Context, remoteCmd string, stdin []byte) ([]byte, error) {
 			cmd := exec.CommandContext(ctx, "sh", "-c", prelude+remoteCmd)
-			cmd.Stdin = payload
+			if stdin != nil { // only the deploy itself reads the payload
+				cmd.Stdin = payload
+			}
 			var stderr strings.Builder
 			cmd.Stderr = &stderr
 			out, err := cmd.Output()
@@ -203,7 +205,7 @@ func TestDeployScript_ConcurrentDeploysNeverCorrupt(t *testing.T) {
 
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
-	go func() { done <- pipeRunner(t, noSudo, pr).DeployBinary(context.Background(), nil, target) }()
+	go func() { done <- pipeRunner(t, noSudo, pr).DeployBinary(context.Background(), []byte{}, target) }()
 	if _, err := io.WriteString(pw, first); err != nil {
 		t.Fatal(err)
 	}

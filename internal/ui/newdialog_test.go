@@ -89,7 +89,7 @@ func TestNewDialog_ModelInputForCodex(t *testing.T) {
 	if !strings.Contains(view, "Model ID") {
 		t.Fatal("codex new-session dialog should render a model input")
 	}
-	if !strings.Contains(view, "gpt-5.6-sol") || !strings.Contains(view, "gpt-5.5") {
+	if !strings.Contains(view, "gpt-6-sol") || !strings.Contains(view, "gpt-5.5") {
 		t.Fatalf("codex model hints should include current ChatGPT versions: %q", view)
 	}
 
@@ -99,8 +99,8 @@ func TestNewDialog_ModelInputForCodex(t *testing.T) {
 	}
 }
 
-func TestKnownModelIDsForTool_CodexStartsWithGPT56Tiers(t *testing.T) {
-	want := []string{"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+func TestKnownModelIDsForTool_CodexStartsWithGPT6Tiers(t *testing.T) {
+	want := []string{"gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
 	got := knownModelIDsForTool("codex")
 	if len(got) < len(want) || !reflect.DeepEqual(got[:len(want)], want) {
 		t.Fatalf("Codex model catalog prefix = %v, want %v", got, want)
@@ -123,7 +123,7 @@ func TestNewDialog_ModelInputForClaude(t *testing.T) {
 	if !strings.Contains(view, "Model ID") {
 		t.Fatal("claude new-session dialog should render a model input")
 	}
-	if !strings.Contains(view, "claude-opus-5") || !strings.Contains(view, "claude-sonnet-5") {
+	if !strings.Contains(view, "claude-opus-5-5") || !strings.Contains(view, "claude-sonnet-5") {
 		t.Fatalf("claude model hints should include current Claude versions: %q", view)
 	}
 
@@ -144,12 +144,12 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectClaude(t *testing.T) {
 	d.modelInput.SetValue("opus")
 	d.filterModelSuggestions()
 
-	if len(d.modelSuggestions) == 0 || d.modelSuggestions[0] != "claude-opus-5" {
-		t.Fatalf("filtered model suggestions = %v, want claude-opus-5 first", d.modelSuggestions)
+	if len(d.modelSuggestions) == 0 || d.modelSuggestions[0] != "claude-opus-5-5" {
+		t.Fatalf("filtered model suggestions = %v, want claude-opus-5-5 first", d.modelSuggestions)
 	}
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	if !d.IsModelSuggestionsActive() {
-		t.Fatal("enter on model input should activate the model suggestions dropdown")
+		t.Fatal("space on model input should activate the model suggestions dropdown")
 	}
 	if view := d.View(); !strings.Contains(view, "Type custom model ID") || !strings.Contains(view, "claude-opus-5") {
 		t.Fatalf("model dropdown should show custom entry and known model IDs after enter: %q", view)
@@ -160,8 +160,8 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectClaude(t *testing.T) {
 	}
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
 
-	if got := d.GetLaunchModelID(); got != "claude-opus-5" {
-		t.Fatalf("GetLaunchModelID() = %q, want claude-opus-5", got)
+	if got := d.GetLaunchModelID(); got != "claude-opus-5-5" {
+		t.Fatalf("GetLaunchModelID() = %q, want claude-opus-5-5", got)
 	}
 	// Accepting a model advances focus off the model field. The exact next
 	// target depends on the focus order rebuildFocusTargets produces — Path
@@ -172,12 +172,11 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectClaude(t *testing.T) {
 	}
 }
 
-// TestPreselectDefaultModel covers the catalog-membership gate in
-// preselectDefaultModel: a [claude] default_model is honored only when the ID
-// is in knownModelIDsForTool. An ID missing from the catalog is discarded
-// silently — no error, no log — so the session launches with no --model flag
-// at all. That is how a valid `default_model = "claude-opus-5"` became inert
-// while the catalog still stopped at 4.8.
+// TestPreselectDefaultModel covers preselectDefaultModel. The model catalog
+// is a suggestion source, not an allowlist (#2388): a configured
+// [claude] default_model is always prefilled, even when this build's catalog
+// does not know it (a model newer than the build, or an alias). Dropping it
+// silently used to launch the session on the tool default instead.
 func TestPreselectDefaultModel(t *testing.T) {
 	withModel := func(id string) *session.UserConfig {
 		cfg := &session.UserConfig{}
@@ -192,9 +191,10 @@ func TestPreselectDefaultModel(t *testing.T) {
 		want   string
 	}{
 		{"in catalog is honored", withModel("claude-opus-5"), "claude", "claude-opus-5"},
+		{"newest Opus is honored", withModel("claude-opus-5-5"), "claude", "claude-opus-5-5"},
 		{"older in-catalog ID still honored", withModel("claude-opus-4-8"), "claude", "claude-opus-4-8"},
-		{"unknown ID degrades to unset", withModel("claude-opus-9"), "claude", ""},
-		{"bare alias is not a catalog ID", withModel("opus"), "claude", ""},
+		{"unknown ID passes through", withModel("claude-opus-9"), "claude", "claude-opus-9"},
+		{"bare alias passes through", withModel("opus"), "claude", "opus"},
 		{"surrounding whitespace tolerated", withModel("  claude-sonnet-5  "), "claude", "claude-sonnet-5"},
 		{"empty default is unset", withModel(""), "claude", ""},
 		{"nil config is safe", nil, "claude", ""},
@@ -223,9 +223,9 @@ func TestNewDialog_ModelSuggestions_FilterAndSelectCodex(t *testing.T) {
 	if len(d.modelSuggestions) != 3 || d.modelSuggestions[0] != "gpt-5.6-sol" {
 		t.Fatalf("filtered model suggestions = %v, want three GPT-5.6 tiers with Sol first", d.modelSuggestions)
 	}
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	if !d.IsModelSuggestionsActive() {
-		t.Fatal("enter on model input should activate the model suggestions dropdown")
+		t.Fatal("space on model input should activate the model suggestions dropdown")
 	}
 	if view := d.View(); !strings.Contains(view, "Type custom model ID") || !strings.Contains(view, "gpt-5.6-terra") || !strings.Contains(view, "gpt-5.6-luna") {
 		t.Fatalf("model dropdown should show custom entry and known model IDs after enter: %q", view)
@@ -329,9 +329,9 @@ func TestNewDialog_ModelDropdown_TabAndShiftTabMoveFocus(t *testing.T) {
 
 	d.focusIndex = d.indexOf(focusModel)
 	d.updateFocus()
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	if !d.IsModelSuggestionsActive() {
-		t.Fatal("enter on model input should activate model suggestions")
+		t.Fatal("space on model input should activate model suggestions")
 	}
 
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyShiftTab})
@@ -351,7 +351,7 @@ func TestNewDialog_ModelDropdown_TabAndShiftTabMoveFocus(t *testing.T) {
 
 	d.focusIndex = d.indexOf(focusModel)
 	d.updateFocus()
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace}) // Space opens the list; Enter advances (newdialog_flow_test.go)
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
 	if d.IsModelSuggestionsActive() {
 		t.Fatal("tab should close the model dropdown")
@@ -373,6 +373,12 @@ func TestNewDialog_TabFromLastFieldCyclesToTop(t *testing.T) {
 	}
 	d.updateFocus()
 
+	// The Create button follows the (single-row) codex options panel; Tab from
+	// it wraps to the top of the form.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
+	if d.currentTarget() != focusCreate {
+		t.Fatalf("currentTarget after tab from options = %v, want focusCreate", d.currentTarget())
+	}
 	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyTab})
 	if d.currentTarget() != focusName {
 		t.Fatalf("currentTarget after tab from last field = %v, want focusName", d.currentTarget())
@@ -433,8 +439,8 @@ func TestDisplayCommandPreset(t *testing.T) {
 func TestDialogPresetCommands(t *testing.T) {
 	d := NewNewDialog()
 
-	// Should have shell (empty), claude, gemini, opencode, codex, pi, copilot, crush, cursor, hermes, deepseek
-	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek"}
+	// Should have shell (empty), claude, gemini, opencode, codex, pi, copilot, crush, muse, cursor, hermes, deepseek, omp
+	expectedCommands := []string{"", "claude", "gemini", "opencode", "codex", "pi", "copilot", "crush", "muse", "cursor", "hermes", "deepseek", "omp"}
 
 	if len(d.presetCommands) != len(expectedCommands) {
 		t.Errorf("Expected %d preset commands, got %d", len(expectedCommands), len(d.presetCommands))
@@ -2713,10 +2719,11 @@ func TestNewDialog_CtrlSInertWhileDropdownActive(t *testing.T) {
 	d.Show()
 	d.SetPathSuggestions([]string{"/tmp/a", "/tmp/b"})
 
-	// Open the path suggestions dropdown.
+	// Open the path suggestions dropdown (Space on the soft-selected pre-fill;
+	// Enter on an existing directory advances instead).
 	d.focusIndex = d.indexOf(focusPath)
 	d.updateFocus()
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter}) // focusPath Enter opens dropdown
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeySpace})
 	if !d.IsSuggestionsActive() {
 		t.Fatal("path dropdown should be active after Enter on Path")
 	}

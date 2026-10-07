@@ -24,6 +24,14 @@ on:
 # (e.g. local worker accidentally re-publishes), goreleaser would race with
 # itself and the second uploader would 422 already_exists on each of the 5
 # assets (the v1.9.0-v1.9.5 race).
+# Every job here builds or launches the agent-deck binary. Since v1.16.7 a
+# TUI or daemon installs a newer release on its own and restarts in place;
+# a release landing mid-run must never hijack a test (issue #2251). The
+# binary also refuses under go test, CI=true and without a TTY, this is the
+# one switch that covers every spawn in this workflow.
+env:
+  AGENTDECK_SKIP_UPDATE_CHECK: "1"
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -187,8 +195,12 @@ jobs:
         timeout-minutes: 10
         env:
           GOTOOLCHAIN: go1.25.13
+        # internal/ui is scoped to its eval cases (TestEval_*); the whole
+        # internal/ui suite already ran in "Run tests" and under -race it
+        # alone can outlast this step's 6m package timeout.
         run: |
-          go test -tags 'eval_smoke eval_full' -race -count=1 -timeout 6m ./tests/eval/... ./internal/ui/...
+          go test -tags 'eval_smoke eval_full' -race -count=1 -timeout 6m ./tests/eval/...
+          go test -tags 'eval_smoke eval_full' -race -count=1 -timeout 6m -run '^TestEval_' ./internal/ui/...
 
       - name: Run GoReleaser
         timeout-minutes: 15
@@ -199,6 +211,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          AGENTDECK_POSTHOG_KEY: ${{ secrets.AGENTDECK_POSTHOG_KEY }}
 
       - name: Validate release assets
         timeout-minutes: 5
