@@ -20999,8 +20999,12 @@ func (h *Home) renderStackedLayout(totalHeight int) string {
 
 	// Session list (full width)
 	listTitle := h.renderPanelTitle(h.sidebarTitle(), h.width)
-	listContent := h.renderSessionList(h.width, listHeight-2) // -2 for title
-	listContent = ensureExactHeight(listContent, listHeight-2)
+	titleLines := 2 // title + underline; compact renders a one-line title
+	if h.compact {
+		titleLines = 1
+	}
+	listContent := h.renderSessionList(h.width, listHeight-titleLines)
+	listContent = ensureExactHeight(listContent, listHeight-titleLines)
 	b.WriteString(listTitle)
 	b.WriteString("\n")
 	b.WriteString(listContent)
@@ -21013,8 +21017,8 @@ func (h *Home) renderStackedLayout(totalHeight int) string {
 
 	// Preview (full width)
 	previewTitle := h.renderPanelTitle("PREVIEW", h.width)
-	previewContent := h.renderPreviewPane(h.width, previewHeight-2) // -2 for title
-	previewContent = ensureExactHeight(previewContent, previewHeight-2)
+	previewContent := h.renderPreviewPane(h.width, previewHeight-titleLines)
+	previewContent = ensureExactHeight(previewContent, previewHeight-titleLines)
 	b.WriteString(previewTitle)
 	b.WriteString("\n")
 	b.WriteString(previewContent)
@@ -25298,14 +25302,40 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		// Calculate maxLines dynamically based on how many header lines we've already written
 		// This accounts for Claude sessions having more header lines than other sessions
 		currentContent := b.String()
-		headerLines := strings.Count(currentContent, "\n") + 1 // +1 for the current line
+		// Rows already used: one per newline, plus the current line if the
+		// header did not end with one.
+		headerLines := strings.Count(currentContent, "\n")
+		if !strings.HasSuffix(currentContent, "\n") {
+			headerLines++
+		}
 		lines := strings.Split(preview, "\n")
 
 		// Strip trailing empty lines BEFORE truncation
 		// This ensures we show actual content, not empty trailing lines when space is limited
 		// (Terminal output often ends with empty lines at cursor position)
-		for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		for len(lines) > 0 && strings.TrimSpace(ansi.Strip(lines[len(lines)-1])) == "" {
 			lines = lines[:len(lines)-1]
+		}
+
+		// Collapse runs of blank lines to at most two BEFORE choosing the
+		// visible window. The render loop below collapses them too; doing it
+		// only there freed rows after the window was sized, which left a blank
+		// band at the bottom of the pane while older output stayed hidden.
+		{
+			collapsed := lines[:0:0]
+			blankRun := 0
+			for _, line := range lines {
+				if strings.TrimSpace(ansi.Strip(stripControlCharsPreserveANSI(line))) == "" {
+					blankRun++
+					if blankRun > 2 {
+						continue
+					}
+				} else {
+					blankRun = 0
+				}
+				collapsed = append(collapsed, line)
+			}
+			lines = collapsed
 		}
 
 		// If all lines were empty, show empty indicator
@@ -25318,7 +25348,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			return b.String()
 		}
 
-		maxLines := height - headerLines - 1 // -1 for potential truncation indicator
+		// The "more lines above" indicator reserves its row below, only when it
+		// is shown. Each output row ends in "\n"; the empty element after the
+		// last one falls past the pane height and is trimmed by ensureExactHeight.
+		maxLines := height - headerLines
 		if maxLines < 1 {
 			maxLines = 1
 		}
