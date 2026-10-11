@@ -155,8 +155,8 @@ func TestPendingRebootstrapAgents_ReadsLabelsOnlyMarker(t *testing.T) {
 }
 
 func TestDescribePendingAgent(t *testing.T) {
-	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
-	since := now.Add(-90 * time.Minute)
+	// The description shows the time in the local zone, so build it there.
+	since := time.Date(2026, 9, 19, 10, 30, 0, 0, time.Local)
 	assert.Equal(t, "com.agentdeck.web: bootstrap failed 2 times since 10:30 (last: Input/output error); every update run retries it",
 		DescribePendingAgent(PendingAgent{Label: "com.agentdeck.web", Reason: PendingReasonBootstrapFailed, Since: since, Attempts: 2, LastError: "Input/output error"}))
 	assert.Equal(t, "com.agentdeck.web: deferred since 10:30, the updater ran inside it; the next update run outside it re-registers it",

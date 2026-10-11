@@ -480,7 +480,8 @@ func FetchReleaseByTag(tag string) (*Release, error) {
 // ("1.16.4"), as semver orders them: a preview controller is older than the
 // release it previews, so it never judges a remote on that release as
 // behind, and it never keeps a remote from moving to it (#2164). Two
-// pre-releases of the same core compare by their suffix.
+// pre-releases of the same core compare by their suffix. A git-describe
+// build suffix ("<n>-g<hex>") is the exception: it sorts above its release.
 func CompareVersions(v1, v2 string) int {
 	// Remove 'v' prefix if present
 	v1 = strings.TrimPrefix(v1, "v")
@@ -513,6 +514,25 @@ func CompareVersions(v1, v2 string) int {
 		}
 	}
 
+	// A git-describe build ("1.16.28-29-gbe8bf483", 29 commits past the
+	// v1.16.28 tag) is AFTER its release, not a pre-release of it; two such
+	// builds of the same core order by commit distance.
+	if d1, ok1 := describeDistance(pre1); ok1 {
+		d2, ok2 := describeDistance(pre2)
+		switch {
+		case !ok2:
+			return 1
+		case d1 < d2:
+			return -1
+		case d1 > d2:
+			return 1
+		}
+		return 0
+	}
+	if _, ok2 := describeDistance(pre2); ok2 {
+		return -1
+	}
+
 	switch {
 	case pre1 == pre2:
 		return 0
@@ -522,6 +542,29 @@ func CompareVersions(v1, v2 string) int {
 		return -1
 	}
 	return comparePreRelease(pre1, pre2)
+}
+
+// describeDistance reports whether pre is a git-describe suffix
+// ("<n>-g<hex>", optionally followed by "-dirty") and returns n.
+func describeDistance(pre string) (int, bool) {
+	pre = strings.TrimSuffix(pre, "-dirty")
+	n, hash, ok := strings.Cut(pre, "-g")
+	if !ok || n == "" || len(hash) < 4 {
+		return 0, false
+	}
+	dist := 0
+	for _, c := range n {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		dist = dist*10 + int(c-'0')
+	}
+	for _, c := range hash {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return 0, false
+		}
+	}
+	return dist, true
 }
 
 // splitPreRelease separates "1.2.3-rc.1+build" into its numeric core "1.2.3"
