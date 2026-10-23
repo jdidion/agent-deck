@@ -42,12 +42,12 @@ func TestAcquireNotifyDaemonLock_SingleInstance(t *testing.T) {
 	release3()
 }
 
-func TestAutostartDaemon_DefaultsOn(t *testing.T) {
-	// The whole notification stack is inert without a running daemon, so the
-	// safe default when the key is absent is to auto-start one.
+func TestAutostartDaemon_DefaultsOff(t *testing.T) {
+	// A TUI under a throwaway HOME must not leak a detached daemon, so the
+	// default when the key is absent is not to auto-start one.
 	writeDesktopNotifyConfig(t, "desktop = true")
-	if !GetNotificationsSettings().GetAutostartDaemonEnabled() {
-		t.Error("autostart defaulted off with no autostart_daemon key; want on")
+	if GetNotificationsSettings().GetAutostartDaemonEnabled() {
+		t.Error("autostart defaulted on with no autostart_daemon key; want off")
 	}
 }
 

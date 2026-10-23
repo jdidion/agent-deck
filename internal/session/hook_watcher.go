@@ -175,6 +175,10 @@ type HookStatus struct {
 	// reads a kind and a summary off these without re-parsing anything.
 	Matcher string
 	Message string
+	// ToolName is the payload tool_name (PreToolUse/PermissionRequest). Claude
+	// sends no hook before a permission prompt other than PreToolUse, so the
+	// tool name is what tells an approval from an AskUserQuestion decision.
+	ToolName string
 }
 
 // hookGenerationForInstance resolves generation authority by instance, not by
@@ -519,6 +523,7 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			Platform                 string `json:"platform"`
 			Matcher                  string `json:"matcher"`
 			Message                  string `json:"message"`
+			ToolName                 string `json:"tool_name"`
 			CodexStartedGeneration   string `json:"codex_started_generation"`
 			CodexCompletedGeneration string `json:"codex_completed_generation"`
 			CodexStartedSessionID    string `json:"codex_started_session_id"`
@@ -546,6 +551,7 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			Platform:                 raw.Platform,
 			Matcher:                  raw.Matcher,
 			Message:                  raw.Message,
+			ToolName:                 raw.ToolName,
 			CodexStartedGeneration:   raw.CodexStartedGeneration,
 			CodexCompletedGeneration: raw.CodexCompletedGeneration,
 			CodexStartedSessionID:    raw.CodexStartedSessionID,
@@ -698,6 +704,7 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		Platform                 string `json:"platform"`
 		Matcher                  string `json:"matcher"`
 		Message                  string `json:"message"`
+		ToolName                 string `json:"tool_name"`
 		CodexStartedGeneration   string `json:"codex_started_generation"`
 		CodexCompletedGeneration string `json:"codex_completed_generation"`
 		CodexStartedSessionID    string `json:"codex_started_session_id"`
@@ -732,6 +739,7 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		Platform:                 status.Platform,
 		Matcher:                  status.Matcher,
 		Message:                  status.Message,
+		ToolName:                 status.ToolName,
 		CodexStartedGeneration:   status.CodexStartedGeneration,
 		CodexCompletedGeneration: status.CodexCompletedGeneration,
 		CodexStartedSessionID:    status.CodexStartedSessionID,

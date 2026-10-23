@@ -454,6 +454,18 @@ func (h *HelpOverlay) View() string {
 			},
 		},
 		{
+			title: "SESSION ICONS",
+			items: [][2]string{
+				{"●", "Running"},
+				{"?", "Needs approval (tool call waiting on yes/no)"},
+				{"✎", "Needs decision (question waiting on an answer)"},
+				{"◐", "Waiting, your turn"},
+				{"○", "Idle"},
+				{"✕", "Error"},
+				{"■", "Stopped"},
+			},
+		},
+		{
 			title: "STARTUP FLAGS",
 			items: [][2]string{
 				{"--group <name>", "Launch scoped to a group"},

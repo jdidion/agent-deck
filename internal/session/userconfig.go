@@ -1848,21 +1848,19 @@ type NotificationsConfig struct {
 	// that does all notification dispatch (parent inbox, desktop banners, the
 	// ask queue); without it those never fire. Historically it had to be
 	// installed as a launchd/systemd service, so an operator running the TUI
-	// standalone got no notifications at all. Default true (nil = true): the
-	// spawn is guarded by a machine-wide lock, so repeated launches and
-	// multiple TUIs never produce a second daemon. Set false to manage the
-	// daemon yourself (e.g. via launchd).
+	// standalone got no notifications at all. Default false (nil = false): a
+	// TUI launched under a throwaway HOME would leak a detached daemon. When
+	// on, the spawn is guarded by a machine-wide lock, so repeated launches
+	// and multiple TUIs never produce a second daemon.
 	AutostartDaemon *bool `toml:"autostart_daemon,omitempty"`
 }
 
 // GetAutostartDaemonEnabled reports whether the TUI should auto-start the notify
-// daemon. Defaults to true when unset (nil): the whole notification stack is
-// inert without a running daemon, so the safe default is to ensure one.
+// daemon. Defaults to false when unset (nil): a TUI started under a throwaway
+// HOME (tests, scripted runs) would otherwise leave a detached daemon behind.
+// Run the daemon under launchd/systemd, or set autostart_daemon = true.
 func (n NotificationsConfig) GetAutostartDaemonEnabled() bool {
-	if n.AutostartDaemon == nil {
-		return true
-	}
-	return *n.AutostartDaemon
+	return n.AutostartDaemon != nil && *n.AutostartDaemon
 }
 
 // GetDesktopEnabled reports whether desktop notifications are enabled.

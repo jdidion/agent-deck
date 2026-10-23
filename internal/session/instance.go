@@ -648,6 +648,8 @@ type Instance struct {
 	// Hook-based status detection (set by StatusFileWatcher from Claude Code hooks)
 	hookStatus    string // running, idle, waiting, dead (empty = no hook data)
 	hookEvent     string // Hook event name that caused the last status (e.g. "PermissionRequest")
+	hookMatcher   string // Notification matcher of the last hook (permission_prompt, elicitation_dialog)
+	hookToolName  string // tool_name of the last hook (PreToolUse, PermissionRequest)
 	hookSessionID string // Session ID from hook payload
 	// claudeSupersededIDs holds Claude session ids this instance moved away
 	// from by following a continued-in handoff (#2683). A late hook still
@@ -7022,6 +7024,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		if hs := readHookStatusFile(i.ID); hs != nil && !i.codexHookFromForeignThread(hs) {
 			i.hookStatus = hs.Status
 			i.hookEvent = hs.Event
+			i.hookMatcher, i.hookToolName = hs.Matcher, hs.ToolName
 			i.hookLastUpdate = hs.UpdatedAt
 			i.hookSessionID = hs.SessionID
 			// #1846: a disk-read hook sample is activity evidence too.
@@ -7614,6 +7617,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 	// it carried had already been written here and stuck, flipping this
 	// instance's status. See the candidate_has_no_conversation_data branch.
 	prevHookStatus, prevHookEvent, prevHookLastUpdate := i.hookStatus, i.hookEvent, i.hookLastUpdate
+	prevHookMatcher, prevHookToolName := i.hookMatcher, i.hookToolName
 	prevStartedGen, prevCompletedGen := i.codexStartedGeneration, i.codexCompletedGeneration
 	prevStartedSID, prevCompletedSID := i.codexStartedSessionID, i.codexCompletedSessionID
 	// rejected tracks whether this event was rolled back by restoreHook below.
@@ -7624,6 +7628,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 	restoreHook := func() {
 		rejected = true
 		i.hookStatus, i.hookEvent, i.hookLastUpdate = prevHookStatus, prevHookEvent, prevHookLastUpdate
+		i.hookMatcher, i.hookToolName = prevHookMatcher, prevHookToolName
 		i.codexStartedGeneration, i.codexCompletedGeneration = prevStartedGen, prevCompletedGen
 		i.codexStartedSessionID, i.codexCompletedSessionID = prevStartedSID, prevCompletedSID
 		i.codexInvalidatingGeneration = prevInvalidatingGen
@@ -7636,6 +7641,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 
 	i.hookStatus = status.Status
 	i.hookEvent = status.Event
+	i.hookMatcher, i.hookToolName = status.Matcher, status.ToolName
 	i.hookLastUpdate = status.UpdatedAt
 	i.setCodexGenerationEvidence(status)
 
@@ -7973,6 +7979,17 @@ func (i *Instance) StatusEvidence() StatusEvidence {
 		SSEStatus:  i.sseStatus,
 		SSEAt:      i.sseLastUpdate,
 	}
+}
+
+// AskKind classifies the instance as an ask from the given live status and the
+// cached hook record, using the ask queue classification. Empty when the
+// session is not asking. Reads only cached fields, so it is safe on the render
+// path.
+func (i *Instance) AskKind(status Status) AskKind {
+	i.mu.RLock()
+	hs := &HookStatus{Event: i.hookEvent, Matcher: i.hookMatcher, ToolName: i.hookToolName}
+	i.mu.RUnlock()
+	return DeriveAskKind(hs, string(status))
 }
 
 func (i *Instance) GetHookStatus() (string, bool) {

@@ -1108,6 +1108,15 @@ type Home struct {
 	// session's active window; >= 0 targets that specific window. When nil, the
 	// dispatch calls the tmux session directly. See issue #1369.
 	quickApproveSink func(inst *session.Instance, windowIndex int) error
+	// askDenySink and askRestartSink are optional overrides used by tests to
+	// capture the ask panel's deny (Escape to the pane) and restart dispatches
+	// without driving real tmux. When nil, deny sends Escape to the session's
+	// tmux pane and restart takes the normal restart path.
+	askDenySink    func(inst *session.Instance) error
+	askRestartSink func(inst *session.Instance) error
+	// askPendingAction is the group action awaiting y/n in the ask panel; nil
+	// when no confirmation is showing.
+	askPendingAction func() tea.Cmd
 }
 
 // reloadState preserves UI state during storage reload
@@ -5997,6 +6006,28 @@ func (h *Home) fetchSelectedPreview() tea.Cmd {
 	return h.fetchPreviewDebounced(inst.ID, winIdx)
 }
 
+// refetchSelectedPreviewNow invalidates the selected item's cached preview and
+// fetches it without the navigation debounce. Used on attach return, where the
+// cached capture predates everything that happened while attached.
+func (h *Home) refetchSelectedPreviewNow() tea.Cmd {
+	if h.getLayoutMode() == LayoutModeSingle {
+		return nil
+	}
+	inst, key, winIdx := h.selectedPreviewTarget()
+	if inst == nil {
+		if _, _, remoteKey, ok := h.selectedRemotePreviewTarget(); ok {
+			h.invalidatePreviewCache(remoteKey)
+		}
+		return h.fetchSelectedPreview()
+	}
+	h.previewCacheMu.Lock()
+	delete(h.previewCache, key)
+	delete(h.previewCacheTime, key)
+	h.previewFetchingID = key
+	h.previewCacheMu.Unlock()
+	return h.fetchPreview(inst, key, winIdx)
+}
+
 // detectOpenCodeSessionCmd returns a command that asynchronously detects
 // the OpenCode session ID for a restored session and signals completion.
 // This follows the Bubble Tea pattern of returning a tea.Cmd for async work.
@@ -6139,6 +6170,10 @@ type sessionRenderState struct {
 	// callers that build a fake snapshot without touching this field (many
 	// tests do) get the pre-finding-1 behavior of counting everything.
 	archivedSuperseded bool
+	// askKind is the ask classification (approval/decision/error, or empty)
+	// of status plus the cached hook record, so row glyphs and header counts
+	// match the ask queue without I/O on the render path.
+	askKind session.AskKind
 }
 
 // shouldPersistAutoNameDesc decides whether the background status loop should
@@ -6286,8 +6321,10 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 		if inst == nil {
 			continue
 		}
+		status := inst.GetStatusThreadSafe()
 		state := sessionRenderState{
-			status:             inst.GetStatusThreadSafe(),
+			status:             status,
+			askKind:            inst.AskKind(status),
 			substate:           inst.CachedSubstate(),
 			tool:               inst.DisplayToolThreadSafe(),
 			archivedSuperseded: inst.IsArchived() && inst.SupersededBy != "",
@@ -9701,6 +9738,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// The selected preview cache holds the pre-attach capture; drop it and
+		// fetch now so the first frame after return shows current output.
+		syncCmd = tea.Batch(syncCmd, h.refetchSelectedPreviewNow())
+
 		// Skip save during reload to avoid overwriting external changes (CLI)
 		h.reloadMu.Lock()
 		reloading := h.isReloading
@@ -10944,11 +10985,28 @@ func (h *Home) refreshAskPanel() {
 	h.askPanel.SetRows(rows)
 }
 
-// handleAskPanelKey routes keys while the ask panel is open. v1 is
-// read-and-jump: Enter selects the owning session, r dismisses an item in
-// place, esc/a/q close the panel.
+// handleAskPanelKey routes keys while the ask panel is open
+// (docs/design/2026-10-23-ask-groups.md "Asks panel"). Item keys: enter jumps,
+// r dismisses, y/n approve/deny an approval. On a group header y/n/r act on the
+// whole group; Y/N/R/D act on the cursor's group from anywhere. Group actions
+// confirm first; only y proceeds and any other key cancels the prompt.
 func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	key := msg.String()
+	if h.askPendingAction != nil {
+		run := h.askPendingAction
+		h.askPendingAction = nil
+		h.askPanel.SetConfirm("")
+		if key != "y" {
+			return h, nil
+		}
+		cmd := run()
+		h.refreshAskPanel()
+		return h, cmd
+	}
+
+	group := h.askPanel.CursorGroup()
+	onHeader := h.askPanel.OnHeader()
+	switch key {
 	case "up", "k":
 		h.askPanel.MoveUp()
 		return h, nil
@@ -10956,6 +11014,9 @@ func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.askPanel.MoveDown()
 		return h, nil
 	case "enter":
+		if onHeader {
+			return h, nil
+		}
 		sel := h.askPanel.Selected()
 		if sel != nil {
 			if inst := h.getInstanceByID(sel.InstanceID); inst != nil {
@@ -10964,15 +11025,48 @@ func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		h.askPanel.Hide()
 		return h, nil
-	// TODO(ask-queue v2): answer-in-place here — route a reply to sel.InstanceID via session send.
+	case "y", "n":
+		if group != session.AskApproval {
+			return h, nil
+		}
+		if onHeader {
+			h.confirmAskGroupAction(key == "y", group)
+			return h, nil
+		}
+		if sel := h.askPanel.Selected(); sel != nil {
+			if inst := h.getInstanceByID(sel.InstanceID); inst != nil {
+				if key == "y" {
+					h.quickApprove(inst, -1)
+				} else {
+					h.askDeny(inst)
+				}
+			}
+		}
+		h.refreshAskPanel()
+		return h, nil
+	case "Y", "N":
+		if group == session.AskApproval {
+			h.confirmAskGroupAction(key == "Y", group)
+		}
+		return h, nil
+	case "R":
+		if items := h.askPanel.GroupItems(group); group == session.AskError && len(items) > 0 {
+			h.askConfirm(fmt.Sprintf("Restart %s? (y/n)", askCountNoun(len(items), "errored session")),
+				func() tea.Cmd { return h.askRestartItems(items) })
+		}
+		return h, nil
+	case "D":
+		h.confirmAskDismissGroup(group)
+		return h, nil
 	case "r":
+		if onHeader {
+			h.confirmAskDismissGroup(group)
+			return h, nil
+		}
 		// Manual dismiss: resolve the item and stay in the panel so the human
 		// can keep working the queue down.
-		sel := h.askPanel.Selected()
-		if sel != nil && h.storage != nil {
-			if db := h.storage.GetDB(); db != nil {
-				_ = db.ResolveAskItem(sel.ID, time.Now())
-			}
+		if sel := h.askPanel.Selected(); sel != nil {
+			h.resolveAskItems([]*statedb.AskItemRow{sel})
 		}
 		h.refreshAskPanel()
 		return h, nil
@@ -10981,6 +11075,109 @@ func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 	}
 	return h, nil
+}
+
+// askCountNoun renders "N noun", pluralising noun with an s when N != 1.
+func askCountNoun(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// askConfirm shows prompt in the ask panel and arms run for a following y.
+func (h *Home) askConfirm(prompt string, run func() tea.Cmd) {
+	h.askPendingAction = run
+	h.askPanel.SetConfirm(prompt)
+}
+
+// confirmAskGroupAction arms approve-all (approve) or deny-all for group.
+func (h *Home) confirmAskGroupAction(approve bool, group session.AskKind) {
+	items := h.askPanel.GroupItems(group)
+	if len(items) == 0 {
+		return
+	}
+	verb := "Deny"
+	if approve {
+		verb = "Approve"
+	}
+	h.askConfirm(fmt.Sprintf("%s %s? (y/n)", verb, askCountNoun(len(items), "pending tool call")), func() tea.Cmd {
+		for _, item := range items {
+			inst := h.getInstanceByID(item.InstanceID)
+			if inst == nil {
+				continue
+			}
+			if approve {
+				h.quickApprove(inst, -1)
+			} else {
+				h.askDeny(inst)
+			}
+		}
+		return nil
+	})
+}
+
+// confirmAskDismissGroup arms dismiss-all for group.
+func (h *Home) confirmAskDismissGroup(group session.AskKind) {
+	items := h.askPanel.GroupItems(group)
+	if len(items) == 0 {
+		return
+	}
+	h.askConfirm(fmt.Sprintf("Dismiss %s? (y/n)", askCountNoun(len(items), "ask")), func() tea.Cmd {
+		h.resolveAskItems(items)
+		return nil
+	})
+}
+
+// resolveAskItems marks items resolved in the store. Best-effort.
+func (h *Home) resolveAskItems(items []*statedb.AskItemRow) {
+	if h.storage == nil {
+		return
+	}
+	db := h.storage.GetDB()
+	if db == nil {
+		return
+	}
+	now := time.Now()
+	for _, item := range items {
+		_ = db.ResolveAskItem(item.ID, now)
+	}
+}
+
+// askDeny rejects a pending tool call by sending Escape to the session's pane.
+func (h *Home) askDeny(inst *session.Instance) {
+	if inst == nil {
+		return
+	}
+	if h.askDenySink != nil {
+		_ = h.askDenySink(inst)
+		return
+	}
+	if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
+		_ = tmuxSess.SendNamedKey("Escape")
+	}
+}
+
+// askRestartItems restarts each item's session through the normal restart
+// path, skipping sessions that are mid-animation or cannot restart.
+func (h *Home) askRestartItems(items []*statedb.AskItemRow) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, item := range items {
+		inst := h.getInstanceByID(item.InstanceID)
+		if inst == nil {
+			continue
+		}
+		if h.askRestartSink != nil {
+			_ = h.askRestartSink(inst)
+			continue
+		}
+		if h.hasActiveAnimation(inst.ID) || !inst.CanRestart() {
+			continue
+		}
+		h.resumingSessions[inst.ID] = time.Now()
+		cmds = append(cmds, h.restartSession(inst))
+	}
+	return tea.Batch(cmds...)
 }
 
 // createSessionFromGlobalSearch creates a new Agent Deck session from global search result
@@ -19415,8 +19612,31 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored 
 
 // renderFilterBar renders the quick filter pills
 // Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [■ Stopped 1] [✕ Error 1]
+// countAskKinds counts local waiting sessions the render snapshot classifies
+// as an approval or a decision ask. Those are drawn ? and ✎ rather than ◐.
+func (h *Home) countAskKinds() (approval, decision int) {
+	for _, state := range h.getSessionRenderSnapshot() {
+		if state.archivedSuperseded || statusBucket(state.status) != session.StatusWaiting {
+			continue
+		}
+		switch state.askKind {
+		case session.AskApproval:
+			approval++
+		case session.AskDecision:
+			decision++
+		}
+	}
+	return approval, decision
+}
+
 func (h *Home) renderFilterBar() string {
 	running, waiting, idle, stopped, errored := h.countSessionStatuses()
+	// ◐ counts only waiting sessions that are not asks; approvals and
+	// decisions get their own ? and ✎ pills.
+	approvals, decisions := h.countAskKinds()
+	if waiting -= approvals + decisions; waiting < 0 {
+		waiting = 0
+	}
 
 	// Pill styling
 	activePillStyle := lipgloss.NewStyle().
@@ -19460,6 +19680,19 @@ func (h *Home) renderFilterBar() string {
 			Padding(0, 1).Render(runningLabel))
 	} else {
 		pills = append(pills, dimPillStyle.Render(runningLabel))
+	}
+
+	if approvals > 0 {
+		pills = append(pills, lipgloss.NewStyle().
+			Foreground(ColorYellow).
+			Background(ColorSurface).
+			Padding(0, 1).Render(fmt.Sprintf("? %d", approvals)))
+	}
+	if decisions > 0 {
+		pills = append(pills, lipgloss.NewStyle().
+			Foreground(ColorMagenta).
+			Background(ColorSurface).
+			Padding(0, 1).Render(fmt.Sprintf("✎ %d", decisions)))
 	}
 
 	waitingLabel := fmt.Sprintf("◐ %d", waiting)
@@ -22889,7 +23122,7 @@ func (h *Home) renderSessionItem(
 	// status (plus the Honest-Status-v2 error substates) to a glyph, and forces
 	// the stopped glyph for archived sessions whose snapshot still carries a
 	// stale live status.
-	statusIcon, statusStyle := rowStatusGlyph(instStatus, instSubstate, inst.IsArchived())
+	statusIcon, statusStyle := rowAttentionGlyph(instStatus, instSubstate, inst.IsArchived(), instState.askKind)
 
 	status := statusStyle.Render(statusIcon)
 

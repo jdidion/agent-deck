@@ -42,6 +42,11 @@ type hookPayload struct {
 	// HookStatus as an ask summary without re-parsing the payload. Absent on
 	// most events; empty then, which the producer treats as "no summary".
 	Message string `json:"message,omitempty"`
+	// ToolName is the tool a PreToolUse/PermissionRequest is about. Claude
+	// sends no hook before a permission prompt other than PreToolUse, so the
+	// ask-queue producer tells an approval from an AskUserQuestion decision by
+	// it. Raw so an unexpected type never makes the payload undecodable.
+	ToolName json.RawMessage `json:"tool_name,omitempty"`
 	// Cwd is the session's working directory (PROJECT_DIR) as reported by
 	// Claude Code on each hook event. Issue #1233: when a running session's
 	// registered worktree is renamed/removed, this points at a path that no
@@ -220,8 +225,9 @@ type hookStatusFile struct {
 	// producer reads a kind and a summary off these without re-parsing.
 	// omitempty keeps records that carry neither (ordinary Stop/turn edges)
 	// byte-identical to before.
-	Matcher string `json:"matcher,omitempty"`
-	Message string `json:"message,omitempty"`
+	Matcher  string `json:"matcher,omitempty"`
+	Message  string `json:"message,omitempty"`
+	ToolName string `json:"tool_name,omitempty"`
 	// Cwd is the working directory the hook payload reported for this event.
 	// Issue #1729: the session-binding path uses it as same-session evidence —
 	// a candidate session id whose cwd is provably outside the instance's
@@ -443,7 +449,7 @@ func handleHookHandlerReceivedAt(receivedAt time.Time) {
 	if isStopHookEvent(payload.HookEventName) {
 		scan = detectDoneSentinel(data)
 	}
-	writeHookStatusReceivedAtPlatform(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, hookPayloadPlatform(payload), scan, receivedAt, hookAskContent{matcher: matcher, message: payload.Message})
+	writeHookStatusReceivedAtPlatform(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, hookPayloadPlatform(payload), scan, receivedAt, hookAskContent{matcher: matcher, message: payload.Message, toolName: hookPayloadToolName(payload)})
 	if payload.HookEventName == "PreToolUse" {
 		// This high-frequency edge only publishes activity. Lifecycle hooks
 		// still own metadata reconciliation, costs, and Recall indexing.
@@ -628,8 +634,21 @@ func writeHookStatus(instanceID, status, sessionID, event, cwd string, done ...s
 // existing 6-arg writeHookStatusWithScan callers (e.g. the #1186 done-signal
 // path) stay source-compatible; absent means "no ask content to persist".
 type hookAskContent struct {
-	matcher string
-	message string
+	matcher  string
+	message  string
+	toolName string
+}
+
+// maxHookToolNameLen caps the tool name persisted to the status file.
+const maxHookToolNameLen = 128
+
+// hookPayloadToolName returns the payload tool_name, trimmed and capped.
+func hookPayloadToolName(p hookPayload) string {
+	name := strings.TrimSpace(rawString(p.ToolName))
+	if len(name) > maxHookToolNameLen {
+		name = name[:maxHookToolNameLen]
+	}
+	return name
 }
 
 // writeHookStatusWithScan is writeHookStatus plus the full Stop-edge scan
@@ -680,6 +699,7 @@ func writeHookStatusReceivedAtPlatform(instanceID, status, sessionID, event, cwd
 	if len(ask) > 0 {
 		statusFile.Matcher = ask[0].matcher
 		statusFile.Message = ask[0].message
+		statusFile.ToolName = ask[0].toolName
 	}
 	if scan.signal != nil {
 		statusFile.DoneStatus = scan.signal.Status

@@ -23,7 +23,7 @@ var currentTheme Theme = ThemeDark
 var darkColors = struct {
 	Bg, Surface, Border, Text, TextDim  lipgloss.Color
 	Accent, Purple, Cyan, Green, Yellow lipgloss.Color
-	Orange, Red, Comment                lipgloss.Color
+	Orange, Red, Comment, Magenta       lipgloss.Color
 }{
 	Bg:      lipgloss.Color("#1a1b26"),
 	Surface: lipgloss.Color("#24283b"),
@@ -38,13 +38,14 @@ var darkColors = struct {
 	Orange:  lipgloss.Color("#ff9e64"),
 	Red:     lipgloss.Color("#f7768e"),
 	Comment: lipgloss.Color("#787fa0"),
+	Magenta: lipgloss.Color("#ff5fd2"),
 }
 
 // Light Theme - Tokyo Night Light variant
 var lightColors = struct {
 	Bg, Surface, Border, Text, TextDim  lipgloss.Color
 	Accent, Purple, Cyan, Green, Yellow lipgloss.Color
-	Orange, Red, Comment                lipgloss.Color
+	Orange, Red, Comment, Magenta       lipgloss.Color
 }{
 	Bg:      lipgloss.Color("#d5d6db"),
 	Surface: lipgloss.Color("#e9e9ec"),
@@ -59,6 +60,7 @@ var lightColors = struct {
 	Orange:  lipgloss.Color("#965027"),
 	Red:     lipgloss.Color("#8c4351"),
 	Comment: lipgloss.Color("#6a6d7c"),
+	Magenta: lipgloss.Color("#a3268f"),
 }
 
 // Active color variables (set by InitTheme)
@@ -76,6 +78,7 @@ var (
 	ColorOrange  lipgloss.Color
 	ColorRed     lipgloss.Color
 	ColorComment lipgloss.Color
+	ColorMagenta lipgloss.Color
 )
 
 // themeMu protects global color/style variables during live theme switches.
@@ -102,6 +105,7 @@ func InitTheme(theme string) {
 		ColorOrange = lightColors.Orange
 		ColorRed = lightColors.Red
 		ColorComment = lightColors.Comment
+		ColorMagenta = lightColors.Magenta
 	} else {
 		currentTheme = ThemeDark
 		ColorBg = darkColors.Bg
@@ -117,6 +121,7 @@ func InitTheme(theme string) {
 		ColorOrange = darkColors.Orange
 		ColorRed = darkColors.Red
 		ColorComment = darkColors.Comment
+		ColorMagenta = darkColors.Magenta
 	}
 	// Reinitialize styles with new colors
 	initStyles()

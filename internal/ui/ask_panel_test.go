@@ -62,18 +62,25 @@ func TestAskPanelSelectedTracksCursor(t *testing.T) {
 		mkAskRow("a3", "i3", "error", "build failed", "jdidion"),
 	})
 
+	// Display: [approval header, a1, decision header, a2, error header, a3].
+	// The cursor starts on the first item, not its header.
 	if sel := ap.Selected(); sel == nil || sel.ID != "a1" {
 		t.Fatalf("initial Selected() should be a1, got %v", sel)
 	}
 
+	ap.MoveDown() // decision header
+	if sel := ap.Selected(); sel != nil {
+		t.Fatalf("on a header Selected() should be nil, got %v", sel)
+	}
 	ap.MoveDown()
 	if sel := ap.Selected(); sel == nil || sel.ID != "a2" {
-		t.Fatalf("after MoveDown Selected() should be a2, got %v", sel)
+		t.Fatalf("after two MoveDown Selected() should be a2, got %v", sel)
 	}
 
+	ap.MoveDown() // error header
 	ap.MoveDown()
 	if sel := ap.Selected(); sel == nil || sel.ID != "a3" {
-		t.Fatalf("after two MoveDown Selected() should be a3, got %v", sel)
+		t.Fatalf("after four MoveDown Selected() should be a3, got %v", sel)
 	}
 
 	// Clamp at the bottom.
@@ -82,16 +89,22 @@ func TestAskPanelSelectedTracksCursor(t *testing.T) {
 		t.Fatalf("cursor should clamp at a3, got %v", sel)
 	}
 
+	ap.MoveUp() // error header
 	ap.MoveUp()
 	if sel := ap.Selected(); sel == nil || sel.ID != "a2" {
-		t.Fatalf("after MoveUp Selected() should be a2, got %v", sel)
+		t.Fatalf("after two MoveUp Selected() should be a2, got %v", sel)
 	}
 
-	// Clamp at the top.
-	ap.MoveUp()
-	ap.MoveUp()
+	// Clamp at the top (the approval header), one line above a1.
+	for i := 0; i < 5; i++ {
+		ap.MoveUp()
+	}
+	if !ap.OnHeader() || ap.Selected() != nil {
+		t.Fatalf("cursor should clamp on the top header, got %v", ap.Selected())
+	}
+	ap.MoveDown()
 	if sel := ap.Selected(); sel == nil || sel.ID != "a1" {
-		t.Fatalf("cursor should clamp at a1, got %v", sel)
+		t.Fatalf("one below the top header should be a1, got %v", sel)
 	}
 }
 
@@ -103,8 +116,12 @@ func TestAskPanelCursorClampsWhenRowsShrink(t *testing.T) {
 		mkAskRow("a2", "i2", "question", "s2", "t2"),
 		mkAskRow("a3", "i3", "error", "s3", "t3"),
 	})
-	ap.MoveDown()
-	ap.MoveDown() // cursor at a3 (index 2)
+	for i := 0; i < 4; i++ {
+		ap.MoveDown() // past the decision and error headers to a3
+	}
+	if sel := ap.Selected(); sel == nil || sel.ID != "a3" {
+		t.Fatalf("precondition: cursor should be on a3, got %v", sel)
+	}
 
 	// Queue shrinks below the cursor position.
 	ap.SetRows([]askRow{

@@ -2,9 +2,11 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -13,12 +15,12 @@ import (
 // queue across every session in the current profile — "flow wants to run a
 // command", "natera is asking which migration", "jdidion hit an error". It is
 // the ask-grained companion to the session-grained notification bar. See
-// docs/design/2026-08-14-human-ask-queue.md.
+// docs/design/2026-08-14-human-ask-queue.md and 2026-10-23-ask-groups.md.
 //
-// v1 is read-and-jump: Enter selects the owning session so the human answers in
-// the pane; there is no answer-in-place. Home owns the store reads, the title
-// resolution, and the key routing (jump / dismiss); this component only holds
-// display rows and renders them, mirroring GlobalSearch's shape.
+// Home owns the store reads, the title resolution, and the key routing (jump,
+// dismiss, approve/deny, group actions and their confirmation); this component
+// groups the rows Home supplies by kind, tracks the cursor, and renders,
+// mirroring GlobalSearch's shape.
 
 var (
 	askPanelHeaderStyle = lipgloss.NewStyle().
@@ -45,6 +47,18 @@ var (
 
 	askPanelHintStyle = lipgloss.NewStyle().
 				Foreground(ColorComment)
+
+	askPanelConfirmStyle = lipgloss.NewStyle().
+				Foreground(ColorYellow).
+				Bold(true)
+
+	askPanelGroupStyle = lipgloss.NewStyle().
+				Bold(true)
+
+	askPanelGroupSelectedStyle = lipgloss.NewStyle().
+					Bold(true).
+					Background(ColorCyan).
+					Foreground(ColorBg)
 )
 
 // askRow pairs a store row with the human-readable session title Home resolves
@@ -55,11 +69,40 @@ type askRow struct {
 	title string
 }
 
+// askGroupOrder is the display order of the ask groups. Kinds outside it
+// (none today) render last under a generic header so nothing is hidden.
+var askGroupOrder = []session.AskKind{session.AskApproval, session.AskDecision, session.AskError}
+
+// askGroupTitle names a group header.
+func askGroupTitle(kind session.AskKind) string {
+	switch kind {
+	case session.AskApproval:
+		return "Needs approval"
+	case session.AskDecision:
+		return "Needs decision"
+	case session.AskError:
+		return "Error"
+	default:
+		return "Other"
+	}
+}
+
+// askLine is one display line: a group header (row == nil) or an item.
+type askLine struct {
+	kind session.AskKind
+	row  *askRow
+}
+
 // AskPanel is the open-ask-queue overlay. It is a pure view over rows Home
-// supplies via SetRows; it never touches the store itself.
+// supplies via SetRows; it never touches the store itself. Rows are grouped by
+// kind under headers (docs/design/2026-10-23-ask-groups.md), and the cursor
+// moves over both header and item lines.
 type AskPanel struct {
 	rows    []askRow
+	groups  map[session.AskKind][]askRow
+	lines   []askLine
 	cursor  int
+	confirm string // pending group-action prompt; "" when none
 	width   int
 	height  int
 	visible bool
@@ -80,9 +123,10 @@ func (ap *AskPanel) Show() {
 	ap.visible = true
 }
 
-// Hide hides the panel.
+// Hide hides the panel and drops any pending confirmation.
 func (ap *AskPanel) Hide() {
 	ap.visible = false
+	ap.confirm = ""
 }
 
 // IsVisible reports whether the panel is visible.
@@ -99,60 +143,168 @@ func (ap *AskPanel) SetSize(width, height int) {
 	ap.height = height
 }
 
-// SetRows replaces the display rows, clamping the cursor so it always points at
-// a valid row (or 0 when empty). Home calls this on open and on every refresh.
+// SetConfirm shows prompt in place of the key hint; "" clears it.
+func (ap *AskPanel) SetConfirm(prompt string) {
+	ap.confirm = prompt
+}
+
+// SetRows replaces the display rows and regroups them. Stored legacy kinds
+// read as their current names. The cursor stays on the same item or header
+// when it survives the refresh; otherwise it is clamped. On first fill it lands
+// on the first item rather than its header.
 func (ap *AskPanel) SetRows(rows []askRow) {
+	prevKind, prevID, hadLines := ap.cursorKey()
+
 	ap.rows = rows
+	ap.groups = make(map[session.AskKind][]askRow)
+	var extra []session.AskKind
+	for _, r := range rows {
+		if r.item == nil {
+			continue
+		}
+		kind := session.NormalizeAskKind(r.item.Kind)
+		known := false
+		for _, k := range askGroupOrder {
+			if k == kind {
+				known = true
+				break
+			}
+		}
+		if !known {
+			kind = ""
+			if len(ap.groups[kind]) == 0 {
+				extra = append(extra, kind)
+			}
+		}
+		ap.groups[kind] = append(ap.groups[kind], r)
+	}
+	ap.lines = ap.lines[:0]
+	for _, kind := range append(append([]session.AskKind{}, askGroupOrder...), extra...) {
+		group := ap.groups[kind]
+		if len(group) == 0 {
+			continue
+		}
+		sort.SliceStable(group, func(i, j int) bool {
+			return group[i].item.CreatedAt.After(group[j].item.CreatedAt)
+		})
+		ap.lines = append(ap.lines, askLine{kind: kind})
+		for i := range group {
+			ap.lines = append(ap.lines, askLine{kind: kind, row: &group[i]})
+		}
+	}
+
+	if !hadLines {
+		ap.cursor = 0
+		if len(ap.lines) > 1 {
+			ap.cursor = 1
+		}
+		return
+	}
+	for i, l := range ap.lines {
+		if l.kind != prevKind {
+			continue
+		}
+		if (prevID == "" && l.row == nil) || (prevID != "" && l.row != nil && l.row.item.ID == prevID) {
+			ap.cursor = i
+			return
+		}
+	}
 	ap.clampCursor()
+}
+
+// cursorKey identifies the line under the cursor: its group, and the item id
+// ("" on a header). ok is false when there are no lines.
+func (ap *AskPanel) cursorKey() (session.AskKind, string, bool) {
+	if len(ap.lines) == 0 {
+		return "", "", false
+	}
+	ap.clampCursor()
+	l := ap.lines[ap.cursor]
+	if l.row == nil {
+		return l.kind, "", true
+	}
+	return l.kind, l.row.item.ID, true
 }
 
 // clampCursor keeps the cursor within [0, len-1], or 0 when empty.
 func (ap *AskPanel) clampCursor() {
-	if len(ap.rows) == 0 {
+	if len(ap.lines) == 0 {
 		ap.cursor = 0
 		return
 	}
 	if ap.cursor < 0 {
 		ap.cursor = 0
 	}
-	if ap.cursor >= len(ap.rows) {
-		ap.cursor = len(ap.rows) - 1
+	if ap.cursor >= len(ap.lines) {
+		ap.cursor = len(ap.lines) - 1
 	}
 }
 
-// MoveUp moves the cursor toward the newest (top) row.
+// MoveUp moves the cursor up one line (headers included).
 func (ap *AskPanel) MoveUp() {
 	if ap.cursor > 0 {
 		ap.cursor--
 	}
 }
 
-// MoveDown moves the cursor toward the oldest (bottom) row.
+// MoveDown moves the cursor down one line (headers included).
 func (ap *AskPanel) MoveDown() {
-	if ap.cursor < len(ap.rows)-1 {
+	if ap.cursor < len(ap.lines)-1 {
 		ap.cursor++
 	}
 }
 
 // Selected returns the store row under the cursor, or nil when the queue is
-// empty.
+// empty or the cursor is on a group header.
 func (ap *AskPanel) Selected() *statedb.AskItemRow {
-	if len(ap.rows) == 0 {
+	if len(ap.lines) == 0 {
 		return nil
 	}
 	ap.clampCursor()
-	return ap.rows[ap.cursor].item
+	if r := ap.lines[ap.cursor].row; r != nil {
+		return r.item
+	}
+	return nil
+}
+
+// OnHeader reports whether the cursor is on a group header.
+func (ap *AskPanel) OnHeader() bool {
+	if len(ap.lines) == 0 {
+		return false
+	}
+	ap.clampCursor()
+	return ap.lines[ap.cursor].row == nil
+}
+
+// CursorGroup returns the kind of the group the cursor is in, or "" when the
+// queue is empty.
+func (ap *AskPanel) CursorGroup() session.AskKind {
+	if len(ap.lines) == 0 {
+		return ""
+	}
+	ap.clampCursor()
+	return ap.lines[ap.cursor].kind
+}
+
+// GroupItems returns the items in group kind, newest first.
+func (ap *AskPanel) GroupItems(kind session.AskKind) []*statedb.AskItemRow {
+	group := ap.groups[kind]
+	out := make([]*statedb.AskItemRow, 0, len(group))
+	for _, r := range group {
+		out = append(out, r.item)
+	}
+	return out
 }
 
 // askKindGlyph maps an ask kind to a glyph and color, in the spirit of the
 // session statusIcon/statusColor palette in internal/session/notifications.go.
 func askKindGlyph(kind string) (string, lipgloss.Color) {
-	switch kind {
-	case "permission":
-		return "◆", ColorYellow
-	case "question":
-		return "?", ColorCyan
-	case "error":
+	switch session.NormalizeAskKind(kind) {
+	case session.AskApproval:
+		return "?", ColorYellow
+	case session.AskDecision:
+		return "✎", ColorMagenta
+	case session.AskError:
 		return "✕", ColorRed
 	default:
 		return "•", ColorComment
@@ -192,21 +344,28 @@ func (ap *AskPanel) View() string {
 
 	var b strings.Builder
 
-	header := askPanelHeaderStyle.Render(fmt.Sprintf("⚡ Asks (%d)", len(ap.rows)))
+	header := askPanelHeaderStyle.Render(fmt.Sprintf("⚡ Asks (%d)", len(ap.lines)-len(ap.groups)))
 	b.WriteString(header + "\n\n")
 
-	if len(ap.rows) == 0 {
+	if len(ap.lines) == 0 {
 		b.WriteString(askPanelEmptyStyle.Render("No open requests — you're caught up."))
 		b.WriteString("\n")
 	} else {
-		for i, row := range ap.rows {
-			b.WriteString(ap.renderRow(i, row, innerWidth) + "\n")
+		for i, l := range ap.lines {
+			if l.row == nil {
+				b.WriteString(ap.renderGroupHeader(i, l.kind) + "\n")
+				continue
+			}
+			b.WriteString(ap.renderRow(i, *l.row, innerWidth) + "\n")
 		}
 	}
 
 	b.WriteString("\n")
-	b.WriteString(askPanelHintStyle.Render(
-		"↑/↓ move · enter jump to session · r dismiss · esc close"))
+	if ap.confirm != "" {
+		b.WriteString(askPanelConfirmStyle.Render(ap.confirm))
+	} else {
+		b.WriteString(askPanelHintStyle.Render(ap.hint()))
+	}
 
 	boxStyle := lipgloss.NewStyle().
 		Width(totalWidth).
@@ -215,6 +374,45 @@ func (ap *AskPanel) View() string {
 		Padding(0, 1)
 
 	return centerInScreen(boxStyle.Render(b.String()), ap.width, ap.height)
+}
+
+// renderGroupHeader renders a group header line with its count.
+func (ap *AskPanel) renderGroupHeader(index int, kind session.AskKind) string {
+	glyph, color := askKindGlyph(string(kind))
+	label := fmt.Sprintf("%s (%d)", askGroupTitle(kind), len(ap.groups[kind]))
+	if index == ap.cursor {
+		return askPanelGroupSelectedStyle.Render("› " + glyph + " " + label)
+	}
+	return askPanelGroupStyle.Render(lipgloss.NewStyle().Foreground(color).Render(glyph) + " " + label)
+}
+
+// hint lists the keys that apply to the line under the cursor.
+func (ap *AskPanel) hint() string {
+	if len(ap.lines) == 0 {
+		return "esc close"
+	}
+	kind := ap.CursorGroup()
+	var keys []string
+	if ap.OnHeader() {
+		if kind == session.AskApproval {
+			keys = append(keys, "y approve all", "n deny all")
+		}
+		if kind == session.AskError {
+			keys = append(keys, "R restart all")
+		}
+		keys = append(keys, "r dismiss all")
+	} else {
+		keys = append(keys, "enter jump")
+		if kind == session.AskApproval {
+			keys = append(keys, "y approve", "n deny", "Y/N approve/deny all")
+		}
+		if kind == session.AskError {
+			keys = append(keys, "R restart all")
+		}
+		keys = append(keys, "r dismiss", "D dismiss all")
+	}
+	keys = append(keys, "esc close")
+	return "↑/↓ move · " + strings.Join(keys, " · ")
 }
 
 // renderRow formats one queue row as "<glyph>  <title>   <summary>   <age>",

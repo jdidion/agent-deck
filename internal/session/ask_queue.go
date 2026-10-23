@@ -19,10 +19,30 @@ var askLog = logging.ForComponent(logging.CompSession)
 type AskKind string
 
 const (
-	AskPermission AskKind = "permission" // permissionrequest / notification+permission_prompt
-	AskQuestion   AskKind = "question"   // notification+elicitation_dialog
-	AskError      AskKind = "error"      // session entered the error status
+	AskApproval AskKind = "approval" // waiting on a tool approval (permission prompt, PreToolUse, plan approval)
+	AskDecision AskKind = "decision" // waiting on a multiple-choice or free-text answer
+	AskError    AskKind = "error"    // session entered the error status
 )
+
+// NormalizeAskKind maps a stored kind to its current name. Rows written before
+// the approval/decision rename carry "permission" and "question".
+func NormalizeAskKind(kind string) AskKind {
+	switch k := AskKind(strings.ToLower(strings.TrimSpace(kind))); k {
+	case "permission":
+		return AskApproval
+	case "question":
+		return AskDecision
+	default:
+		return k
+	}
+}
+
+// DeriveAskKind is the kind-only form of deriveAsk, for callers outside the
+// producer (the TUI row glyphs) that need the same classification.
+func DeriveAskKind(hs *HookStatus, status string) AskKind {
+	kind, _, _ := deriveAsk(hs, status)
+	return kind
+}
 
 const (
 	// askPruneInterval rate-limits PruneResolvedAskItems so it runs at most once
@@ -63,24 +83,39 @@ func askItemID(instanceID, disambig string) string {
 // judgement that excludes idle from the desktop notifier.
 func deriveAsk(hs *HookStatus, toStatus string) (AskKind, string, bool) {
 	st := normalizeStatusString(toStatus)
-	var event, matcher, msg string
+	var event, matcher, msg, tool string
 	if hs != nil {
 		event = strings.ToLower(strings.TrimSpace(hs.Event))
-		matcher = strings.TrimSpace(hs.Matcher)
+		matcher = strings.ToLower(strings.TrimSpace(hs.Matcher))
 		msg = strings.TrimSpace(hs.Message)
+		tool = strings.TrimSpace(hs.ToolName)
 	}
-	// A permission/question ask requires the session to actually be waiting.
-	// The hook status is the LATEST event and can be stale: a session that
-	// answered a prompt and resumed carries a running status with a
-	// still-permission-shaped matcher for a beat. Gating on the live status
-	// stops that stale record from re-opening a resolved ask.
-	switch {
-	case st == string(StatusWaiting) && (event == "permissionrequest" || matcher == "permission_prompt"):
-		return AskPermission, summaryOr(msg, "wants permission to run a command"), true
-	case st == string(StatusWaiting) && matcher == "elicitation_dialog":
-		return AskQuestion, summaryOr(msg, "is asking a question"), true
-	case st == string(StatusError):
+	if st == string(StatusError) {
 		return AskError, summaryOr(msg, "hit an error"), true
+	}
+	// An approval/decision requires the session to actually be waiting. The
+	// hook status is the LATEST event and can be stale: a session that answered
+	// a prompt and resumed carries a running status with a still-permission-
+	// shaped record for a beat, and a PreToolUse while running is a tool that
+	// is executing. Gating on the live status stops either from opening an ask.
+	if st != string(StatusWaiting) {
+		return "", "", false
+	}
+	askUserQuestion := strings.EqualFold(tool, "AskUserQuestion")
+	switch {
+	case matcher == "elicitation_dialog" || (event == "pretooluse" && askUserQuestion):
+		return AskDecision, summaryOr(msg, "is asking a question"), true
+	case event == "permissionrequest" || matcher == "permission_prompt":
+		return AskApproval, summaryOr(msg, "wants permission to run a command"), true
+	case event == "pretooluse":
+		// Claude sends no hook before a permission prompt, so a session left
+		// waiting on PreToolUse is blocked on that tool. An empty tool name is
+		// a status file written before tool_name was retained.
+		fallback := "wants permission to run a command"
+		if tool != "" {
+			fallback = "wants to run " + tool
+		}
+		return AskApproval, summaryOr(msg, fallback), true
 	default:
 		return "", "", false
 	}

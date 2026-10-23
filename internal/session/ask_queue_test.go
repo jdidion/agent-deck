@@ -18,9 +18,9 @@ func TestDeriveAsk(t *testing.T) {
 		wantK   AskKind
 		wantSum string
 	}{
-		{"permissionrequest event", &HookStatus{Event: "permissionrequest"}, "waiting", true, AskPermission, "wants permission to run a command"},
-		{"permission matcher with message", &HookStatus{Event: "notification", Matcher: "permission_prompt", Message: "Run npm test?"}, "waiting", true, AskPermission, "Run npm test?"},
-		{"elicitation matcher", &HookStatus{Event: "notification", Matcher: "elicitation_dialog"}, "waiting", true, AskQuestion, "is asking a question"},
+		{"permissionrequest event", &HookStatus{Event: "permissionrequest"}, "waiting", true, AskApproval, "wants permission to run a command"},
+		{"permission matcher with message", &HookStatus{Event: "notification", Matcher: "permission_prompt", Message: "Run npm test?"}, "waiting", true, AskApproval, "Run npm test?"},
+		{"elicitation matcher", &HookStatus{Event: "notification", Matcher: "elicitation_dialog"}, "waiting", true, AskDecision, "is asking a question"},
 		{"error status, no hook", nil, "error", true, AskError, "hit an error"},
 		{"error status with message", &HookStatus{Message: "push rejected"}, "error", true, AskError, "push rejected"},
 		{"plain waiting, no matcher, is not an ask", nil, "waiting", false, "", ""},
@@ -155,7 +155,7 @@ func TestSyncAsks_ContentSigMismatchStaysOpenWhileWaiting(t *testing.T) {
 			ID:         askItemID(id, sig),
 			InstanceID: id,
 			Profile:    profile,
-			Kind:       string(AskPermission),
+			Kind:       string(AskApproval),
 			Summary:    "seeded",
 			ContentSig: sig,
 			CreatedAt:  time.Now(),
@@ -246,7 +246,7 @@ func TestSyncAsks_PrunesOldResolvedItems(t *testing.T) {
 		ID:         askItemID("old", "1"),
 		InstanceID: "old",
 		Profile:    profile,
-		Kind:       string(AskPermission),
+		Kind:       string(AskApproval),
 		Summary:    "old ask",
 		CreatedAt:  now.Add(-72 * time.Hour),
 	}
@@ -261,7 +261,7 @@ func TestSyncAsks_PrunesOldResolvedItems(t *testing.T) {
 		ID:         askItemID("recent", "1"),
 		InstanceID: "recent",
 		Profile:    profile,
-		Kind:       string(AskPermission),
+		Kind:       string(AskApproval),
 		Summary:    "recent ask",
 		CreatedAt:  now.Add(-1 * time.Hour),
 	}

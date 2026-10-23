@@ -1358,6 +1358,7 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		Sequence                 uint64 `json:"sequence"`
 		Matcher                  string `json:"matcher"`
 		Message                  string `json:"message"`
+		ToolName                 string `json:"tool_name"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
@@ -1392,6 +1393,7 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		Sequence:                 raw.Sequence,
 		Matcher:                  raw.Matcher,
 		Message:                  raw.Message,
+		ToolName:                 raw.ToolName,
 	}
 	maskConsumedCodexCompletion(instanceID, hookStatus)
 	return hookStatus
