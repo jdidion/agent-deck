@@ -181,6 +181,122 @@ func TestSyncAsks_ContentSigMismatchStaysOpenWhileWaiting(t *testing.T) {
 	}
 }
 
+// TestSyncAsks_ReopensAfterResolveWithEmptySignal is the exact case that
+// silently dropped a reopened ask before identity moved off the transcript
+// content signal: an instance with NO resolvable transcript (Tool "", or any
+// non-Claude tool -- transitionEventOutputHash returns "") whose ask is
+// resolved and then reopens must get a fresh id, not collide with the
+// resolved row's id. Under the old (instance, content-sig) identity, both
+// opens hashed to the SAME id (both signals are ""), so the second open's
+// INSERT ... ON CONFLICT(id) DO NOTHING silently no-opped against the
+// already-resolved row and the reopen never surfaced.
+func TestSyncAsks_ReopensAfterResolveWithEmptySignal(t *testing.T) {
+	d, db, profile := newAskDaemon(t)
+	inst := &Instance{ID: "x", Title: "flow"} // Tool "" -> no transcript -> sig ""
+	byID := map[string]*Instance{"x": inst}
+	hooks := map[string]*HookStatus{"x": {Event: "permissionrequest"}}
+
+	// 1. Open.
+	d.syncAsks(profile, db, byID, map[string]string{"x": "waiting"}, hooks)
+	open, err := db.ListOpenAskItems()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("setup: open = %d, want 1", len(open))
+	}
+	firstID := open[0].ID
+
+	// 2. Answered: the status leaves waiting, resolving the ask.
+	d.syncAsks(profile, db, byID, map[string]string{"x": "running"}, hooks)
+	if n := openAskCount(t, d, profile); n != 0 {
+		t.Fatalf("open = %d after the answer, want 0 (resolved)", n)
+	}
+
+	// The per-open discriminator is the open timestamp (UnixNano). Force a
+	// distinct nanosecond between the first open and the reopen below so the
+	// id is guaranteed to differ even on a fast test run where time.Now()
+	// could otherwise repeat.
+	time.Sleep(2 * time.Millisecond)
+
+	// 3. Reopen: a genuine second prompt on the same instance, same (empty)
+	// content signal.
+	d.syncAsks(profile, db, byID, map[string]string{"x": "waiting"}, hooks)
+	open, err = db.ListOpenAskItems()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("open = %d after reopen, want 1", len(open))
+	}
+	if open[0].ID == firstID {
+		t.Error("reopen after resolve reused the first ask's id; with an empty content signal this collides with the resolved row and the upsert's ON CONFLICT(id) DO NOTHING silently drops the reopen")
+	}
+}
+
+// TestSyncAsks_PrunesOldResolvedItems: syncAsks throttles PruneResolvedAskItems
+// per profile (askPruneInterval) and, when it runs, deletes resolved items
+// older than askResolvedRetention while leaving open items and
+// recently-resolved items alone.
+func TestSyncAsks_PrunesOldResolvedItems(t *testing.T) {
+	d, db, profile := newAskDaemon(t)
+	now := time.Now()
+
+	oldRow := &statedb.AskItemRow{
+		ID:         askItemID("old", "1"),
+		InstanceID: "old",
+		Profile:    profile,
+		Kind:       string(AskPermission),
+		Summary:    "old ask",
+		CreatedAt:  now.Add(-72 * time.Hour),
+	}
+	if err := db.UpsertAskItem(oldRow); err != nil {
+		t.Fatalf("seed old: %v", err)
+	}
+	if err := db.ResolveAskItem(oldRow.ID, now.Add(-50*time.Hour)); err != nil {
+		t.Fatalf("resolve old: %v", err)
+	}
+
+	recentRow := &statedb.AskItemRow{
+		ID:         askItemID("recent", "1"),
+		InstanceID: "recent",
+		Profile:    profile,
+		Kind:       string(AskPermission),
+		Summary:    "recent ask",
+		CreatedAt:  now.Add(-1 * time.Hour),
+	}
+	if err := db.UpsertAskItem(recentRow); err != nil {
+		t.Fatalf("seed recent: %v", err)
+	}
+	if err := db.ResolveAskItem(recentRow.ID, now.Add(-30*time.Minute)); err != nil {
+		t.Fatalf("resolve recent: %v", err)
+	}
+
+	// newAskDaemon's lastAskPrune map has no entry for profile, so this call's
+	// throttle check (IsZero()) fires the prune.
+	d.syncAsks(profile, db, map[string]*Instance{}, map[string]string{}, nil)
+
+	items, err := db.ListAskItems(true, 0)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var gotOld, gotRecent bool
+	for _, item := range items {
+		if item.ID == oldRow.ID {
+			gotOld = true
+		}
+		if item.ID == recentRow.ID {
+			gotRecent = true
+		}
+	}
+	if gotOld {
+		t.Error("a resolved item older than askResolvedRetention (48h) should have been pruned")
+	}
+	if !gotRecent {
+		t.Error("a recently-resolved item (well within askResolvedRetention) should still be present")
+	}
+}
+
 // End-to-end with a REAL growing transcript, proving the behaviours that
 // were hard for the desktop notifier and the whole point of the status-driven
 // rewrite: a sustained wait collapses to a single ask no matter how much the

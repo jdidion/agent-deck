@@ -399,3 +399,51 @@ func TestOpenShellHereHotkey(t *testing.T) {
 		t.Errorf("hotkeyOpenShellHere is missing from hotkeyActionOrder")
 	}
 }
+
+// TestDefaultHotkeyBindings_NoCanonicalKeyCollision guards defaultHotkeyBindings
+// itself: no two distinct actions may share the same non-empty canonical key.
+// This is the guard that would have caught the original ask-panel bug, where
+// hotkeyAskPanel shipped bound to "a" -- the same canonical key as
+// hotkeyQuickApprove -- so the home-screen dispatch's literal
+// `case defaultHotkeyBindings[hotkeyAskPanel]:` silently shadowed the
+// quick-approve arm. Go cannot flag that at compile time because the two
+// switch cases are map lookups, not constants.
+func TestDefaultHotkeyBindings_NoCanonicalKeyCollision(t *testing.T) {
+	seen := make(map[string]string)
+	for _, action := range hotkeyActionOrder {
+		key := strings.TrimSpace(defaultHotkeyBindings[action])
+		if key == "" {
+			continue
+		}
+		if prev, ok := seen[key]; ok && prev != action {
+			t.Errorf("canonical key %q is bound to both %q and %q", key, prev, action)
+			continue
+		}
+		seen[key] = action
+	}
+}
+
+// TestAskPanelHotkey_AltQOpens_PlainADoesNot pins the fix at the
+// handleMainKey dispatch boundary: "a" must reach quick_approve (a no-op here
+// since there is no highlighted session), never the ask panel, and "alt+q"
+// must open the ask panel.
+func TestAskPanelHotkey_AltQOpens_PlainADoesNot(t *testing.T) {
+	home := NewHome()
+	home.width = 120
+	home.height = 40
+	home.initialLoading = false
+
+	if home.askPanel.IsVisible() {
+		t.Fatal("askPanel should not be visible before any keypress")
+	}
+
+	home.handleMainKey(plainKeyMsg('a'))
+	if home.askPanel.IsVisible() {
+		t.Fatal("pressing \"a\" opened the ask panel; it must be routed to quick_approve instead")
+	}
+
+	home.handleMainKey(altKeyMsg('q'))
+	if !home.askPanel.IsVisible() {
+		t.Fatal("pressing \"alt+q\" did not open the ask panel")
+	}
+}

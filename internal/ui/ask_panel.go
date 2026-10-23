@@ -87,7 +87,10 @@ func (ap *AskPanel) Hide() {
 
 // IsVisible reports whether the panel is visible.
 func (ap *AskPanel) IsVisible() bool {
-	return ap.visible
+	// Nil-safe like the sibling overlays (e.g. AgentsPanel.IsVisible): the key
+	// path calls this on every keystroke, and a Home built without the
+	// constructor (test literals) has a nil askPanel. Production always sets it.
+	return ap != nil && ap.visible
 }
 
 // SetSize sets the overlay dimensions.

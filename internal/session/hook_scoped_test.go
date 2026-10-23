@@ -72,6 +72,32 @@ func TestReadHookStatusFile_PrefersScopedOverFlat(t *testing.T) {
 	assert.Equal(t, "scoped-sess", hs.SessionID)
 }
 
+// TestReadHookStatusFile_RetainsMatcherAndMessage verifies the CLI cold-load
+// path (readHookStatusFile, distinct from StatusFileWatcher.processFile)
+// parses the "matcher" and "message" JSON fields into HookStatus.Matcher and
+// HookStatus.Message rather than dropping them. deriveAsk in the ask queue
+// reads a kind and summary directly off these fields, so a regression here
+// silently degrades every permission/question ask surfaced through the
+// direct-read fallback (non-watcher CLI paths) to its generic fallback text.
+func TestReadHookStatusFile_RetainsMatcherAndMessage(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	instanceID := "matcher-message-inst"
+	path := filepath.Join(GetHooksDir(), instanceID+".json")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	data := fmt.Sprintf(
+		`{"status":%q,"session_id":%q,"event":"notification","ts":%d,"matcher":%q,"message":%q}`,
+		"waiting", "matcher-message-sess", time.Now().Unix(),
+		"permission_prompt", "Run the build?",
+	)
+	require.NoError(t, os.WriteFile(path, []byte(data), 0o644))
+
+	hs := readHookStatusFile(instanceID)
+	require.NotNil(t, hs, "status file should be resolved")
+	assert.Equal(t, "permission_prompt", hs.Matcher)
+	assert.Equal(t, "Run the build?", hs.Message)
+}
+
 // newTestWatcher constructs a StatusFileWatcher wired to a real fsnotify watcher
 // rooted at the given hooksDir, suitable for live Start() tests.
 func newTestWatcher(t *testing.T, hooksDir string) *StatusFileWatcher {
