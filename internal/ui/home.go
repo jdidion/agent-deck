@@ -21443,7 +21443,9 @@ func (h *Home) renderHelpBarMinimal() string {
 	if key := h.actionKey(hotkeySettings); key != "" {
 		globalParts = append(globalParts, globalStyle.Render(key))
 	}
+	var helpPart string
 	if key := h.actionKey(hotkeyHelp); key != "" {
+		helpPart = globalStyle.Render(key + " help")
 		globalParts = append(globalParts, globalStyle.Render(key))
 	}
 	if key := h.actionKey(hotkeyQuit); key != "" {
@@ -21459,9 +21461,15 @@ func (h *Home) renderHelpBarMinimal() string {
 	rightPart := globalKeys
 	padding := h.width - lipgloss.Width(leftPart) - lipgloss.Width(rightPart) - 4
 	if padding < 2 {
-		// Content too wide for one line — drop right part to avoid overflow
+		// Too wide for one line: keep only the help key on the right (it is
+		// how every other binding is discovered) and truncate the context keys
+		// to make room for it.
 		padding = 2
-		rightPart = ""
+		rightPart = helpPart
+		if rightPart != "" {
+			room := max(0, h.width-lipgloss.Width(rightPart)-4-padding)
+			leftPart = ansi.Truncate(leftPart, room, "…")
+		}
 	}
 
 	content := leftPart + sep + strings.Repeat(" ", padding) + rightPart
@@ -21575,6 +21583,7 @@ func (h *Home) renderHelpBarCompact() string {
 	// while leaving its bare key behind.
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalHints := []string{globalStyle.Render("↑↓ Nav")}
+	helpIdx := -1
 	for _, hint := range []struct {
 		action string
 		label  string
@@ -21585,13 +21594,26 @@ func (h *Home) renderHelpBarCompact() string {
 		{hotkeyQuit, "Quit"},
 	} {
 		if key := h.actionKey(hint.action); key != "" {
+			if hint.action == hotkeyHelp {
+				helpIdx = len(globalHints)
+			}
 			globalHints = append(globalHints, globalStyle.Render(key+" "+hint.label))
 		}
 	}
 
 	rightPart := strings.Join(globalHints, " ")
-	for len(globalHints) > 1 && lipgloss.Width(rightPart)+6 > h.width {
-		globalHints = globalHints[:len(globalHints)-1]
+	// Trim global hints from the tail only while they alone don't fit, but
+	// never Help (index helpIdx) or Nav (index 0): Help is how every other
+	// binding is discovered.
+	for lipgloss.Width(rightPart)+6 > h.width {
+		drop := lastDroppableGlobal(len(globalHints), helpIdx)
+		if drop <= 0 {
+			break
+		}
+		globalHints = append(globalHints[:drop], globalHints[drop+1:]...)
+		if drop < helpIdx {
+			helpIdx--
+		}
 		rightPart = strings.Join(globalHints, " ")
 	}
 	// A long optional hint must not block a shorter later one from using
@@ -21827,10 +21849,9 @@ func (h *Home) renderHelpBarFull() string {
 		reloadIndicator = reloadStyle.Render("⟳ Reloading...")
 	}
 
-	// Global shortcuts (right side) - more compact with separators. "↑↓ Nav"
-	// and Quit are pinned; the rest drop lowest-priority-first (from the end
-	// of this slice) when space is tight, before either pinned key is
-	// sacrificed.
+	// Global shortcuts (right side) - more compact with separators. Help and
+	// Quit are pinned; the rest drop lowest-priority-first (from the end of
+	// this slice) when space is tight, before either pinned key is sacrificed.
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	navHint := globalStyle.Render("↑↓ Nav")
 	var quitHint string
@@ -21846,9 +21867,11 @@ func (h *Home) renderHelpBarFull() string {
 	if key := h.actionKey(hotkeySettings); key != "" {
 		droppableGlobal = append(droppableGlobal, globalStyle.Render(key+" Settings"))
 	}
-	helpKey := h.actionKey(hotkeyHelp)
-	if helpKey != "" {
-		droppableGlobal = append(droppableGlobal, globalStyle.Render(helpKey+" Help"))
+	// Help is pinned like Nav and Quit: it is the way to discover every other
+	// binding, so it must survive however narrow the bar gets.
+	var helpHint string
+	if key := h.actionKey(hotkeyHelp); key != "" {
+		helpHint = globalStyle.Render(key + " Help")
 	}
 
 	leftPrefix := contextLabel
@@ -21863,33 +21886,43 @@ func (h *Home) renderHelpBarFull() string {
 		sep:        sep,
 		nav:        navHint,
 		droppable:  droppableGlobal,
+		help:       helpHint,
 		quit:       quitHint,
 	}
 	helpContent := h.fitFullFooter(parts)
-	// Keep the original order where Help already fits. On crowded 120-column
-	// rows, shorter labels make room for Help without losing existing actions.
-	if h.width >= 120 && h.width < 160 && helpKey != "" && !strings.Contains(helpContent, helpKey+" Help") {
-		shorten := func(hints []string) {
+	// On crowded 120-column rows the pinned Nav/Help/Quit block pushes context
+	// hints out; shorter labels win some of them back.
+	if h.width >= 120 && h.width < 160 && strings.Contains(helpContent, " …") {
+		shorten := func(hints []string) []string {
+			out := make([]string, len(hints))
 			for i, hint := range hints {
 				hint = strings.Replace(hint, "New/Quick", "New", 1)
 				hint = strings.Replace(hint, "Restart Fresh", "Fresh", 1)
 				hint = strings.Replace(hint, "Enter", "⏎", 1)
 				hint = strings.Replace(hint, "Import", "Add", 1)
 				hint = strings.Replace(hint, "Group", "Grp", 1)
-				hints[i] = hint
+				out[i] = hint
 			}
+			return out
 		}
-		shorten(primaryHints)
-		shorten(secondaryHints)
-		parts.nav += sep + droppableGlobal[len(droppableGlobal)-1]
-		parts.droppable = droppableGlobal[:len(droppableGlobal)-1]
-		parts.primary = primaryHints
-		parts.secondary = secondaryHints
+		parts.primary = shorten(primaryHints)
+		parts.secondary = shorten(secondaryHints)
 		helpContent = h.fitFullFooter(parts)
 	}
 
 	raw := lipgloss.JoinVertical(lipgloss.Left, border, helpContent)
 	return lipgloss.NewStyle().MaxWidth(h.width).Render(raw)
+}
+
+// lastDroppableGlobal returns the index of the last compact-footer global hint
+// that may be dropped: never index 0 (Nav) or helpIdx (Help). 0 means none.
+func lastDroppableGlobal(n, helpIdx int) int {
+	for i := n - 1; i > 0; i-- {
+		if i != helpIdx {
+			return i
+		}
+	}
+	return 0
 }
 
 // fullFooterParts is the raw material of the full-tier footer line: the left
@@ -21903,6 +21936,7 @@ type fullFooterParts struct {
 	sep        string
 	nav        string   // pinned: never dropped
 	droppable  []string // global hints, dropped from the end when space is tight
+	help       string   // pinned: never dropped
 	quit       string   // pinned: never dropped
 }
 
@@ -21921,10 +21955,13 @@ type fullFooterParts struct {
 // ellipsis. nav and quit are never dropped; leftPrefix never is either.
 func (h *Home) fitFullFooter(p fullFooterParts) string {
 	// buildRight renders the global block keeping the n highest-priority
-	// droppable hints, always framed by the pinned nav and quit hints.
+	// droppable hints, framed by the pinned nav, help and quit hints.
 	buildRight := func(n int) string {
 		parts := []string{p.nav}
 		parts = append(parts, p.droppable[:n]...)
+		if p.help != "" {
+			parts = append(parts, p.help)
+		}
 		if p.quit != "" {
 			parts = append(parts, p.quit)
 		}
@@ -24340,7 +24377,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	if h.compact {
-		// Compact: name, status, tool/group pills, and activity on ONE line.
+		// Compact: name, status, tool/group pills, activity, and viewers on ONE line.
 		b.WriteString(nameStyle.Render(selected.Title))
 		b.WriteString("  ")
 		b.WriteString(statusBadge)
@@ -24350,6 +24387,11 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(groupBadge)
 		b.WriteString("  ")
 		b.WriteString(infoStyle.Render("⏱ " + activityStr))
+		if selectedStatus != session.StatusStopped {
+			previewViewers, previewViewersKnown := selected.ViewersCached()
+			b.WriteString("  ")
+			b.WriteString(infoStyle.Render(viewersLine(previewViewers, previewViewersKnown, time.Now())))
+		}
 		b.WriteString("\n")
 	} else {
 		// Classic: name and status on their own line.
@@ -24390,8 +24432,9 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 	// Who else has this session open (shared attach), from the per-socket
 	// viewer cache so the render path never spawns tmux. A stopped session
-	// has no tmux to view, so the line is for live ones.
-	if selectedStatus != session.StatusStopped {
+	// has no tmux to view, so the line is for live ones. Compact puts it on the
+	// header line instead.
+	if !h.compact && selectedStatus != session.StatusStopped {
 		previewViewers, previewViewersKnown := selected.ViewersCached()
 		b.WriteString(infoStyle.Render(viewersLine(previewViewers, previewViewersKnown, time.Now())))
 		b.WriteString("\n")
@@ -24417,7 +24460,11 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 	// Worktree info section (for sessions running in git worktrees). Hidden when
 	// previewHideWorktree is set (config [preview] hide_worktree / runtime toggle).
-	if selected.IsWorktree() && !h.previewHideWorktree {
+	// Output-only preview mode (the v key) gives the pane to session output, so
+	// the per-session info sections below are skipped in that mode.
+	infoSections := h.previewMode != PreviewModeOutput
+
+	if infoSections && selected.IsWorktree() && !h.previewHideWorktree {
 		wtHeader := renderSectionDivider("Worktree", width-4)
 		b.WriteString(wtHeader)
 		b.WriteString("\n")
@@ -24489,7 +24536,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Multi-repo info section
-	if selected.IsMultiRepo() {
+	if infoSections && selected.IsMultiRepo() {
 		mrHeader := renderSectionDivider("Multi-Repo", width-4)
 		b.WriteString(mrHeader)
 		b.WriteString("\n")
@@ -24514,7 +24561,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 
 	// Claude-specific info (session ID and MCPs). Hidden when previewHideClaude
 	// is set (config [preview] hide_claude / runtime toggle).
-	if session.IsClaudeCompatible(selected.Tool) && !h.previewHideClaude {
+	if infoSections && session.IsClaudeCompatible(selected.Tool) && !h.previewHideClaude {
 		// Section divider for Claude info
 		claudeHeader := renderSectionDivider("Claude", width-4)
 		b.WriteString(claudeHeader)
@@ -24712,7 +24759,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Gemini-specific info (session ID)
-	if selected.Tool == "gemini" {
+	if infoSections && selected.Tool == "gemini" {
 		geminiHeader := renderSectionDivider("Gemini", width-4)
 		b.WriteString(geminiHeader)
 		b.WriteString("\n")
@@ -24744,7 +24791,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Cursor Agent CLI — MCP configuration for `cursor agent`
-	if selected.Tool == "cursor" {
+	if infoSections && selected.Tool == "cursor" {
 		cursorHeader := renderSectionDivider("Cursor", width-4)
 		b.WriteString(cursorHeader)
 		b.WriteString("\n")
@@ -24761,7 +24808,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// OpenCode-specific info (session ID)
-	if selected.Tool == "opencode" {
+	if infoSections && selected.Tool == "opencode" {
 		opencodeHeader := renderSectionDivider("OpenCode", width-4)
 		b.WriteString(opencodeHeader)
 		b.WriteString("\n")
@@ -24821,7 +24868,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Codex-specific info (session ID, detection)
-	if selected.Tool == "codex" {
+	if infoSections && selected.Tool == "codex" {
 		codexHeader := renderSectionDivider("Codex", width-4)
 		b.WriteString(codexHeader)
 		b.WriteString("\n")
@@ -24834,7 +24881,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Custom tool info (tools defined in config.toml that aren't built-in)
-	if !session.IsClaudeCompatible(selected.Tool) && selected.Tool != "gemini" && selected.Tool != "opencode" &&
+	if infoSections && !session.IsClaudeCompatible(selected.Tool) && selected.Tool != "gemini" && selected.Tool != "opencode" &&
 		selected.Tool != "codex" {
 		if toolDef := session.GetToolDef(selected.Tool); toolDef != nil {
 			toolName := selected.Tool
