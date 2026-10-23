@@ -646,6 +646,11 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	// extra capture, no new goroutine (F3). Disabled-by-config → cheap no-op.
 	d.runSelfHealObservePass(profile, instances, statuses, hookStatuses, db, time.Now().UTC())
 
+	// Reconcile the human ask queue once per pass (level-triggered, idempotent;
+	// see ask_queue.go). Placed here so it runs on both the first-init and the
+	// steady-state paths, and sees the freshest statuses.
+	d.syncAsks(profile, db, byID, statuses, hookStatuses)
+
 	// Issue #2481: a child seen running starts a new run, so the next observed
 	// flip is a new turn unless a path journals one for it first.
 	d.forgetJournaledTurnsOfRunning(profile, statuses)
