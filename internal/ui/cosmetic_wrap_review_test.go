@@ -33,7 +33,7 @@ import (
 // itself: at 120 cols (the tier between the 80-col compact footer and the
 // 200-col footer that shows both blocks) the footer used to truncate its left
 // block at the raw terminal edge with no ellipsis, and lose the entire right
-// block in the process. Help and Quit are the pinned right-block hints.
+// block in the process. Nav, Help and Quit are the pinned right-block hints.
 func TestCosmeticFooter_120Cols_KeepsHelpAndQuit_NoHardCut(t *testing.T) {
 	home := NewHome()
 	home.width = 120
@@ -47,6 +47,9 @@ func TestCosmeticFooter_120Cols_KeepsHelpAndQuit_NoHardCut(t *testing.T) {
 	helpKey := home.actionKey(hotkeyHelp)
 	if helpKey != "" && !strings.Contains(result, helpKey+" Help") {
 		t.Errorf("120-col footer dropped Help (%q Help): %q", helpKey, result)
+	}
+	if !strings.Contains(result, "↑↓ Nav") {
+		t.Errorf("120-col footer dropped '↑↓ Nav': %q", result)
 	}
 	quitKey := home.actionKey(hotkeyQuit)
 	if quitKey != "" && !strings.Contains(result, quitKey+" Quit") {
@@ -69,8 +72,8 @@ func TestCosmeticFooter_120Cols_KeepsHelpAndQuit_NoHardCut(t *testing.T) {
 // TestCosmeticFooter_fitFullFooter_NeverDropsHelpOrQuit exercises
 // fitFullFooter directly across a range of widths, including ones far
 // narrower than any real terminal, to pin the "Help and Quit are never
-// sacrificed" contract: Help is how every other binding is discovered, so it
-// must stay visible however narrow the bar gets.
+// sacrificed" contract (Nav too): Help is how every other binding is
+// discovered, so it must stay visible however narrow the bar gets.
 func TestCosmeticFooter_fitFullFooter_NeverDropsHelpOrQuit(t *testing.T) {
 	home := &Home{}
 	parts := fullFooterParts{
@@ -78,7 +81,8 @@ func TestCosmeticFooter_fitFullFooter_NeverDropsHelpOrQuit(t *testing.T) {
 		primary:    []string{"Enter Attach", "n/N New/Quick", "g Group"},
 		secondary:  []string{"r Rename", "d Delete"},
 		sep:        " │ ",
-		droppable:  []string{"↑↓ Nav", "+/- Move", "/ Search", "G Global", "S Settings"},
+		nav:        "↑↓ Nav",
+		droppable:  []string{"+/- Move", "/ Search", "G Global", "S Settings"},
 		help:       "? Help",
 		quit:       "q Quit",
 	}
@@ -88,6 +92,9 @@ func TestCosmeticFooter_fitFullFooter_NeverDropsHelpOrQuit(t *testing.T) {
 		got := home.fitFullFooter(parts)
 		if !strings.Contains(got, parts.help) {
 			t.Errorf("width=%d: fitFullFooter dropped Help: %q", width, got)
+		}
+		if !strings.Contains(got, parts.nav) {
+			t.Errorf("width=%d: fitFullFooter dropped Nav: %q", width, got)
 		}
 		if !strings.Contains(got, parts.quit) {
 			t.Errorf("width=%d: fitFullFooter dropped Quit: %q", width, got)

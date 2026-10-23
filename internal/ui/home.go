@@ -14063,7 +14063,9 @@ func (h *Home) confirmAction() tea.Cmd {
 	case ConfirmDeleteGroup:
 		groupPath := h.confirmDialog.GetTargetID()
 		h.groupTree.DeleteGroup(groupPath)
-
+		// SaveGroups is additive (never prunes), so the removed group's rows must
+		// be deleted explicitly or it would resurrect on the next reload.
+		h.deleteGroupRows(groupPath)
 		h.instancesMu.Lock()
 		h.instances = h.groupTree.GetAllInstances()
 		h.instancesMu.Unlock()
@@ -15484,6 +15486,10 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.pendingGroupOps = append(h.pendingGroupOps, pendingGroupOp{
 					kind: groupOpRename, oldPath: oldPath, name: name,
 				})
+				// A rename re-paths the group and its subgroups; the old path rows
+				// must be deleted explicitly (additive SaveGroups won't prune them)
+				// or the group reappears under its old name on the next reload.
+				h.deleteGroupRows(oldPath)
 
 				h.instancesMu.Lock()
 				h.instances = h.groupTree.GetAllInstances()
@@ -15895,6 +15901,19 @@ func (h *Home) adoptOwnWrite(stamps statedb.WriteStamps, what string) bool {
 		h.storageWatcher.NotifySave()
 	}
 	return true
+}
+
+// deleteGroupRows removes a group and its descendants from the groups table.
+// SaveGroups is additive (upsert, never prune), so an intentional removal —
+// delete or the old path of a rename/move — must be persisted explicitly here,
+// otherwise the stale rows resurrect the group on the next reload.
+func (h *Home) deleteGroupRows(path string) {
+	if h.storage == nil || path == "" {
+		return
+	}
+	if err := h.storage.DeleteGroupSubtree(path); err != nil {
+		uiLog.Warn("delete_group_rows_failed", slog.String("path", path), slog.String("error", err.Error()))
+	}
 }
 
 // saveGroupState saves only group expanded/collapsed state to SQLite.
@@ -21894,9 +21913,9 @@ func (h *Home) renderHelpBarFull() string {
 		quit:       quitHint,
 	}
 	helpContent := h.fitFullFooter(parts)
-	// On crowded 120-column rows the pinned Nav/Help/Quit block pushes context
-	// hints out; shorter labels win some of them back.
-	if h.width >= 120 && h.width < 160 && strings.Contains(helpContent, " …") {
+	// When the pinned Nav/Help/Quit block pushes context hints out (at any
+	// width: the hint set grows), shorter labels win some of them back.
+	if strings.Contains(helpContent, " …") {
 		shorten := func(hints []string) []string {
 			out := make([]string, len(hints))
 			for i, hint := range hints {
