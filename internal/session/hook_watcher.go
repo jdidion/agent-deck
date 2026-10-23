@@ -168,6 +168,13 @@ type HookStatus struct {
 	// own session id, so its events must never bind the entry's session.
 	// Empty for agents that send no platform.
 	Platform string
+	// Matcher/Message are the retained ask content (human-ask-queue). Matcher
+	// is the decoded Notification matcher ("permission_prompt"|
+	// "elicitation_dialog"); Message is Claude's human-readable Notification
+	// text. Both empty for records with no ask content. The ask-queue producer
+	// reads a kind and a summary off these without re-parsing anything.
+	Matcher string
+	Message string
 }
 
 // hookGenerationForInstance resolves generation authority by instance, not by
@@ -510,6 +517,8 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			TranscriptPath           string `json:"transcript_path"`
 			Cwd                      string `json:"cwd"`
 			Platform                 string `json:"platform"`
+			Matcher                  string `json:"matcher"`
+			Message                  string `json:"message"`
 			CodexStartedGeneration   string `json:"codex_started_generation"`
 			CodexCompletedGeneration string `json:"codex_completed_generation"`
 			CodexStartedSessionID    string `json:"codex_started_session_id"`
@@ -535,6 +544,8 @@ func (w *StatusFileWatcher) scanDirEntriesInto(out map[string]*HookStatus, dir s
 			TranscriptPath:           raw.TranscriptPath,
 			Cwd:                      raw.Cwd,
 			Platform:                 raw.Platform,
+			Matcher:                  raw.Matcher,
+			Message:                  raw.Message,
 			CodexStartedGeneration:   raw.CodexStartedGeneration,
 			CodexCompletedGeneration: raw.CodexCompletedGeneration,
 			CodexStartedSessionID:    raw.CodexStartedSessionID,
@@ -685,6 +696,8 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		TranscriptPath           string `json:"transcript_path"`
 		Cwd                      string `json:"cwd"`
 		Platform                 string `json:"platform"`
+		Matcher                  string `json:"matcher"`
+		Message                  string `json:"message"`
 		CodexStartedGeneration   string `json:"codex_started_generation"`
 		CodexCompletedGeneration string `json:"codex_completed_generation"`
 		CodexStartedSessionID    string `json:"codex_started_session_id"`
@@ -717,6 +730,8 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 		TranscriptPath:           status.TranscriptPath,
 		Cwd:                      status.Cwd,
 		Platform:                 status.Platform,
+		Matcher:                  status.Matcher,
+		Message:                  status.Message,
 		CodexStartedGeneration:   status.CodexStartedGeneration,
 		CodexCompletedGeneration: status.CodexCompletedGeneration,
 		CodexStartedSessionID:    status.CodexStartedSessionID,
