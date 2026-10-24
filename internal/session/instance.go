@@ -7047,6 +7047,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		(i.shouldRejectCodexSubagentRebind(i.hookSessionID) ||
 			i.shouldRejectCodexUnbackedTurnEnd(i.hookSessionID, i.hookEvent)) {
 		i.hookStatus, i.hookEvent, i.hookSessionID = "", "", ""
+		i.hookMatcher, i.hookToolName = "", ""
 		i.hookLastUpdate = time.Time{}
 	}
 
@@ -7981,15 +7982,20 @@ func (i *Instance) StatusEvidence() StatusEvidence {
 	}
 }
 
-// AskKind classifies the instance as an ask from the given live status and the
-// cached hook record, using the ask queue classification. Empty when the
-// session is not asking. Reads only cached fields, so it is safe on the render
-// path.
+// AskKind classifies the instance as an ask from the given live status, the
+// cached hook record and the cached substate, using the ask queue
+// classification. Empty when the session is not asking. Reads only cached
+// fields, so it is safe on the render path.
 func (i *Instance) AskKind(status Status) AskKind {
+	return DeriveAskKind(i.AskHookRecord(), string(status), i.CachedSubstate())
+}
+
+// AskHookRecord returns the cached hook record fields the ask classification
+// reads (event, matcher, tool name).
+func (i *Instance) AskHookRecord() *HookStatus {
 	i.mu.RLock()
-	hs := &HookStatus{Event: i.hookEvent, Matcher: i.hookMatcher, ToolName: i.hookToolName}
-	i.mu.RUnlock()
-	return DeriveAskKind(hs, string(status))
+	defer i.mu.RUnlock()
+	return &HookStatus{Event: i.hookEvent, Matcher: i.hookMatcher, ToolName: i.hookToolName}
 }
 
 func (i *Instance) GetHookStatus() (string, bool) {
@@ -8070,6 +8076,7 @@ func (i *Instance) ClearHookStatus() {
 	// after. Fold it into the durable last-activity record first.
 	i.noteAgentActivityLocked(i.hookLastUpdate)
 	i.hookStatus = ""
+	i.hookMatcher, i.hookToolName = "", ""
 	i.hookLastUpdate = time.Time{}
 	i.mu.Unlock()
 	// Flush BEFORE removing the file below, bypassing the write throttle —

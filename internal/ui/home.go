@@ -405,10 +405,15 @@ type Home struct {
 	nextTimeFilterExpiry time.Time
 
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
-	previewCache      map[string]string    // previewKey -> cached preview content
-	previewCacheTime  map[string]time.Time // previewKey -> when cached (for expiration)
-	previewCacheMu    sync.RWMutex         // Protects previewCache for thread-safety
-	previewFetchingID string               // ID currently being fetched (prevents duplicate fetches)
+	previewCache     map[string]string    // previewKey -> cached preview content
+	previewCacheTime map[string]time.Time // previewKey -> when cached (for expiration)
+	previewFetchGen  map[string]uint64    // previewKey -> latest local fetch generation issued
+	// previewFetchGenMu guards previewFetchGen. Separate from previewCacheMu
+	// because fetchPreview is called with previewCacheMu held. Lock order:
+	// previewCacheMu, then previewFetchGenMu.
+	previewFetchGenMu sync.Mutex
+	previewCacheMu    sync.RWMutex // Protects previewCache for thread-safety
+	previewFetchingID string       // ID currently being fetched (prevents duplicate fetches)
 
 	// Preview debouncing (PERFORMANCE: prevents subprocess spawn on every keystroke)
 	// During rapid navigation, we delay preview fetch by 150ms to let navigation settle
@@ -1108,15 +1113,16 @@ type Home struct {
 	// session's active window; >= 0 targets that specific window. When nil, the
 	// dispatch calls the tmux session directly. See issue #1369.
 	quickApproveSink func(inst *session.Instance, windowIndex int) error
-	// askDenySink and askRestartSink are optional overrides used by tests to
-	// capture the ask panel's deny (Escape to the pane) and restart dispatches
-	// without driving real tmux. When nil, deny sends Escape to the session's
-	// tmux pane and restart takes the normal restart path.
-	askDenySink    func(inst *session.Instance) error
+	// askRestartSink is an optional override used by tests to capture the ask
+	// panel's restart dispatches. When nil, restart takes the normal restart
+	// path.
 	askRestartSink func(inst *session.Instance) error
 	// askPendingAction is the group action awaiting y/n in the ask panel; nil
 	// when no confirmation is showing.
 	askPendingAction func() tea.Cmd
+	// askDispatchInFlight is set while an approve/deny dispatch cmd runs;
+	// approve/deny keys are ignored until its askDispatchResultMsg arrives.
+	askDispatchInFlight bool
 }
 
 // reloadState preserves UI state during storage reload
@@ -1733,6 +1739,10 @@ type previewFetchedMsg struct {
 	previewKey string // cache key: sessionID or sessionID:windowIndex
 	content    string
 	err        error
+	// gen is the fetch generation for previewKey, stamped when the fetch cmd
+	// is built. A result older than previewFetchGen[previewKey] is dropped.
+	// Zero for fetches that do not stamp one (remote previews).
+	gen uint64
 }
 
 // remotePaneWatchTarget names the remote session whose pane the TUI asked
@@ -5720,6 +5730,13 @@ func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int)
 	if inst == nil {
 		return nil
 	}
+	h.previewFetchGenMu.Lock()
+	if h.previewFetchGen == nil {
+		h.previewFetchGen = make(map[string]uint64)
+	}
+	h.previewFetchGen[key]++
+	gen := h.previewFetchGen[key]
+	h.previewFetchGenMu.Unlock()
 	return func() tea.Msg {
 		var content string
 		var err error
@@ -5732,6 +5749,7 @@ func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int)
 			previewKey: key,
 			content:    content,
 			err:        err,
+			gen:        gen,
 		}
 	}
 }
@@ -6006,9 +6024,10 @@ func (h *Home) fetchSelectedPreview() tea.Cmd {
 	return h.fetchPreviewDebounced(inst.ID, winIdx)
 }
 
-// refetchSelectedPreviewNow invalidates the selected item's cached preview and
+// refetchSelectedPreviewNow expires the selected item's cached preview and
 // fetches it without the navigation debounce. Used on attach return, where the
-// cached capture predates everything that happened while attached.
+// cached capture predates everything that happened while attached. The old
+// capture stays on screen until the new one lands.
 func (h *Home) refetchSelectedPreviewNow() tea.Cmd {
 	if h.getLayoutMode() == LayoutModeSingle {
 		return nil
@@ -6016,13 +6035,14 @@ func (h *Home) refetchSelectedPreviewNow() tea.Cmd {
 	inst, key, winIdx := h.selectedPreviewTarget()
 	if inst == nil {
 		if _, _, remoteKey, ok := h.selectedRemotePreviewTarget(); ok {
-			h.invalidatePreviewCache(remoteKey)
+			h.previewCacheMu.Lock()
+			h.previewCacheTime[remoteKey] = time.Time{}
+			h.previewCacheMu.Unlock()
 		}
 		return h.fetchSelectedPreview()
 	}
 	h.previewCacheMu.Lock()
-	delete(h.previewCache, key)
-	delete(h.previewCacheTime, key)
+	h.previewCacheTime[key] = time.Time{}
 	h.previewFetchingID = key
 	h.previewCacheMu.Unlock()
 	return h.fetchPreview(inst, key, winIdx)
@@ -6171,9 +6191,12 @@ type sessionRenderState struct {
 	// tests do) get the pre-finding-1 behavior of counting everything.
 	archivedSuperseded bool
 	// askKind is the ask classification (approval/decision/error, or empty)
-	// of status plus the cached hook record, so row glyphs and header counts
-	// match the ask queue without I/O on the render path.
+	// of status plus the cached hook record and substate, so row glyphs and
+	// header counts match the ask queue without I/O on the render path.
 	askKind session.AskKind
+	// archived is true for any archived session; archived sessions are not
+	// counted as asks in the filter bar.
+	archived bool
 }
 
 // shouldPersistAutoNameDesc decides whether the background status loop should
@@ -6324,7 +6347,8 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 		status := inst.GetStatusThreadSafe()
 		state := sessionRenderState{
 			status:             status,
-			askKind:            inst.AskKind(status),
+			askKind:            session.DeriveAskKind(inst.AskHookRecord(), string(status), uiCachedSubstate(inst)),
+			archived:           inst.IsArchived(),
 			substate:           inst.CachedSubstate(),
 			tool:               inst.DisplayToolThreadSafe(),
 			archivedSuperseded: inst.IsArchived() && inst.SupersededBy != "",
@@ -10025,11 +10049,26 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case askDispatchResultMsg:
+		h.askDispatchInFlight = false
+		h.setError(errors.New(askDispatchSummary(msg)))
+		h.refreshAskPanel()
+		return h, nil
+
 	case previewFetchedMsg:
 		// Async preview content received - always advance the TTL so failures
 		// and empty responses don't trigger a fetch on every tick.
 		// Protect both previewFetchingID and previewCache with the same mutex
 		h.previewCacheMu.Lock()
+		h.previewFetchGenMu.Lock()
+		latest := h.previewFetchGen[msg.previewKey]
+		h.previewFetchGenMu.Unlock()
+		if msg.gen < latest {
+			// Superseded by a newer fetch for this key, still in flight or
+			// already applied.
+			h.previewCacheMu.Unlock()
+			return h, nil
+		}
 		h.previewFetchingID = ""
 		h.previewCacheTime[msg.previewKey] = time.Now()
 		if msg.err == nil {
@@ -11025,31 +11064,21 @@ func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		h.askPanel.Hide()
 		return h, nil
-	case "y", "n", "Y", "N":
-		if group == session.AskApproval {
-			// Approve/deny are disabled: approval rows are not confirmed against the
-			// pane, so these keys typed "1" into sessions at their normal prompt.
-			h.setError(fmt.Errorf("approve/deny from the Asks panel is disabled until it verifies the prompt on screen; open the session (enter) to answer"))
+	case "y", "n":
+		if h.askDispatchInFlight || group != session.AskApproval {
+			return h, nil
 		}
-		return h, nil
-	case "_disabled_yn":
 		if onHeader {
 			h.confirmAskGroupAction(key == "y", group)
 			return h, nil
 		}
-		if sel := h.askPanel.Selected(); sel != nil {
-			if inst := h.getInstanceByID(sel.InstanceID); inst != nil {
-				if key == "y" {
-					h.quickApprove(inst, -1)
-				} else {
-					h.askDeny(inst)
-				}
-			}
+		sel := h.askPanel.Selected()
+		if sel == nil {
+			return h, nil
 		}
-		h.refreshAskPanel()
-		return h, nil
-	case "_disabled_YN":
-		if group == session.AskApproval {
+		return h, h.askDispatch(key == "y", []*statedb.AskItemRow{sel})
+	case "Y", "N":
+		if !h.askDispatchInFlight && group == session.AskApproval {
 			h.confirmAskGroupAction(key == "Y", group)
 		}
 		return h, nil
@@ -11095,9 +11124,20 @@ func (h *Home) askConfirm(prompt string, run func() tea.Cmd) {
 	h.askPanel.SetConfirm(prompt)
 }
 
-// confirmAskGroupAction arms approve-all (approve) or deny-all for group.
+// confirmAskGroupAction arms approve-all (approve) or deny-all for group. It
+// targets only rows whose session still classifies as an approval from its
+// live status, cached hook record and cached substate.
 func (h *Home) confirmAskGroupAction(approve bool, group session.AskKind) {
-	items := h.askPanel.GroupItems(group)
+	var items []*statedb.AskItemRow
+	for _, item := range h.askPanel.GroupItems(group) {
+		inst := h.getInstanceByID(item.InstanceID)
+		if inst == nil {
+			continue
+		}
+		if session.DeriveAskKind(inst.AskHookRecord(), string(inst.GetStatusThreadSafe()), uiCachedSubstate(inst)) == session.AskApproval {
+			items = append(items, item)
+		}
+	}
 	if len(items) == 0 {
 		return
 	}
@@ -11106,19 +11146,127 @@ func (h *Home) confirmAskGroupAction(approve bool, group session.AskKind) {
 		verb = "Approve"
 	}
 	h.askConfirm(fmt.Sprintf("%s %s? (y/n)", verb, askCountNoun(len(items), "pending tool call")), func() tea.Cmd {
-		for _, item := range items {
-			inst := h.getInstanceByID(item.InstanceID)
-			if inst == nil {
-				continue
-			}
-			if approve {
-				h.quickApprove(inst, -1)
-			} else {
-				h.askDeny(inst)
-			}
-		}
-		return nil
+		return h.askDispatch(approve, items)
 	})
+}
+
+// uiCachedSubstate reads an instance's substate for the TUI's ask
+// classification without capturing the pane.
+var uiCachedSubstate = (*session.Instance).CachedSubstate
+
+// askPaneHasMenu takes a fresh capture of the session's pane and reports
+// whether it shows an open interactive menu. Dispatch sends only when it does.
+// A session with no tmux pane passes, so the send reports it as a failure
+// rather than a skip.
+var askPaneHasMenu = func(inst *session.Instance) bool {
+	if inst.GetTmuxSession() == nil {
+		return true
+	}
+	content, err := captureVisiblePane(inst)
+	if err != nil {
+		return false
+	}
+	return tmux.HasOpenInteractiveMenu(tmux.StripANSI(content))
+}
+
+// askSendApprove answers the open menu with "1"+Enter, as quick-approve does.
+var askSendApprove = func(inst *session.Instance) error {
+	tmuxSess := inst.GetTmuxSession()
+	if tmuxSess == nil {
+		return fmt.Errorf("no tmux session")
+	}
+	return tmuxSess.SendKeysAndEnter("1")
+}
+
+// askSendDeny rejects the open menu by sending Escape.
+var askSendDeny = func(inst *session.Instance) error {
+	tmuxSess := inst.GetTmuxSession()
+	if tmuxSess == nil {
+		return fmt.Errorf("no tmux session")
+	}
+	return tmuxSess.SendNamedKey("Escape")
+}
+
+// askDispatchResultMsg reports one approve/deny dispatch. Action is "approve"
+// or "deny"; Skipped counts sessions whose pane showed no menu.
+type askDispatchResultMsg struct {
+	Action       string
+	Sent         int
+	Skipped      int
+	Failed       int
+	FailedTitles []string
+}
+
+// askDispatch returns a cmd that approves (or denies) each item's session in
+// parallel, sending only to panes that show an open menu on a fresh capture.
+// The key handler only resolves instances; captures and sends run in the cmd.
+func (h *Home) askDispatch(approve bool, items []*statedb.AskItemRow) tea.Cmd {
+	type target struct {
+		inst  *session.Instance
+		title string
+	}
+	targets := make([]target, 0, len(items))
+	for _, item := range items {
+		inst := h.getInstanceByID(item.InstanceID)
+		title := item.InstanceID
+		if inst != nil {
+			title = inst.Title
+		}
+		targets = append(targets, target{inst: inst, title: title})
+	}
+	action, send := "deny", askSendDeny
+	if approve {
+		action, send = "approve", askSendApprove
+	}
+	h.askDispatchInFlight = true
+	return func() tea.Msg {
+		res := askDispatchResultMsg{Action: action}
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, t := range targets {
+			wg.Add(1)
+			go func(t target) {
+				defer wg.Done()
+				var err error
+				skipped := false
+				if t.inst == nil {
+					err = fmt.Errorf("session not found")
+				} else if !askPaneHasMenu(t.inst) {
+					skipped = true
+				} else {
+					err = send(t.inst)
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case skipped:
+					res.Skipped++
+				case err != nil:
+					res.Failed++
+					res.FailedTitles = append(res.FailedTitles, t.title)
+				default:
+					res.Sent++
+				}
+			}(t)
+		}
+		wg.Wait()
+		sort.Strings(res.FailedTitles)
+		return res
+	}
+}
+
+// askDispatchSummary renders a dispatch result as one status line, e.g.
+// "Approved 2, skipped 19 (no prompt on screen), failed 0".
+func askDispatchSummary(msg askDispatchResultMsg) string {
+	verb := "Denied"
+	if msg.Action == "approve" {
+		verb = "Approved"
+	}
+	line := fmt.Sprintf("%s %d, skipped %d (no prompt on screen), failed %d", verb, msg.Sent, msg.Skipped, msg.Failed)
+	if len(msg.FailedTitles) > 0 {
+		line += ": " + strings.Join(msg.FailedTitles, ", ")
+	}
+	return line
 }
 
 // confirmAskDismissGroup arms dismiss-all for group.
@@ -11145,20 +11293,6 @@ func (h *Home) resolveAskItems(items []*statedb.AskItemRow) {
 	now := time.Now()
 	for _, item := range items {
 		_ = db.ResolveAskItem(item.ID, now)
-	}
-}
-
-// askDeny rejects a pending tool call by sending Escape to the session's pane.
-func (h *Home) askDeny(inst *session.Instance) {
-	if inst == nil {
-		return
-	}
-	if h.askDenySink != nil {
-		_ = h.askDenySink(inst)
-		return
-	}
-	if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
-		_ = tmuxSess.SendNamedKey("Escape")
 	}
 }
 
@@ -19616,11 +19750,12 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored 
 
 // renderFilterBar renders the quick filter pills
 // Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [■ Stopped 1] [✕ Error 1]
-// countAskKinds counts local waiting sessions the render snapshot classifies
-// as an approval or a decision ask. Those are drawn ? and ✎ rather than ◐.
+// countAskKinds counts local, unarchived waiting sessions the render snapshot
+// classifies as an approval or a decision ask. Those are drawn ? and ✎ rather
+// than ◐.
 func (h *Home) countAskKinds() (approval, decision int) {
 	for _, state := range h.getSessionRenderSnapshot() {
-		if state.archivedSuperseded || statusBucket(state.status) != session.StatusWaiting {
+		if state.archived || statusBucket(state.status) != session.StatusWaiting {
 			continue
 		}
 		switch state.askKind {

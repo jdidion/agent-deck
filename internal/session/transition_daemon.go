@@ -226,6 +226,18 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 	// a background goroutine it has no way to let finish.
 	d.maybeStartInitialRecallBackfill(ctx)
 
+	// A daemon started under a throwaway HOME (tests, scripted runs) exits
+	// once that HOME is gone rather than lingering detached. Checked before
+	// each pass, since a pass writes under HOME and would recreate it.
+	home, _ := os.UserHomeDir()
+	homeGone := func() bool {
+		if home == "" {
+			return false
+		}
+		_, err := os.Stat(home)
+		return os.IsNotExist(err)
+	}
+
 	// Prime baseline once, then run adaptive loop.
 	interval := d.SyncOnce(ctx)
 	d.tickRemoteTalkback(ctx)
@@ -238,6 +250,9 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(interval):
+			if homeGone() {
+				return nil
+			}
 			d.maybeStartInitialRecallBackfill(ctx)
 			interval = d.SyncOnce(ctx)
 			d.tickRemoteTalkback(ctx)

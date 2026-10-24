@@ -102,6 +102,7 @@ type AskPanel struct {
 	groups  map[session.AskKind][]askRow
 	lines   []askLine
 	cursor  int
+	offset  int    // first line rendered when the list is taller than the panel
 	confirm string // pending group-action prompt; "" when none
 	width   int
 	height  int
@@ -347,11 +348,18 @@ func (ap *AskPanel) View() string {
 	header := askPanelHeaderStyle.Render(fmt.Sprintf("⚡ Asks (%d)", len(ap.lines)-len(ap.groups)))
 	b.WriteString(header + "\n\n")
 
+	footer := askPanelHintStyle.Render(ap.hint())
+	if ap.confirm != "" {
+		footer = askPanelConfirmStyle.Render(ap.confirm)
+	}
+
 	if len(ap.lines) == 0 {
 		b.WriteString(askPanelEmptyStyle.Render("No open requests — you're caught up."))
 		b.WriteString("\n")
 	} else {
-		for i, l := range ap.lines {
+		start, end := ap.visibleRange(totalWidth-2, footer)
+		for i := start; i < end; i++ {
+			l := ap.lines[i]
 			if l.row == nil {
 				b.WriteString(ap.renderGroupHeader(i, l.kind) + "\n")
 				continue
@@ -361,11 +369,7 @@ func (ap *AskPanel) View() string {
 	}
 
 	b.WriteString("\n")
-	if ap.confirm != "" {
-		b.WriteString(askPanelConfirmStyle.Render(ap.confirm))
-	} else {
-		b.WriteString(askPanelHintStyle.Render(ap.hint()))
-	}
+	b.WriteString(footer)
 
 	boxStyle := lipgloss.NewStyle().
 		Width(totalWidth).
@@ -374,6 +378,40 @@ func (ap *AskPanel) View() string {
 		Padding(0, 1)
 
 	return centerInScreen(boxStyle.Render(b.String()), ap.width, ap.height)
+}
+
+// visibleRange returns the [start, end) slice of lines that fits the panel
+// height around the header, the blank lines and the footer (wrapped at
+// contentWidth), scrolling ap.offset so the cursor stays in view. A panel with
+// no height set shows every line.
+func (ap *AskPanel) visibleRange(contentWidth int, footer string) (int, int) {
+	n := len(ap.lines)
+	if ap.height <= 0 {
+		return 0, n
+	}
+	footerLines := lipgloss.Height(lipgloss.NewStyle().Width(contentWidth).Render(footer))
+	// Border (2), title and its blank line (2), blank line above the footer (1).
+	avail := ap.height - 5 - footerLines
+	if avail < 1 {
+		avail = 1
+	}
+	if n <= avail {
+		ap.offset = 0
+		return 0, n
+	}
+	if ap.cursor < ap.offset {
+		ap.offset = ap.cursor
+	}
+	if ap.cursor >= ap.offset+avail {
+		ap.offset = ap.cursor - avail + 1
+	}
+	if ap.offset > n-avail {
+		ap.offset = n - avail
+	}
+	if ap.offset < 0 {
+		ap.offset = 0
+	}
+	return ap.offset, ap.offset + avail
 }
 
 // renderGroupHeader renders a group header line with its count.

@@ -341,6 +341,13 @@ func hasCodexInteractiveMenu(content string) bool {
 	return false
 }
 
+// HasOpenInteractiveMenu reports whether content (an ANSI-stripped pane
+// capture) shows an open selection menu awaiting the operator. It is the
+// predicate behind SubstateInteractiveMenu.
+func HasOpenInteractiveMenu(content string) bool {
+	return hasOpenInteractiveMenu(content)
+}
+
 // hasOpenInteractiveMenu reports whether the pane shows an open selection
 // menu awaiting the operator's choice, scoped to the recent tail so a stale
 // menu scrolled out of view does not keep matching forever. A picker

@@ -39,10 +39,14 @@ func NormalizeAskKind(kind string) AskKind {
 
 // DeriveAskKind is the kind-only form of deriveAsk, for callers outside the
 // producer (the TUI row glyphs) that need the same classification.
-func DeriveAskKind(hs *HookStatus, status string) AskKind {
-	kind, _, _ := deriveAsk(hs, status)
+func DeriveAskKind(hs *HookStatus, status string, substate Substate) AskKind {
+	kind, _, _ := deriveAsk(hs, status, substate)
 	return kind
 }
+
+// askSubstateOf reads an instance's substate for syncAsks. It returns the
+// cached value from the status pass, so the producer takes no pane capture.
+var askSubstateOf = (*Instance).CachedSubstate
 
 const (
 	// askPruneInterval rate-limits PruneResolvedAskItems so it runs at most once
@@ -76,16 +80,20 @@ func askItemID(instanceID, disambig string) string {
 // deriveAsk classifies an instance's current state as an ask, or reports
 // ok == false when it is not a request the human owes a response to.
 //
-// Scoped to explicit requests and errors. A plain finished-and-waiting turn
-// (a Stop with no permission/elicitation matcher) is deliberately NOT an ask:
-// the queue is for things the human is being asked to DO, and enqueuing every
-// idle-at-the-prompt session would drown the real requests. This is the same
-// judgement that excludes idle from the desktop notifier.
-func deriveAsk(hs *HookStatus, toStatus string) (AskKind, string, bool) {
+// Scoped to explicit requests and errors. A plain finished-and-waiting turn is
+// deliberately NOT an ask: the queue is for things the human is being asked to
+// DO, and enqueuing every idle-at-the-prompt session would drown the real
+// requests. This is the same judgement that excludes idle from the desktop
+// notifier.
+//
+// The pane is the ground truth for approvals and decisions: they require the
+// substate interactive-menu. The hook record is the LATEST event and is often
+// stale (a PreToolUse from a turn that already finished), so it only picks
+// between decision and approval and supplies the summary.
+func deriveAsk(hs *HookStatus, toStatus string, substate Substate) (AskKind, string, bool) {
 	st := normalizeStatusString(toStatus)
-	var event, matcher, msg, tool string
+	var matcher, msg, tool string
 	if hs != nil {
-		event = strings.ToLower(strings.TrimSpace(hs.Event))
 		matcher = strings.ToLower(strings.TrimSpace(hs.Matcher))
 		msg = strings.TrimSpace(hs.Message)
 		tool = strings.TrimSpace(hs.ToolName)
@@ -93,32 +101,20 @@ func deriveAsk(hs *HookStatus, toStatus string) (AskKind, string, bool) {
 	if st == string(StatusError) {
 		return AskError, summaryOr(msg, "hit an error"), true
 	}
-	// An approval/decision requires the session to actually be waiting. The
-	// hook status is the LATEST event and can be stale: a session that answered
-	// a prompt and resumed carries a running status with a still-permission-
-	// shaped record for a beat, and a PreToolUse while running is a tool that
-	// is executing. Gating on the live status stops either from opening an ask.
-	if st != string(StatusWaiting) {
+	// An approval/decision requires the session to be waiting with the menu
+	// on screen. A running session with a permission-shaped record has already
+	// been answered, and a waiting one without the menu is at its prompt.
+	if st != string(StatusWaiting) || substate != SubstateInteractiveMenu {
 		return "", "", false
 	}
-	askUserQuestion := strings.EqualFold(tool, "AskUserQuestion")
-	switch {
-	case matcher == "elicitation_dialog" || (event == "pretooluse" && askUserQuestion):
+	if matcher == "elicitation_dialog" || strings.EqualFold(tool, "AskUserQuestion") {
 		return AskDecision, summaryOr(msg, "is asking a question"), true
-	case event == "permissionrequest" || matcher == "permission_prompt":
-		return AskApproval, summaryOr(msg, "wants permission to run a command"), true
-	case event == "pretooluse":
-		// Claude sends no hook before a permission prompt, so a session left
-		// waiting on PreToolUse is blocked on that tool. An empty tool name is
-		// a status file written before tool_name was retained.
-		fallback := "wants permission to run a command"
-		if tool != "" {
-			fallback = "wants to run " + tool
-		}
-		return AskApproval, summaryOr(msg, fallback), true
-	default:
-		return "", "", false
 	}
+	fallback := "wants permission to run a command"
+	if tool != "" {
+		fallback = "wants to run " + tool
+	}
+	return AskApproval, summaryOr(msg, fallback), true
 }
 
 func summaryOr(s, fallback string) string {
@@ -182,11 +178,28 @@ func (d *TransitionDaemon) syncAsks(
 	// or is no longer in an attention status (the ask was answered and the agent
 	// moved on). hasOpen tracks which instances still hold an open ask after this
 	// pass, so the open phase below does not create a duplicate for them.
+	//
+	// An open approval or decision also closes when its instance no longer
+	// derives that kind: the menu left the pane, or the request changed kind
+	// (the open phase then opens the new kind in the same pass).
+	derive := func(id string) (AskKind, string, bool) {
+		var sub Substate
+		if inst := byID[id]; inst != nil {
+			sub = askSubstateOf(inst)
+		}
+		return deriveAsk(hookStatuses[id], statuses[id], sub)
+	}
 	hasOpen := make(map[string]bool, len(open))
 	for _, item := range open {
 		if _, live := byID[item.InstanceID]; !live || !isAttentionStatus(statuses[item.InstanceID]) {
 			d.resolveAsk(db, item.ID, now)
 			continue
+		}
+		if stored := NormalizeAskKind(item.Kind); stored != AskError {
+			if kind, _, ok := derive(item.InstanceID); !ok || kind != stored {
+				d.resolveAsk(db, item.ID, now)
+				continue
+			}
 		}
 		hasOpen[item.InstanceID] = true
 	}
@@ -198,7 +211,7 @@ func (d *TransitionDaemon) syncAsks(
 		if inst == nil || hasOpen[id] {
 			continue
 		}
-		kind, summary, ok := deriveAsk(hookStatuses[id], statuses[id])
+		kind, summary, ok := derive(id)
 		if !ok {
 			continue
 		}
