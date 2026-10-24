@@ -464,7 +464,9 @@ func TestAskDispatch_MixedApproveAllReportsSkipped(t *testing.T) {
 // Spec "Dispatching keys": "The confirmation prompt counts only rows still
 // classified as approvals." ap3 has an open approval row but its cached
 // substate no longer shows the menu.
-func TestAskDispatch_ConfirmationCountsOnlyStillApprovals(t *testing.T) {
+func TestAskDispatch_ConfirmationCountsEveryShownRow(t *testing.T) {
+	// Spec "Dispatching keys": the prompt counts the rows the panel shows; the
+	// cached substate can lag the pane, so the per-send pane check is the gate.
 	h, _, _ := newAskGroupsHome(t,
 		askGroupsSeed{"ap1", "approval", session.StatusWaiting, 1 * time.Minute},
 		askGroupsSeed{"ap2", "approval", session.StatusWaiting, 2 * time.Minute},
@@ -476,8 +478,8 @@ func TestAskDispatch_ConfirmationCountsOnlyStillApprovals(t *testing.T) {
 
 	askGroupsMoveToItem(t, h, "ask-ap1")
 	askKeyCmd(h, "Y")
-	if p := askGroupsPromptLine(h); !strings.Contains(p, "Approve 2 pending tool calls? (y/n)") {
-		t.Errorf("prompt = %q, want %q (ap3 is no longer an approval)", p, "Approve 2 pending tool calls? (y/n)")
+	if p := askGroupsPromptLine(h); !strings.Contains(p, "Approve 3 pending tool calls? (y/n)") {
+		t.Errorf("prompt = %q, want %q", p, "Approve 3 pending tool calls? (y/n)")
 	}
 }
 

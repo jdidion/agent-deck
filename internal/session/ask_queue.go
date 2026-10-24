@@ -44,9 +44,21 @@ func DeriveAskKind(hs *HookStatus, status string, substate Substate) AskKind {
 	return kind
 }
 
-// askSubstateOf reads an instance's substate for syncAsks. It returns the
-// cached value from the status pass, so the producer takes no pane capture.
-var askSubstateOf = (*Instance).CachedSubstate
+// askSubstateOf reads a waiting instance's substate for syncAsks. The cached
+// value is used when the status pass recorded one; otherwise the pane is
+// captured. The cache is empty whenever the pass did not capture: the daemon
+// loads fresh instances every pass and probes none while a TUI is alive, and
+// hook-driven statuses skip the capture.
+var askSubstateOf = func(inst *Instance) Substate {
+	if sub := inst.CachedSubstate(); sub != SubstateNone {
+		return sub
+	}
+	tmuxSess := inst.GetTmuxSession()
+	if tmuxSess == nil {
+		return SubstateNone
+	}
+	return tmuxSess.GetSubstate()
+}
 
 const (
 	// askPruneInterval rate-limits PruneResolvedAskItems so it runs at most once
@@ -184,7 +196,7 @@ func (d *TransitionDaemon) syncAsks(
 	// (the open phase then opens the new kind in the same pass).
 	derive := func(id string) (AskKind, string, bool) {
 		var sub Substate
-		if inst := byID[id]; inst != nil {
+		if inst := byID[id]; inst != nil && normalizeStatusString(statuses[id]) == string(StatusWaiting) {
 			sub = askSubstateOf(inst)
 		}
 		return deriveAsk(hookStatuses[id], statuses[id], sub)

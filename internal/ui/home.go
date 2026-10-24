@@ -10051,7 +10051,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case askDispatchResultMsg:
 		h.askDispatchInFlight = false
-		h.setError(errors.New(askDispatchSummary(msg)))
+		h.askPanel.SetStatus(askDispatchSummary(msg))
+		if msg.Failed > 0 {
+			h.setError(errors.New(askDispatchSummary(msg)))
+		}
 		h.refreshAskPanel()
 		return h, nil
 
@@ -11068,6 +11071,7 @@ func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.askDispatchInFlight || group != session.AskApproval {
 			return h, nil
 		}
+		h.askPanel.SetStatus("")
 		if onHeader {
 			h.confirmAskGroupAction(key == "y", group)
 			return h, nil
@@ -11124,26 +11128,19 @@ func (h *Home) askConfirm(prompt string, run func() tea.Cmd) {
 	h.askPanel.SetConfirm(prompt)
 }
 
-// confirmAskGroupAction arms approve-all (approve) or deny-all for group. It
-// targets only rows whose session still classifies as an approval from its
-// live status, cached hook record and cached substate.
+// confirmAskGroupAction arms approve-all (approve) or deny-all for every row
+// shown in group. The cached substate is not consulted here: it is only as
+// fresh as the last status pass that captured the pane, and hook-driven
+// statuses skip the capture. Dispatch re-checks each pane before sending.
 func (h *Home) confirmAskGroupAction(approve bool, group session.AskKind) {
-	var items []*statedb.AskItemRow
-	for _, item := range h.askPanel.GroupItems(group) {
-		inst := h.getInstanceByID(item.InstanceID)
-		if inst == nil {
-			continue
-		}
-		if session.DeriveAskKind(inst.AskHookRecord(), string(inst.GetStatusThreadSafe()), uiCachedSubstate(inst)) == session.AskApproval {
-			items = append(items, item)
-		}
-	}
-	if len(items) == 0 {
-		return
-	}
+	items := h.askPanel.GroupItems(group)
 	verb := "Deny"
 	if approve {
 		verb = "Approve"
+	}
+	if len(items) == 0 {
+		h.askPanel.SetStatus("Nothing to " + strings.ToLower(verb))
+		return
 	}
 	h.askConfirm(fmt.Sprintf("%s %s? (y/n)", verb, askCountNoun(len(items), "pending tool call")), func() tea.Cmd {
 		return h.askDispatch(approve, items)
@@ -11219,6 +11216,11 @@ func (h *Home) askDispatch(approve bool, items []*statedb.AskItemRow) tea.Cmd {
 		action, send = "approve", askSendApprove
 	}
 	h.askDispatchInFlight = true
+	progress := "Denying"
+	if approve {
+		progress = "Approving"
+	}
+	h.askPanel.SetStatus(fmt.Sprintf("%s %s…", progress, askCountNoun(len(targets), "session")))
 	return func() tea.Msg {
 		res := askDispatchResultMsg{Action: action}
 		var mu sync.Mutex

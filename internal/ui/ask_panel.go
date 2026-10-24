@@ -104,6 +104,7 @@ type AskPanel struct {
 	cursor  int
 	offset  int    // first line rendered when the list is taller than the panel
 	confirm string // pending group-action prompt; "" when none
+	status  string // progress or result of the last approve/deny; "" when none
 	width   int
 	height  int
 	visible bool
@@ -128,6 +129,7 @@ func (ap *AskPanel) Show() {
 func (ap *AskPanel) Hide() {
 	ap.visible = false
 	ap.confirm = ""
+	ap.status = ""
 }
 
 // IsVisible reports whether the panel is visible.
@@ -147,6 +149,11 @@ func (ap *AskPanel) SetSize(width, height int) {
 // SetConfirm shows prompt in place of the key hint; "" clears it.
 func (ap *AskPanel) SetConfirm(prompt string) {
 	ap.confirm = prompt
+}
+
+// SetStatus shows a progress or result line above the key hint; "" clears it.
+func (ap *AskPanel) SetStatus(status string) {
+	ap.status = status
 }
 
 // SetRows replaces the display rows and regroups them. Stored legacy kinds
@@ -351,6 +358,8 @@ func (ap *AskPanel) View() string {
 	footer := askPanelHintStyle.Render(ap.hint())
 	if ap.confirm != "" {
 		footer = askPanelConfirmStyle.Render(ap.confirm)
+	} else if ap.status != "" {
+		footer = askPanelConfirmStyle.Render(ap.status) + "\n" + footer
 	}
 
 	if len(ap.lines) == 0 {

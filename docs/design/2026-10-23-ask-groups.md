@@ -58,7 +58,11 @@ skipped and counted, never sent to. Dispatch runs off the Bubble Tea event loop
 Failures (send error, no tmux session) are counted and named, not swallowed.
 While a group dispatch is in flight, further approve/deny keys are ignored, so
 repeated presses do not send extra rounds. The per-item `y`/`n` follow the same
-check. The confirmation prompt counts only rows still classified as approvals.
+check. The confirmation prompt counts the rows the panel shows (the cached
+substate can lag the pane, since hook-driven statuses skip the capture; the
+per-send check is the gate). While a dispatch runs, the panel shows
+`Approving N sessions…`, then the result line; with nothing to act on it says
+so instead of doing nothing silently.
 
 The existing `permission` kind is renamed `approval` and `question` is renamed
 `decision`. Rows already stored with the old names are read as the new names.
