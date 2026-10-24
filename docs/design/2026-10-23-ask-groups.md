@@ -141,3 +141,35 @@ poll once the HOME it started with no longer exists.
   fetch result is applied only if it belongs to the latest fetch for that
   session, so an in-flight pre-attach capture cannot overwrite the fresh one.
 - The filter bar does not count archived sessions as `?` or `✎`.
+
+## Second review round (2026-10-24)
+
+- **Approve answers only a permission prompt.** The dispatch gate requires the
+  pane to show a permission dialog (the numbered Yes/No "Do you want to
+  proceed?" shape, including plan approval), not any open menu: an
+  AskUserQuestion picker or other selection list is skipped, so `1` never picks
+  a question's first option. The check uses the same frame preparation as the
+  status classifier (`prepareFrame`), so Claude's agent roster below the footer
+  cannot push the dialog out of the inspected tail.
+- **Capture errors are failures.** A pane capture that errors or times out at
+  dispatch counts as failed and names the session; skipped means the capture
+  succeeded and showed no permission prompt.
+- **Daemon captures are bounded.** The producer captures only waiting
+  instances, at most once per instance every 5 s (reusing the last result in
+  between), each capture under the per-probe budget, and stops capturing for
+  the rest of the pass once the pass budget is spent.
+- **Unknown is not "menu gone".** An instance whose capture errored, timed out
+  or was skipped for budget has an unknown substate: its open row is kept and
+  no row is opened for it. An open approval or decision resolves on a missing
+  menu only after two consecutive successful captures without one.
+- **HOME identity.** The daemon records HOME's identity (`os.Stat` at start)
+  and exits when HOME is missing or is no longer the same directory
+  (`os.SameFile`), checked before the first pass and after every pass, so a
+  pass that recreates HOME cannot keep it alive.
+- **Panel status.** Showing the panel clears any old status line, and each
+  send has a timeout, so a dispatch result always arrives and the in-flight
+  guard always clears.
+- **Counts.** Archived sessions count in none of the `●`/`?`/`✎`/`◐` pills'
+  ask arithmetic: an archived waiting session is not "your turn" either.
+- **Remote preview.** Remote preview fetches carry a generation too, so an
+  in-flight pre-attach remote capture cannot overwrite the post-attach one.
