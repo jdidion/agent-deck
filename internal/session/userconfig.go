@@ -504,6 +504,13 @@ type UISettings struct {
 	// omitted setting preserves the classic layout and Enter-to-attach behavior.
 	EmbeddedTerminal *bool `toml:"embedded_terminal,omitempty"`
 
+	// Compact tightens vertical layout: the SESSIONS/PREVIEW panel titles render
+	// as a single "TITLE ────" line instead of title-over-underline, and the
+	// preview header puts session name, status, tool/group pills, and the
+	// activity time on one line. Default false (the classic roomier layout).
+	// Distinct from SidebarDensity, which controls per-session ROW height.
+	Compact *bool `toml:"compact,omitempty"`
+
 	// SidebarDensity controls how many lines one session occupies in the
 	// embedded-layout sidebar. It has no effect on the classic layout. Valid
 	// values:
@@ -766,6 +773,11 @@ func normalizePreviewFieldList(fields []string, key string) []string {
 // An omitted value preserves the classic layout.
 func (u UISettings) GetEmbeddedTerminal() bool {
 	return u.EmbeddedTerminal != nil && *u.EmbeddedTerminal
+}
+
+// GetCompact reports whether the tightened vertical layout is on. Default false.
+func (u UISettings) GetCompact() bool {
+	return u.Compact != nil && *u.Compact
 }
 
 // Sidebar densities for the embedded layout. See UISettings.SidebarDensity.
@@ -1753,6 +1765,16 @@ type PreviewSettings struct {
 	// in the preview pane when output is visible.
 	// Range: 0.1 - 0.9 (fraction reserved for notes). Default: 0.33
 	NotesOutputSplit float64 `toml:"notes_output_split,omitzero"`
+
+	// HideWorktree hides the Worktree section in the preview pane. This is the
+	// INITIAL state; the toggle-preview-sections hotkey flips it at runtime.
+	// Default: false (shown). Pointer to distinguish "not set" from "explicitly false".
+	HideWorktree *bool `toml:"hide_worktree,omitempty"`
+
+	// HideClaude hides the Claude section in the preview pane. Initial state only;
+	// the toggle-preview-sections hotkey flips it at runtime.
+	// Default: false (shown). Pointer to distinguish "not set" from "explicitly false".
+	HideClaude *bool `toml:"hide_claude,omitempty"`
 }
 
 // AnalyticsDisplaySettings configures which analytics sections to display
@@ -1820,6 +1842,23 @@ type NotificationsConfig struct {
 	// on by default; this covers the operator, including TOP-LEVEL sessions with
 	// no parent, which the transition path cannot reach at all.
 	Desktop bool `toml:"desktop,omitempty"`
+
+	// AutostartDaemon makes the TUI launch the always-on notify daemon on
+	// startup if one is not already running. The daemon is a SEPARATE process
+	// that does all notification dispatch (parent inbox, desktop banners, the
+	// ask queue); without it those never fire. Historically it had to be
+	// installed as a launchd/systemd service, so an operator running the TUI
+	// standalone got no notifications at all. Default true (nil = true); a
+	// daemon whose HOME is removed exits on its next poll. When on, the spawn is guarded by a machine-wide lock, so repeated launches
+	// and multiple TUIs never produce a second daemon.
+	AutostartDaemon *bool `toml:"autostart_daemon,omitempty"`
+}
+
+// GetAutostartDaemonEnabled reports whether the TUI should auto-start the notify
+// daemon. Defaults to true when unset (nil). A daemon started under a throwaway
+// HOME exits once that HOME is removed (see TransitionDaemon.Run).
+func (n NotificationsConfig) GetAutostartDaemonEnabled() bool {
+	return n.AutostartDaemon == nil || *n.AutostartDaemon
 }
 
 // GetDesktopEnabled reports whether desktop notifications are enabled.
@@ -2030,6 +2069,18 @@ func (p *PreviewSettings) GetShowNotes() bool {
 		return false // Default: notes OFF
 	}
 	return *p.ShowNotes
+}
+
+// GetHideWorktree reports the INITIAL hidden state of the preview Worktree
+// section. Default false (shown).
+func (p *PreviewSettings) GetHideWorktree() bool {
+	return p.HideWorktree != nil && *p.HideWorktree
+}
+
+// GetHideClaude reports the INITIAL hidden state of the preview Claude section.
+// Default false (shown).
+func (p *PreviewSettings) GetHideClaude() bool {
+	return p.HideClaude != nil && *p.HideClaude
 }
 
 // GetNotesOutputSplit returns notes/output split ratio, clamped to sane bounds.

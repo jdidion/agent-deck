@@ -341,6 +341,80 @@ func hasCodexInteractiveMenu(content string) bool {
 	return false
 }
 
+// HasOpenInteractiveMenu reports whether content (an ANSI-stripped pane
+// capture) shows an open selection menu awaiting the operator. It is the
+// predicate behind SubstateInteractiveMenu.
+func HasOpenInteractiveMenu(content string) bool {
+	return hasOpenInteractiveMenu(content)
+}
+
+// permissionQuestionRe matches the question a permission dialog opens with:
+// "Do you want to proceed?", "Do you want to make this edit to main.go?", and
+// plan approval's "Would you like to proceed?". An AskUserQuestion picker asks
+// in its own words ("Do you want me to push …?"), which this does not match.
+var permissionQuestionRe = regexp.MustCompile(`(?i)^[\s│]*(?:do you want to \S|would you like to proceed\b)`)
+
+// permissionFirstOptionRe matches a permission dialog's first option, which
+// is always a Yes ("❯ 1. Yes", "1. Yes, and auto-accept edits"). Approving
+// sends "1", so the gate requires it.
+var permissionFirstOptionRe = regexp.MustCompile(`(?i)^[\s│]*(?:❯\s*)?1\.\s+yes\b`)
+
+// askPickerChrome is lowercased chrome drawn only by an AskUserQuestion picker
+// (its header checkbox, free-text option and navigation hint), never by a
+// permission dialog.
+var askPickerChrome = []string{
+	"☐ ",
+	"☒ ",
+	"type something",
+	"enter to select",
+	"↑/↓ to navigate",
+}
+
+// PaneShowsPermissionPrompt reports whether content (an ANSI-stripped Claude
+// pane capture) shows a permission dialog: a "Do you want to …?" or plan
+// approval question directly followed by a numbered "1. Yes" option, with no
+// question-picker chrome. Any other open menu (an AskUserQuestion picker, a
+// selection list, the feedback survey) is not one, so answering "1" can only
+// ever approve. The frame is prepared as the status classifier prepares a
+// Claude frame, so a roster drawn under the dialog does not push it out of
+// the inspected tail.
+func PaneShowsPermissionPrompt(content string) bool {
+	s := &Session{DisplayName: "permission-check", detectedTool: "claude"}
+	s.mu.Lock()
+	content = s.prepareFrame(content)
+	s.mu.Unlock()
+	if !hasOpenInteractiveMenu(content) {
+		return false
+	}
+	lines := recentTailLines(content, 15)
+	if start, end, ok := claudeDraftBoxBounds(lines); ok {
+		for i := start + 1; i < end; i++ {
+			lines[i] = ""
+		}
+	}
+	question := -1
+	for i, line := range lines {
+		lower := strings.ToLower(line)
+		for _, chrome := range askPickerChrome {
+			if strings.Contains(lower, chrome) {
+				return false
+			}
+		}
+		if permissionQuestionRe.MatchString(line) {
+			question = i
+		}
+	}
+	if question < 0 {
+		return false
+	}
+	for _, line := range lines[question+1:] {
+		if strings.TrimSpace(line) != "" {
+			return permissionFirstOptionRe.MatchString(line)
+		}
+	}
+	return false
+}
+
 // hasOpenInteractiveMenu reports whether the pane shows an open selection
 // menu awaiting the operator's choice, scoped to the recent tail so a stale
 // menu scrolled out of view does not keep matching forever. A picker

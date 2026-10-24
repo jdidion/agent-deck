@@ -72,7 +72,7 @@ func ValidateTranscriptPath(path string) (string, bool) {
 	}
 	realRoots := make([]string, 0, len(roots))
 	for _, r := range roots {
-		realRoots = append(realRoots, resolveCanonical(r))
+		realRoots = append(realRoots, resolveProbeTarget(r))
 	}
 	if !containedUnderAny(resolveProbeTarget(cleanPath), realRoots) {
 		return "", false

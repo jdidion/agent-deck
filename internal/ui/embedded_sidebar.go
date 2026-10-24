@@ -233,7 +233,7 @@ func (h *Home) renderEmbeddedSessionItem(
 		return
 	}
 
-	statusIcon, statusStyle := rowStatusGlyph(state.status, state.substate, inst.IsArchived())
+	statusIcon, statusStyle := rowAttentionGlyph(state.status, state.substate, inst.IsArchived(), state.askKind)
 	_, restarting := h.resumingSessions[inst.ID]
 	if restarting {
 		spinnerFrames := []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"}

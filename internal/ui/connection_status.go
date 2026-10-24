@@ -90,6 +90,26 @@ func rowStatusGlyph(status session.Status, substate session.Substate, archived b
 	return icon, style
 }
 
+// rowAttentionGlyph is rowStatusGlyph refined by the ask classification
+// (docs/design/2026-10-23-ask-groups.md "Session row icons"): a waiting session
+// blocked on a tool approval draws ? in yellow, one asking for a decision draws
+// ✎ in magenta, and any other waiting session (a finished turn) draws ◐ dim.
+// kind is session.DeriveAskKind of the live status and cached hook record.
+func rowAttentionGlyph(status session.Status, substate session.Substate, archived bool, kind session.AskKind) (icon string, style lipgloss.Style) {
+	icon, style = rowStatusGlyph(status, substate, archived)
+	if archived || statusBucket(status) != session.StatusWaiting {
+		return icon, style
+	}
+	switch kind {
+	case session.AskApproval:
+		return "?", lipgloss.NewStyle().Foreground(ColorYellow)
+	case session.AskDecision:
+		return "✎", lipgloss.NewStyle().Foreground(ColorMagenta)
+	default:
+		return "◐", lipgloss.NewStyle().Foreground(ColorTextDim)
+	}
+}
+
 // remoteRowStatusGlyph is the remote-session entry point to rowStatusGlyph.
 //
 // A remote row's state arrives as raw JSON strings from `agent-deck list --json`

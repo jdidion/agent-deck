@@ -87,17 +87,21 @@ var claudeFooterRe = regexp.MustCompile(`^\s*⏵⏵ |shift\+tab to cycle|← for
 // roster entries, the artifact list and its "+N more" continuation.
 var claudeRosterRowRe = regexp.MustCompile(`^\s*(?:[⏺◯●]\s|⧉\s|\+\d+ more\b)`)
 
+// claudeDialogHintRe matches the key-hint line under an open dialog or picker
+// ("Esc to cancel · Tab to amend", "Enter to select · ↑/↓ to navigate"). While
+// a dialog is open Claude may draw the roster straight under that line with no
+// footer, so it anchors the trim when no footer is found.
+var claudeDialogHintRe = regexp.MustCompile(`(?i)^\s*(?:esc to cancel|enter to (?:select|confirm)|tab/arrow keys to navigate|use arrow keys to navigate)\b`)
+
 // trimClaudeTrailingRoster drops agent-roster / artifact rows that follow the
-// footer. Anything else after the footer (a menu, an error line) keeps the
-// frame intact, so the trim can only ever remove rows the detectors ignore.
+// footer, or the dialog key-hint line when the frame has no footer. Anything
+// else after that line (a menu, an error line) keeps the frame intact, so the
+// trim can only ever remove rows the detectors ignore.
 func trimClaudeTrailingRoster(content string) string {
 	lines := strings.Split(content, "\n")
-	footer := -1
-	for i := len(lines) - 1; i >= 0 && i >= len(lines)-60; i-- {
-		if claudeFooterRe.MatchString(lines[i]) {
-			footer = i
-			break
-		}
+	footer := lastLineMatching(lines, claudeFooterRe)
+	if footer < 0 {
+		footer = lastLineMatching(lines, claudeDialogHintRe)
 	}
 	if footer < 0 || footer == len(lines)-1 {
 		return content
@@ -109,6 +113,17 @@ func trimClaudeTrailingRoster(content string) string {
 		return content
 	}
 	return strings.Join(lines[:footer+1], "\n")
+}
+
+// lastLineMatching returns the index of the last of the final 60 lines that
+// matches re, or -1.
+func lastLineMatching(lines []string, re *regexp.Regexp) int {
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-60; i-- {
+		if re.MatchString(lines[i]) {
+			return i
+		}
+	}
+	return -1
 }
 
 // claudeTailBusyRe is the unambiguous live-work cue inside the recent tail:

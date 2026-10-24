@@ -113,8 +113,9 @@ func TestLiveCodexThreadID(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(codexHome, "thread-writer-locks"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	realHome := evalSymlinksT(t, codexHome)
 	a, b := uniqueSID(t), uniqueSID(t)
-	lock := func(id string) string { return filepath.Join(codexHome, "thread-writer-locks", id+".lock") }
+	lock := func(id string) string { return filepath.Join(realHome, "thread-writer-locks", id+".lock") }
 	rollout := func(id string) string {
 		return filepath.Join(codexHome, "sessions", "2026", "09", "23", "rollout-2026-09-23T05-36-36-"+id+".jsonl")
 	}
@@ -147,6 +148,7 @@ func TestLatestCodexTurnGeneration_FreshThreadOwnedByLiveProcess(t *testing.T) {
 	if err := os.MkdirAll(lockDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	lockDir = evalSymlinksT(t, lockDir)
 	fresh, other := uniqueSID(t), uniqueSID(t)
 	inst.CodexSessionID = fresh
 

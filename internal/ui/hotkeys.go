@@ -82,6 +82,24 @@ const (
 	// have the bare key can set [hotkeys].agents_panel = "a" and move
 	// quick_approve.
 	hotkeyAgentsPanel = "agents_panel"
+	// hotkeyAskPanel opens the human-ask queue: a cross-session list of open
+	// requests an agent has made of the human (permission / question / error).
+	//
+	// It ships on the "alt+q" chord, not a bare letter. The bare "a" it
+	// originally used is quick_approve's canonical key, so a literal `case "a"`
+	// in the home dispatch shadowed quick_approve entirely (a duplicate switch
+	// case Go cannot flag, because the sibling arm is a map index rather than a
+	// constant). Every plain letter that reads as "ask" is taken, so — like
+	// hotkeyAgentsPanel with "alt+a" — this keeps a mnemonic on a free chord. A
+	// user who wants the bare key can set [hotkeys].ask_panel and move whatever
+	// currently owns it.
+	hotkeyAskPanel = "ask_panel"
+	// hotkeyTogglePreviewSections shows/hides the collapsible preview-pane
+	// sections (Worktree, Claude) together. Their initial state comes from
+	// [preview] hide_worktree / hide_claude; this key flips it at runtime. On a
+	// free "alt+h" chord — bare letters are exhausted and this is the mnemonic
+	// (Hide).
+	hotkeyTogglePreviewSections = "toggle_preview_sections"
 	// Session switcher. While attached it is intercepted in the tmux attach
 	// loop (see internal/tmux/pty.go AttachOptions); on the home screen it is
 	// dispatched like any other hotkey. Must resolve to a "ctrl+<letter>" chord.
@@ -168,6 +186,8 @@ var hotkeyActionOrder = []string{
 	hotkeyDeadLetters,
 	hotkeyTriggers,
 	hotkeyAgentsPanel,
+	hotkeyAskPanel,
+	hotkeyTogglePreviewSections,
 	hotkeySwitchSession,
 	hotkeyAltSession,
 	hotkeyMRUBack,
@@ -175,61 +195,63 @@ var hotkeyActionOrder = []string{
 }
 
 var defaultHotkeyBindings = map[string]string{
-	hotkeyQuit:             "q",
-	hotkeyNewSession:       "n",
-	hotkeyQuickCreate:      "N",
-	hotkeyRename:           "r",
-	hotkeyRestart:          "R",
-	hotkeyRestartFresh:     "T",
-	hotkeyDelete:           "d",
-	hotkeyCloseSession:     "D",
-	hotkeyArchiveSession:   "A",
-	hotkeyUnarchiveSession: "shift+u",
-	hotkeyViewArchived:     "^",
-	hotkeyUndoDelete:       "ctrl+z",
-	hotkeyMoveToGroup:      "M",
-	hotkeyMCPManager:       "m",
-	hotkeyPluginManager:    "L",
-	hotkeySkillsManager:    "s",
-	hotkeyTogglePreview:    "v",
-	hotkeyCycleGroupView:   "t",
-	hotkeyCycleTimeFilter:  "*",
-	hotkeyMarkUnread:       "u",
-	hotkeyQuickApprove:     "a",
-	hotkeyPromptSession:    "o",
-	hotkeyQueueMessage:     "Q",
-	hotkeyToggleYolo:       "y",
-	hotkeyQuickFork:        "f",
-	hotkeyForkWithOptions:  "F",
-	hotkeyCopyOutput:       "c",
-	hotkeyCopyPane:         "V",
-	hotkeyCopyInfo:         "B",
-	hotkeyContextInspector: "C",
-	hotkeySendOutput:       "x",
-	hotkeyExecShell:        "E",
-	hotkeyOpenShellHere:    "H",
-	hotkeyEditNotes:        "e",
-	hotkeyEditPaths:        "p",
-	hotkeyEditSession:      "P",
-	hotkeyWorktreeSetup:    "b",
-	hotkeyWorktreeFinish:   "W",
-	hotkeyCreateGroup:      "g",
-	hotkeySearch:           "/",
-	hotkeyHelp:             "?",
-	hotkeySettings:         "S",
-	hotkeyImport:           "i",
-	hotkeyReload:           "ctrl+r",
-	hotkeyRestartDeck:      "ctrl+t",
-	hotkeyInstallUpdate:    "ctrl+y",
-	hotkeyDetach:           "ctrl+q",
-	hotkeyWatcherPanel:     "w",
-	hotkeyDeadLetters:      "alt+d",
-	hotkeyTriggers:         "alt+t",
-	hotkeyAgentsPanel:      "alt+a",
-	hotkeySwitchSession:    "ctrl+s",
-	hotkeyAltSession:       "`",
-	hotkeyMRUBack:          "alt+left",
-	hotkeyMRUForward:       "alt+right",
+	hotkeyQuit:                  "q",
+	hotkeyNewSession:            "n",
+	hotkeyQuickCreate:           "N",
+	hotkeyRename:                "r",
+	hotkeyRestart:               "R",
+	hotkeyRestartFresh:          "T",
+	hotkeyDelete:                "d",
+	hotkeyCloseSession:          "D",
+	hotkeyArchiveSession:        "A",
+	hotkeyUnarchiveSession:      "shift+u",
+	hotkeyViewArchived:          "^",
+	hotkeyUndoDelete:            "ctrl+z",
+	hotkeyMoveToGroup:           "M",
+	hotkeyMCPManager:            "m",
+	hotkeyPluginManager:         "L",
+	hotkeySkillsManager:         "s",
+	hotkeyTogglePreview:         "v",
+	hotkeyCycleGroupView:        "t",
+	hotkeyCycleTimeFilter:       "*",
+	hotkeyMarkUnread:            "u",
+	hotkeyQuickApprove:          "a",
+	hotkeyPromptSession:         "o",
+	hotkeyQueueMessage:          "Q",
+	hotkeyToggleYolo:            "y",
+	hotkeyQuickFork:             "f",
+	hotkeyForkWithOptions:       "F",
+	hotkeyCopyOutput:            "c",
+	hotkeyCopyPane:              "V",
+	hotkeyCopyInfo:              "B",
+	hotkeyContextInspector:      "C",
+	hotkeySendOutput:            "x",
+	hotkeyExecShell:             "E",
+	hotkeyOpenShellHere:         "H",
+	hotkeyEditNotes:             "e",
+	hotkeyEditPaths:             "p",
+	hotkeyEditSession:           "P",
+	hotkeyWorktreeSetup:         "b",
+	hotkeyWorktreeFinish:        "W",
+	hotkeyCreateGroup:           "g",
+	hotkeySearch:                "/",
+	hotkeyHelp:                  "?",
+	hotkeySettings:              "S",
+	hotkeyImport:                "i",
+	hotkeyReload:                "ctrl+r",
+	hotkeyRestartDeck:           "ctrl+t",
+	hotkeyInstallUpdate:         "ctrl+y",
+	hotkeyDetach:                "ctrl+q",
+	hotkeyWatcherPanel:          "w",
+	hotkeyDeadLetters:           "alt+d",
+	hotkeyTriggers:              "alt+t",
+	hotkeyAgentsPanel:           "alt+a",
+	hotkeyAskPanel:              "alt+q",
+	hotkeyTogglePreviewSections: "alt+h",
+	hotkeySwitchSession:         "ctrl+s",
+	hotkeyAltSession:            "`",
+	hotkeyMRUBack:               "alt+left",
+	hotkeyMRUForward:            "alt+right",
 }
 
 var hotkeyActionDefaultTriggers = map[string][]string{

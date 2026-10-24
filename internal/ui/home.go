@@ -277,6 +277,7 @@ type Home struct {
 	globalSearch         *GlobalSearch // Recall search over recall.db (the G key)
 	recallSource         RecallSource  // the index behind it (nil when [recall] enabled = false)
 	recallOff            string        // why the index is not open ("" when it is); G shows it in the local search
+	askPanel             *AskPanel     // Open human-ask queue across sessions (see docs/design/2026-08-14-human-ask-queue.md)
 	newDialog            *NewDialog
 	pendingRemoteName    string                // #1353: remote target for the open new-session dialog ("" = local)
 	groupDialog          *GroupDialog          // For creating/renaming groups
@@ -404,10 +405,15 @@ type Home struct {
 	nextTimeFilterExpiry time.Time
 
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
-	previewCache      map[string]string    // previewKey -> cached preview content
-	previewCacheTime  map[string]time.Time // previewKey -> when cached (for expiration)
-	previewCacheMu    sync.RWMutex         // Protects previewCache for thread-safety
-	previewFetchingID string               // ID currently being fetched (prevents duplicate fetches)
+	previewCache     map[string]string    // previewKey -> cached preview content
+	previewCacheTime map[string]time.Time // previewKey -> when cached (for expiration)
+	previewFetchGen  map[string]uint64    // previewKey -> latest fetch generation issued
+	// previewFetchGenMu guards previewFetchGen. Separate from previewCacheMu
+	// because fetchPreview is called with previewCacheMu held. Lock order:
+	// previewCacheMu, then previewFetchGenMu.
+	previewFetchGenMu sync.Mutex
+	previewCacheMu    sync.RWMutex // Protects previewCache for thread-safety
+	previewFetchingID string       // ID currently being fetched (prevents duplicate fetches)
 
 	// Preview debouncing (PERFORMANCE: prevents subprocess spawn on every keystroke)
 	// During rapid navigation, we delay preview fetch by 150ms to let navigation settle
@@ -743,6 +749,18 @@ type Home struct {
 	// preview_orientation, toggled live via the `O` keybinding, persisted
 	// back to config on toggle.
 	previewOrientation string
+
+	// previewHideWorktree / previewHideClaude hide the Worktree and Claude
+	// sections in the preview pane. Initialized from [preview] hide_worktree /
+	// hide_claude and toggled together at runtime by the toggle-preview-sections
+	// hotkey (see hotkeyTogglePreviewSections).
+	previewHideWorktree bool
+	previewHideClaude   bool
+
+	// compact tightens vertical layout ([ui] compact): one-line panel titles and
+	// a single-line preview header (name + status + pills + activity). Default
+	// off (the classic roomier layout).
+	compact bool
 
 	// footerMode selects the bottom hint-bar style (config.toml [ui] footer).
 	// One of session.FooterCurated (default), FooterFull, FooterCompact, or
@@ -1095,6 +1113,16 @@ type Home struct {
 	// session's active window; >= 0 targets that specific window. When nil, the
 	// dispatch calls the tmux session directly. See issue #1369.
 	quickApproveSink func(inst *session.Instance, windowIndex int) error
+	// askRestartSink is an optional override used by tests to capture the ask
+	// panel's restart dispatches. When nil, restart takes the normal restart
+	// path.
+	askRestartSink func(inst *session.Instance) error
+	// askPendingAction is the group action awaiting y/n in the ask panel; nil
+	// when no confirmation is showing.
+	askPendingAction func() tea.Cmd
+	// askDispatchInFlight is set while an approve/deny dispatch cmd runs;
+	// approve/deny keys are ignored until its askDispatchResultMsg arrives.
+	askDispatchInFlight bool
 }
 
 // reloadState preserves UI state during storage reload
@@ -1711,6 +1739,9 @@ type previewFetchedMsg struct {
 	previewKey string // cache key: sessionID or sessionID:windowIndex
 	content    string
 	err        error
+	// gen is the fetch generation for previewKey, stamped when the fetch cmd
+	// is built. A result older than previewFetchGen[previewKey] is dropped.
+	gen uint64
 }
 
 // remotePaneWatchTarget names the remote session whose pane the TUI asked
@@ -2203,6 +2234,11 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.footerMode = cfg.UI.GetFooter()
 		h.attachOnCreate = cfg.UI.GetAttachOnCreate()
 		h.viewModeOpts.ActiveIncludesIdle = cfg.UI.GetActiveIncludesIdle()
+		// Initial hidden state of the collapsible preview sections; the
+		// toggle-preview-sections hotkey flips these at runtime.
+		h.previewHideWorktree = cfg.Preview.GetHideWorktree()
+		h.previewHideClaude = cfg.Preview.GetHideClaude()
+		h.compact = cfg.UI.GetCompact()
 	} else {
 		h.fullRepaint = (session.DisplaySettings{}).GetFullRepaint()
 		h.activeFilterExcludes = (session.DisplaySettings{}).GetActiveFilterExcludes()
@@ -2330,6 +2366,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	} else {
 		h.recallOff = recallOffNotice
 	}
+	h.askPanel = NewAskPanel()
 
 	// Initialize MCP socket pool if enabled
 	// Note: Pool initialization happens AFTER loading sessions so we can discover MCPs in use
@@ -3942,6 +3979,9 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
 func (h *Home) sidebarLineBudget() (lineBudget int, sidebarWidth int) {
 	helpBarHeight := 2
 	panelTitleLines := 2 // SESSIONS title + underline (matches View())
+	if h.compact {
+		panelTitleLines = 1 // compact: single "TITLE ────" line
+	}
 
 	// Filter bar is always shown for consistent layout (matches View())
 	filterBarHeight := 1
@@ -4223,6 +4263,9 @@ func (h *Home) applySavedLayoutSettings(ui session.UISettings) {
 func (h *Home) getVisibleHeight() int {
 	helpBarHeight := 2
 	panelTitleLines := 2
+	if h.compact {
+		panelTitleLines = 1
+	}
 	filterBarHeight := 1
 	updateBannerHeight := 0
 	if h.shouldRenderUpdateBanner() {
@@ -5686,6 +5729,13 @@ func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int)
 	if inst == nil {
 		return nil
 	}
+	h.previewFetchGenMu.Lock()
+	if h.previewFetchGen == nil {
+		h.previewFetchGen = make(map[string]uint64)
+	}
+	h.previewFetchGen[key]++
+	gen := h.previewFetchGen[key]
+	h.previewFetchGenMu.Unlock()
 	return func() tea.Msg {
 		var content string
 		var err error
@@ -5698,6 +5748,7 @@ func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int)
 			previewKey: key,
 			content:    content,
 			err:        err,
+			gen:        gen,
 		}
 	}
 }
@@ -5732,20 +5783,31 @@ func (h *Home) fetchRemotePreviewDebounced(remoteName, sessionID string) tea.Cmd
 	}
 }
 
+// fetchRemotePreview returns a command that fetches a remote session's preview
+// over ssh. Like fetchPreview it stamps the result with a new generation for
+// key, so an older fetch still in flight cannot overwrite a newer one. Callers
+// may hold previewCacheMu.
 func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
+	h.previewFetchGenMu.Lock()
+	if h.previewFetchGen == nil {
+		h.previewFetchGen = make(map[string]uint64)
+	}
+	h.previewFetchGen[key]++
+	gen := h.previewFetchGen[key]
+	h.previewFetchGenMu.Unlock()
 	return func() tea.Msg {
 		config, err := session.LoadUserConfig()
 		if err != nil || config == nil || config.Remotes == nil {
-			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("failed to load remote config")}
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("failed to load remote config"), gen: gen}
 		}
 
 		rc, ok := config.Remotes[remoteName]
 		if !ok {
-			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("remote '%s' not found", remoteName)}
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("remote '%s' not found", remoteName), gen: gen}
 		}
 
 		if h.remoteAuthBlocked(remoteName, rc) {
-			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("auth failed; run agent-deck remote list --retry")}
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("auth failed; run agent-deck remote list --retry"), gen: gen}
 		}
 		runner := session.NewSSHRunner(remoteName, rc)
 		ctx, cancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
@@ -5774,7 +5836,7 @@ func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
 			}
 		}
 		content = truncateRemotePreviewContent(content)
-		return previewFetchedMsg{previewKey: key, content: content, err: fetchErr}
+		return previewFetchedMsg{previewKey: key, content: content, err: fetchErr, gen: gen}
 	}
 }
 
@@ -5972,6 +6034,40 @@ func (h *Home) fetchSelectedPreview() tea.Cmd {
 	return h.fetchPreviewDebounced(inst.ID, winIdx)
 }
 
+// refetchSelectedPreviewNow expires the selected item's cached preview and
+// fetches it without the navigation debounce. Used on attach return, where the
+// cached capture predates everything that happened while attached. The old
+// capture stays on screen until the new one lands.
+func (h *Home) refetchSelectedPreviewNow() tea.Cmd {
+	if h.getLayoutMode() == LayoutModeSingle {
+		return nil
+	}
+	inst, key, winIdx := h.selectedPreviewTarget()
+	if inst == nil {
+		remoteName, remoteSessionID, remoteKey, ok := h.selectedRemotePreviewTarget()
+		if !ok {
+			return h.fetchSelectedPreview()
+		}
+		h.previewCacheMu.Lock()
+		h.previewCacheTime[remoteKey] = time.Time{}
+		h.previewCacheMu.Unlock()
+		if remotePaneWatchActive(remoteName, remoteSessionID) {
+			return h.fetchSelectedPreview()
+		}
+		// Fetch now even if a poll is in flight: its newer generation makes
+		// the pre-attach result drop on arrival.
+		h.previewCacheMu.Lock()
+		h.previewFetchingID = remoteKey
+		h.previewCacheMu.Unlock()
+		return tea.Batch(h.fetchSelectedPreview(), h.fetchRemotePreview(remoteName, remoteSessionID, remoteKey))
+	}
+	h.previewCacheMu.Lock()
+	h.previewCacheTime[key] = time.Time{}
+	h.previewFetchingID = key
+	h.previewCacheMu.Unlock()
+	return h.fetchPreview(inst, key, winIdx)
+}
+
 // detectOpenCodeSessionCmd returns a command that asynchronously detects
 // the OpenCode session ID for a restored session and signals completion.
 // This follows the Bubble Tea pattern of returning a tea.Cmd for async work.
@@ -6114,6 +6210,13 @@ type sessionRenderState struct {
 	// callers that build a fake snapshot without touching this field (many
 	// tests do) get the pre-finding-1 behavior of counting everything.
 	archivedSuperseded bool
+	// askKind is the ask classification (approval/decision/error, or empty)
+	// of status plus the cached hook record and substate, so row glyphs and
+	// header counts match the ask queue without I/O on the render path.
+	askKind session.AskKind
+	// archived is true for any archived session; archived sessions are not
+	// counted as asks in the filter bar.
+	archived bool
 }
 
 // shouldPersistAutoNameDesc decides whether the background status loop should
@@ -6261,8 +6364,11 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 		if inst == nil {
 			continue
 		}
+		status := inst.GetStatusThreadSafe()
 		state := sessionRenderState{
-			status:             inst.GetStatusThreadSafe(),
+			status:             status,
+			askKind:            session.DeriveAskKind(inst.AskHookRecord(), string(status), uiCachedSubstate(inst)),
+			archived:           inst.IsArchived(),
 			substate:           inst.CachedSubstate(),
 			tool:               inst.DisplayToolThreadSafe(),
 			archivedSuperseded: inst.IsArchived() && inst.SupersededBy != "",
@@ -9676,6 +9782,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// The selected preview cache holds the pre-attach capture; drop it and
+		// fetch now so the first frame after return shows current output.
+		syncCmd = tea.Batch(syncCmd, h.refetchSelectedPreviewNow())
+
 		// Skip save during reload to avoid overwriting external changes (CLI)
 		h.reloadMu.Lock()
 		reloading := h.isReloading
@@ -9959,11 +10069,29 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, nil
 
+	case askDispatchResultMsg:
+		h.askDispatchInFlight = false
+		h.askPanel.SetStatus(askDispatchSummary(msg))
+		if msg.Failed > 0 {
+			h.setError(errors.New(askDispatchSummary(msg)))
+		}
+		h.refreshAskPanel()
+		return h, nil
+
 	case previewFetchedMsg:
 		// Async preview content received - always advance the TTL so failures
 		// and empty responses don't trigger a fetch on every tick.
 		// Protect both previewFetchingID and previewCache with the same mutex
 		h.previewCacheMu.Lock()
+		h.previewFetchGenMu.Lock()
+		latest := h.previewFetchGen[msg.previewKey]
+		h.previewFetchGenMu.Unlock()
+		if msg.gen < latest {
+			// Superseded by a newer fetch for this key, still in flight or
+			// already applied.
+			h.previewCacheMu.Unlock()
+			return h, nil
+		}
 		h.previewFetchingID = ""
 		h.previewCacheTime[msg.previewKey] = time.Now()
 		if msg.err == nil {
@@ -10236,6 +10364,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Refresh cost totals for header display
 		h.refreshCostTotals()
+
+		// Live-refresh the ask panel while it is open, so items appear/resolve
+		// under the human as the producer daemon writes the store.
+		if h.askPanel.IsVisible() {
+			h.refreshAskPanel()
+		}
 
 		// Periodic UI state save (every 5 ticks = ~10 seconds)
 		h.uiStateSaveTicks++
@@ -10597,6 +10731,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if h.globalSearch.IsVisible() {
 			return h.handleGlobalSearchKey(msg)
 		}
+		if h.askPanel.IsVisible() {
+			return h.handleAskPanelKey(msg)
+		}
 		if h.newDialog.IsVisible() {
 			return h.handleNewDialogKey(msg)
 		}
@@ -10880,6 +11017,351 @@ func (h *Home) jumpToSession(inst *session.Instance) {
 			break
 		}
 	}
+}
+
+// refreshAskPanel reloads the open-ask queue from the current profile's store
+// and hands the display rows (store row + resolved session title) to the
+// panel. Best-effort: a nil storage/db or a read error just leaves the panel
+// with whatever rows it had. The db is per-profile, so ListOpenAskItems only
+// ever returns the current profile's items.
+func (h *Home) refreshAskPanel() {
+	if h.storage == nil {
+		return
+	}
+	db := h.storage.GetDB()
+	if db == nil {
+		return
+	}
+	items, err := db.ListOpenAskItems()
+	if err != nil {
+		return
+	}
+	rows := make([]askRow, 0, len(items))
+	for _, item := range items {
+		title := item.InstanceID
+		if inst := h.getInstanceByID(item.InstanceID); inst != nil {
+			title = inst.Title
+		}
+		rows = append(rows, askRow{item: item, title: title})
+	}
+	h.askPanel.SetRows(rows)
+}
+
+// handleAskPanelKey routes keys while the ask panel is open
+// (docs/design/2026-10-23-ask-groups.md "Asks panel"). Item keys: enter jumps,
+// r dismisses, y/n approve/deny an approval. On a group header y/n/r act on the
+// whole group; Y/N/R/D act on the cursor's group from anywhere. Group actions
+// confirm first; only y proceeds and any other key cancels the prompt.
+func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	if h.askPendingAction != nil {
+		run := h.askPendingAction
+		h.askPendingAction = nil
+		h.askPanel.SetConfirm("")
+		if key != "y" {
+			return h, nil
+		}
+		cmd := run()
+		h.refreshAskPanel()
+		return h, cmd
+	}
+
+	group := h.askPanel.CursorGroup()
+	onHeader := h.askPanel.OnHeader()
+	switch key {
+	case "up", "k":
+		h.askPanel.MoveUp()
+		return h, nil
+	case "down", "j":
+		h.askPanel.MoveDown()
+		return h, nil
+	case "enter":
+		if onHeader {
+			return h, nil
+		}
+		sel := h.askPanel.Selected()
+		if sel != nil {
+			if inst := h.getInstanceByID(sel.InstanceID); inst != nil {
+				h.jumpToSession(inst)
+			}
+		}
+		h.askPanel.Hide()
+		return h, nil
+	case "y", "n":
+		if h.askDispatchInFlight || group != session.AskApproval {
+			return h, nil
+		}
+		h.askPanel.SetStatus("")
+		if onHeader {
+			h.confirmAskGroupAction(key == "y", group)
+			return h, nil
+		}
+		sel := h.askPanel.Selected()
+		if sel == nil {
+			return h, nil
+		}
+		return h, h.askDispatch(key == "y", []*statedb.AskItemRow{sel})
+	case "Y", "N":
+		if !h.askDispatchInFlight && group == session.AskApproval {
+			h.confirmAskGroupAction(key == "Y", group)
+		}
+		return h, nil
+	case "R":
+		if items := h.askPanel.GroupItems(group); group == session.AskError && len(items) > 0 {
+			h.askConfirm(fmt.Sprintf("Restart %s? (y/n)", askCountNoun(len(items), "errored session")),
+				func() tea.Cmd { return h.askRestartItems(items) })
+		}
+		return h, nil
+	case "D":
+		h.confirmAskDismissGroup(group)
+		return h, nil
+	case "r":
+		if onHeader {
+			h.confirmAskDismissGroup(group)
+			return h, nil
+		}
+		// Manual dismiss: resolve the item and stay in the panel so the human
+		// can keep working the queue down.
+		if sel := h.askPanel.Selected(); sel != nil {
+			h.resolveAskItems([]*statedb.AskItemRow{sel})
+		}
+		h.refreshAskPanel()
+		return h, nil
+	case "esc", "a", "q":
+		h.askPanel.Hide()
+		return h, nil
+	}
+	return h, nil
+}
+
+// askCountNoun renders "N noun", pluralising noun with an s when N != 1.
+func askCountNoun(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// askConfirm shows prompt in the ask panel and arms run for a following y.
+func (h *Home) askConfirm(prompt string, run func() tea.Cmd) {
+	h.askPendingAction = run
+	h.askPanel.SetConfirm(prompt)
+}
+
+// confirmAskGroupAction arms approve-all (approve) or deny-all for every row
+// shown in group. The cached substate is not consulted here: it is only as
+// fresh as the last status pass that captured the pane, and hook-driven
+// statuses skip the capture. Dispatch re-checks each pane before sending.
+func (h *Home) confirmAskGroupAction(approve bool, group session.AskKind) {
+	items := h.askPanel.GroupItems(group)
+	verb := "Deny"
+	if approve {
+		verb = "Approve"
+	}
+	if len(items) == 0 {
+		h.askPanel.SetStatus("Nothing to " + strings.ToLower(verb))
+		return
+	}
+	h.askConfirm(fmt.Sprintf("%s %s? (y/n)", verb, askCountNoun(len(items), "pending tool call")), func() tea.Cmd {
+		return h.askDispatch(approve, items)
+	})
+}
+
+// uiCachedSubstate reads an instance's substate for the TUI's ask
+// classification without capturing the pane.
+var uiCachedSubstate = (*session.Instance).CachedSubstate
+
+// askPaneCheck takes a fresh capture of the session's pane and reports whether
+// it shows a permission dialog. Dispatch sends approve or deny only when it
+// does, so "1" never answers a question picker or lands in an idle prompt. A
+// session with no tmux pane, or a failed capture, is an error.
+var askPaneCheck = func(inst *session.Instance) (bool, error) {
+	content, err := captureVisiblePane(inst)
+	if err != nil {
+		return false, err
+	}
+	return tmux.PaneShowsPermissionPrompt(tmux.StripANSI(content)), nil
+}
+
+// askSendTimeout bounds each pane check and each send of a dispatch, so the
+// result message always arrives and askDispatchInFlight always clears.
+var askSendTimeout = 5 * time.Second
+
+// askWithTimeout runs fn under askSendTimeout. On timeout fn is abandoned and
+// an error is returned; fn's goroutine finishes on its own.
+func askWithTimeout(fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(askSendTimeout):
+		return fmt.Errorf("timed out after %s", askSendTimeout)
+	}
+}
+
+// askSendApprove answers the open menu with "1"+Enter, as quick-approve does.
+var askSendApprove = func(inst *session.Instance) error {
+	tmuxSess := inst.GetTmuxSession()
+	if tmuxSess == nil {
+		return fmt.Errorf("no tmux session")
+	}
+	return tmuxSess.SendKeysAndEnter("1")
+}
+
+// askSendDeny rejects the open menu by sending Escape.
+var askSendDeny = func(inst *session.Instance) error {
+	tmuxSess := inst.GetTmuxSession()
+	if tmuxSess == nil {
+		return fmt.Errorf("no tmux session")
+	}
+	return tmuxSess.SendNamedKey("Escape")
+}
+
+// askDispatchResultMsg reports one approve/deny dispatch. Action is "approve"
+// or "deny"; Skipped counts sessions whose pane, captured successfully,
+// showed no permission dialog.
+type askDispatchResultMsg struct {
+	Action       string
+	Sent         int
+	Skipped      int
+	Failed       int
+	FailedTitles []string
+}
+
+// askDispatch returns a cmd that approves (or denies) each item's session in
+// parallel, sending only to panes that show a permission dialog on a fresh
+// capture.
+// The key handler only resolves instances; captures and sends run in the cmd.
+func (h *Home) askDispatch(approve bool, items []*statedb.AskItemRow) tea.Cmd {
+	type target struct {
+		inst  *session.Instance
+		title string
+	}
+	targets := make([]target, 0, len(items))
+	for _, item := range items {
+		inst := h.getInstanceByID(item.InstanceID)
+		title := item.InstanceID
+		if inst != nil {
+			title = inst.Title
+		}
+		targets = append(targets, target{inst: inst, title: title})
+	}
+	action, send := "deny", askSendDeny
+	if approve {
+		action, send = "approve", askSendApprove
+	}
+	h.askDispatchInFlight = true
+	progress := "Denying"
+	if approve {
+		progress = "Approving"
+	}
+	h.askPanel.SetStatus(fmt.Sprintf("%s %s…", progress, askCountNoun(len(targets), "session")))
+	return func() tea.Msg {
+		res := askDispatchResultMsg{Action: action}
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		for _, t := range targets {
+			wg.Add(1)
+			go func(t target) {
+				defer wg.Done()
+				var err error
+				skipped := false
+				if t.inst == nil {
+					err = fmt.Errorf("session not found")
+				} else {
+					var hasPrompt bool
+					err = askWithTimeout(func() error {
+						var checkErr error
+						hasPrompt, checkErr = askPaneCheck(t.inst)
+						return checkErr
+					})
+					if err == nil && !hasPrompt {
+						skipped = true
+					} else if err == nil {
+						err = askWithTimeout(func() error { return send(t.inst) })
+					}
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case skipped:
+					res.Skipped++
+				case err != nil:
+					res.Failed++
+					res.FailedTitles = append(res.FailedTitles, t.title)
+				default:
+					res.Sent++
+				}
+			}(t)
+		}
+		wg.Wait()
+		sort.Strings(res.FailedTitles)
+		return res
+	}
+}
+
+// askDispatchSummary renders a dispatch result as one status line, e.g.
+// "Approved 2, skipped 19 (no prompt on screen), failed 0".
+func askDispatchSummary(msg askDispatchResultMsg) string {
+	verb := "Denied"
+	if msg.Action == "approve" {
+		verb = "Approved"
+	}
+	line := fmt.Sprintf("%s %d, skipped %d (no prompt on screen), failed %d", verb, msg.Sent, msg.Skipped, msg.Failed)
+	if len(msg.FailedTitles) > 0 {
+		line += ": " + strings.Join(msg.FailedTitles, ", ")
+	}
+	return line
+}
+
+// confirmAskDismissGroup arms dismiss-all for group.
+func (h *Home) confirmAskDismissGroup(group session.AskKind) {
+	items := h.askPanel.GroupItems(group)
+	if len(items) == 0 {
+		return
+	}
+	h.askConfirm(fmt.Sprintf("Dismiss %s? (y/n)", askCountNoun(len(items), "ask")), func() tea.Cmd {
+		h.resolveAskItems(items)
+		return nil
+	})
+}
+
+// resolveAskItems marks items resolved in the store. Best-effort.
+func (h *Home) resolveAskItems(items []*statedb.AskItemRow) {
+	if h.storage == nil {
+		return
+	}
+	db := h.storage.GetDB()
+	if db == nil {
+		return
+	}
+	now := time.Now()
+	for _, item := range items {
+		_ = db.ResolveAskItem(item.ID, now)
+	}
+}
+
+// askRestartItems restarts each item's session through the normal restart
+// path, skipping sessions that are mid-animation or cannot restart.
+func (h *Home) askRestartItems(items []*statedb.AskItemRow) tea.Cmd {
+	var cmds []tea.Cmd
+	for _, item := range items {
+		inst := h.getInstanceByID(item.InstanceID)
+		if inst == nil {
+			continue
+		}
+		if h.askRestartSink != nil {
+			_ = h.askRestartSink(inst)
+			continue
+		}
+		if h.hasActiveAnimation(inst.ID) || !inst.CanRestart() {
+			continue
+		}
+		h.resumingSessions[inst.ID] = time.Now()
+		cmds = append(cmds, h.restartSession(inst))
+	}
+	return tea.Batch(cmds...)
 }
 
 // createSessionFromGlobalSearch creates a new Agent Deck session from global search result
@@ -11603,7 +12085,7 @@ func (h *Home) hasModalVisible() bool {
 		h.agentsPanel.IsVisible() || // hotkeyAgentsPanel overlay
 		(h.deadLetterPanel != nil && h.deadLetterPanel.IsVisible()) || // hotkeyDeadLetters overlay
 		h.triggersPanel.IsVisible() || // hotkeyTriggers overlay
-		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() ||
+		h.helpOverlay.IsVisible() || h.search.IsVisible() || h.globalSearch.IsVisible() || h.askPanel.IsVisible() ||
 		h.newDialog.IsVisible() || h.groupDialog.IsVisible() || h.forkDialog.IsVisible() ||
 		h.confirmDialog.IsVisible() || h.hookTrustDialog.IsVisible() || h.mcpDialog.IsVisible() || h.pluginDialog.IsVisible() || h.skillDialog.IsVisible() ||
 		h.geminiModelDialog.IsVisible() || h.promptInputDialog.IsVisible() || h.sessionPickerDialog.IsVisible() ||
@@ -12767,6 +13249,23 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		h.helpOverlay.SetEmbeddedLayout(h.embeddedLayout)
 		h.helpOverlay.SetSize(h.width, h.height)
 		h.helpOverlay.Show()
+		return h, nil
+
+	case defaultHotkeyBindings[hotkeyAskPanel]:
+		// Open the human-ask queue: a cross-session list of open requests an
+		// agent has made of the human (permission / question / error). Bound on a
+		// chord (see hotkeyAskPanel) so it does not shadow quick_approve's "a".
+		h.refreshAskPanel()
+		h.askPanel.SetSize(h.width, h.height)
+		h.askPanel.Show()
+		return h, nil
+
+	case defaultHotkeyBindings[hotkeyTogglePreviewSections]:
+		// Show/hide the collapsible preview sections (Worktree, Claude) together:
+		// if both are hidden, show both; otherwise hide both.
+		hidden := h.previewHideWorktree && h.previewHideClaude
+		h.previewHideWorktree = !hidden
+		h.previewHideClaude = !hidden
 		return h, nil
 
 	case "<":
@@ -13945,7 +14444,9 @@ func (h *Home) confirmAction() tea.Cmd {
 	case ConfirmDeleteGroup:
 		groupPath := h.confirmDialog.GetTargetID()
 		h.groupTree.DeleteGroup(groupPath)
-
+		// SaveGroups is additive (never prunes), so the removed group's rows must
+		// be deleted explicitly or it would resurrect on the next reload.
+		h.deleteGroupRows(groupPath)
 		h.instancesMu.Lock()
 		h.instances = h.groupTree.GetAllInstances()
 		h.instancesMu.Unlock()
@@ -15366,6 +15867,10 @@ func (h *Home) handleGroupDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				h.pendingGroupOps = append(h.pendingGroupOps, pendingGroupOp{
 					kind: groupOpRename, oldPath: oldPath, name: name,
 				})
+				// A rename re-paths the group and its subgroups; the old path rows
+				// must be deleted explicitly (additive SaveGroups won't prune them)
+				// or the group reappears under its old name on the next reload.
+				h.deleteGroupRows(oldPath)
 
 				h.instancesMu.Lock()
 				h.instances = h.groupTree.GetAllInstances()
@@ -15777,6 +16282,19 @@ func (h *Home) adoptOwnWrite(stamps statedb.WriteStamps, what string) bool {
 		h.storageWatcher.NotifySave()
 	}
 	return true
+}
+
+// deleteGroupRows removes a group and its descendants from the groups table.
+// SaveGroups is additive (upsert, never prune), so an intentional removal —
+// delete or the old path of a rename/move — must be persisted explicitly here,
+// otherwise the stale rows resurrect the group on the next reload.
+func (h *Home) deleteGroupRows(path string) {
+	if h.storage == nil || path == "" {
+		return
+	}
+	if err := h.storage.DeleteGroupSubtree(path); err != nil {
+		uiLog.Warn("delete_group_rows_failed", slog.String("path", path), slog.String("error", err.Error()))
+	}
 }
 
 // saveGroupState saves only group expanded/collapsed state to SQLite.
@@ -19278,8 +19796,40 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored 
 
 // renderFilterBar renders the quick filter pills
 // Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [■ Stopped 1] [✕ Error 1]
+// countAskKinds counts local, unarchived waiting sessions the render snapshot
+// classifies as an approval or a decision ask. Those are drawn ? and ✎ rather
+// than ◐. archivedWaiting counts the archived waiting sessions that
+// countSessionStatuses includes in its waiting total; they are in none of ◐,
+// ? or ✎.
+func (h *Home) countAskKinds() (approval, decision, archivedWaiting int) {
+	for _, state := range h.getSessionRenderSnapshot() {
+		if statusBucket(state.status) != session.StatusWaiting {
+			continue
+		}
+		if state.archived {
+			if !state.archivedSuperseded {
+				archivedWaiting++
+			}
+			continue
+		}
+		switch state.askKind {
+		case session.AskApproval:
+			approval++
+		case session.AskDecision:
+			decision++
+		}
+	}
+	return approval, decision, archivedWaiting
+}
+
 func (h *Home) renderFilterBar() string {
 	running, waiting, idle, stopped, errored := h.countSessionStatuses()
+	// ◐ counts only unarchived waiting sessions that are not asks; approvals
+	// and decisions get their own ? and ✎ pills.
+	approvals, decisions, archivedWaiting := h.countAskKinds()
+	if waiting -= approvals + decisions + archivedWaiting; waiting < 0 {
+		waiting = 0
+	}
 
 	// Pill styling
 	activePillStyle := lipgloss.NewStyle().
@@ -19323,6 +19873,19 @@ func (h *Home) renderFilterBar() string {
 			Padding(0, 1).Render(runningLabel))
 	} else {
 		pills = append(pills, dimPillStyle.Render(runningLabel))
+	}
+
+	if approvals > 0 {
+		pills = append(pills, lipgloss.NewStyle().
+			Foreground(ColorYellow).
+			Background(ColorSurface).
+			Padding(0, 1).Render(fmt.Sprintf("? %d", approvals)))
+	}
+	if decisions > 0 {
+		pills = append(pills, lipgloss.NewStyle().
+			Foreground(ColorMagenta).
+			Background(ColorSurface).
+			Padding(0, 1).Render(fmt.Sprintf("✎ %d", decisions)))
 	}
 
 	waitingLabel := fmt.Sprintf("◐ %d", waiting)
@@ -19623,6 +20186,9 @@ func (h *Home) renderFrame() string {
 	}
 	if h.globalSearch.IsVisible() {
 		return h.globalSearch.View()
+	}
+	if h.askPanel.IsVisible() {
+		return h.askPanel.View()
 	}
 	if h.newDialog.IsVisible() {
 		return h.newDialog.View()
@@ -20180,17 +20746,23 @@ func (h *Home) renderPanelTitle(title string, width int) string {
 
 	titleStyle := lipgloss.NewStyle().
 		Foreground(ColorCyan).
-		Bold(true).
-		Width(width)
+		Bold(true)
 
+	if h.compact {
+		// One line: "TITLE ─────────" — the title, a space, then a rule that
+		// fills the remaining width. Saves a vertical line versus the classic
+		// title-over-underline. panelTitleLines (= 1 when compact) must match.
+		barStyle := lipgloss.NewStyle().Foreground(ColorBorder)
+		barLen := max(0, width-lipgloss.Width(title)-1)
+		return titleStyle.Render(title) + " " + barStyle.Render(strings.Repeat("─", barLen))
+	}
+
+	// Classic two-line: title, then a full-width underline.
+	titleStyle = titleStyle.Width(width)
 	underlineStyle := lipgloss.NewStyle().
 		Foreground(ColorBorder).
 		Width(width)
-
-	// Create underline that extends to panel width
-	underlineLen := max(0, width)
-	underline := underlineStyle.Render(strings.Repeat("─", underlineLen))
-
+	underline := underlineStyle.Render(strings.Repeat("─", max(0, width)))
 	return titleStyle.Render(title) + "\n" + underline
 }
 
@@ -20749,6 +21321,9 @@ func (h *Home) renderDualColumnLayout(contentHeight int) string {
 	// Panel title is exactly 2 lines (title + underline)
 	// Panel content gets the remaining space: contentHeight - 2
 	panelTitleLines := 2
+	if h.compact {
+		panelTitleLines = 1
+	}
 	panelContentHeight := contentHeight - panelTitleLines
 
 	// Build left panel (session list) with styled title.
@@ -20869,8 +21444,12 @@ func (h *Home) renderStackedLayout(totalHeight int) string {
 
 	// Session list (full width)
 	listTitle := h.renderPanelTitle(h.sidebarTitle(), h.width)
-	listContent := h.renderSessionList(h.width, listHeight-2) // -2 for title
-	listContent = ensureExactHeight(listContent, listHeight-2)
+	titleLines := 2 // title + underline; compact renders a one-line title
+	if h.compact {
+		titleLines = 1
+	}
+	listContent := h.renderSessionList(h.width, listHeight-titleLines)
+	listContent = ensureExactHeight(listContent, listHeight-titleLines)
 	b.WriteString(listTitle)
 	b.WriteString("\n")
 	b.WriteString(listContent)
@@ -20883,8 +21462,8 @@ func (h *Home) renderStackedLayout(totalHeight int) string {
 
 	// Preview (full width)
 	previewTitle := h.renderPanelTitle("PREVIEW", h.width)
-	previewContent := h.renderPreviewPane(h.width, previewHeight-2) // -2 for title
-	previewContent = ensureExactHeight(previewContent, previewHeight-2)
+	previewContent := h.renderPreviewPane(h.width, previewHeight-titleLines)
+	previewContent = ensureExactHeight(previewContent, previewHeight-titleLines)
 	b.WriteString(previewTitle)
 	b.WriteString("\n")
 	b.WriteString(previewContent)
@@ -21313,7 +21892,9 @@ func (h *Home) renderHelpBarMinimal() string {
 	if key := h.actionKey(hotkeySettings); key != "" {
 		globalParts = append(globalParts, globalStyle.Render(key))
 	}
+	var helpPart string
 	if key := h.actionKey(hotkeyHelp); key != "" {
+		helpPart = globalStyle.Render(key + " help")
 		globalParts = append(globalParts, globalStyle.Render(key))
 	}
 	if key := h.actionKey(hotkeyQuit); key != "" {
@@ -21329,9 +21910,15 @@ func (h *Home) renderHelpBarMinimal() string {
 	rightPart := globalKeys
 	padding := h.width - lipgloss.Width(leftPart) - lipgloss.Width(rightPart) - 4
 	if padding < 2 {
-		// Content too wide for one line — drop right part to avoid overflow
+		// Too wide for one line: keep only the help key on the right (it is
+		// how every other binding is discovered) and truncate the context keys
+		// to make room for it.
 		padding = 2
-		rightPart = ""
+		rightPart = helpPart
+		if rightPart != "" {
+			room := max(0, h.width-lipgloss.Width(rightPart)-4-padding)
+			leftPart = ansi.Truncate(leftPart, room, "…")
+		}
 	}
 
 	content := leftPart + sep + strings.Repeat(" ", padding) + rightPart
@@ -21445,6 +22032,7 @@ func (h *Home) renderHelpBarCompact() string {
 	// while leaving its bare key behind.
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	globalHints := []string{globalStyle.Render("↑↓ Nav")}
+	helpIdx := -1
 	for _, hint := range []struct {
 		action string
 		label  string
@@ -21455,13 +22043,26 @@ func (h *Home) renderHelpBarCompact() string {
 		{hotkeyQuit, "Quit"},
 	} {
 		if key := h.actionKey(hint.action); key != "" {
+			if hint.action == hotkeyHelp {
+				helpIdx = len(globalHints)
+			}
 			globalHints = append(globalHints, globalStyle.Render(key+" "+hint.label))
 		}
 	}
 
 	rightPart := strings.Join(globalHints, " ")
-	for len(globalHints) > 1 && lipgloss.Width(rightPart)+6 > h.width {
-		globalHints = globalHints[:len(globalHints)-1]
+	// Trim global hints from the tail only while they alone don't fit, but
+	// never Help (index helpIdx) or Nav (index 0): Help is how every other
+	// binding is discovered.
+	for lipgloss.Width(rightPart)+6 > h.width {
+		drop := lastDroppableGlobal(len(globalHints), helpIdx)
+		if drop <= 0 {
+			break
+		}
+		globalHints = append(globalHints[:drop], globalHints[drop+1:]...)
+		if drop < helpIdx {
+			helpIdx--
+		}
 		rightPart = strings.Join(globalHints, " ")
 	}
 	// A long optional hint must not block a shorter later one from using
@@ -21697,10 +22298,9 @@ func (h *Home) renderHelpBarFull() string {
 		reloadIndicator = reloadStyle.Render("⟳ Reloading...")
 	}
 
-	// Global shortcuts (right side) - more compact with separators. "↑↓ Nav"
-	// and Quit are pinned; the rest drop lowest-priority-first (from the end
-	// of this slice) when space is tight, before either pinned key is
-	// sacrificed.
+	// Global shortcuts (right side) - more compact with separators. Help and
+	// Quit are pinned; the rest drop lowest-priority-first (from the end of
+	// this slice) when space is tight, before either pinned key is sacrificed.
 	globalStyle := lipgloss.NewStyle().Foreground(ColorComment)
 	navHint := globalStyle.Render("↑↓ Nav")
 	var quitHint string
@@ -21716,9 +22316,11 @@ func (h *Home) renderHelpBarFull() string {
 	if key := h.actionKey(hotkeySettings); key != "" {
 		droppableGlobal = append(droppableGlobal, globalStyle.Render(key+" Settings"))
 	}
-	helpKey := h.actionKey(hotkeyHelp)
-	if helpKey != "" {
-		droppableGlobal = append(droppableGlobal, globalStyle.Render(helpKey+" Help"))
+	// Help is pinned like Nav and Quit: it is the way to discover every other
+	// binding, so it must survive however narrow the bar gets.
+	var helpHint string
+	if key := h.actionKey(hotkeyHelp); key != "" {
+		helpHint = globalStyle.Render(key + " Help")
 	}
 
 	leftPrefix := contextLabel
@@ -21733,33 +22335,43 @@ func (h *Home) renderHelpBarFull() string {
 		sep:        sep,
 		nav:        navHint,
 		droppable:  droppableGlobal,
+		help:       helpHint,
 		quit:       quitHint,
 	}
 	helpContent := h.fitFullFooter(parts)
-	// Keep the original order where Help already fits. On crowded 120-column
-	// rows, shorter labels make room for Help without losing existing actions.
-	if h.width >= 120 && h.width < 160 && helpKey != "" && !strings.Contains(helpContent, helpKey+" Help") {
-		shorten := func(hints []string) {
+	// When the pinned Nav/Help/Quit block pushes context hints out (at any
+	// width: the hint set grows), shorter labels win some of them back.
+	if strings.Contains(helpContent, " …") {
+		shorten := func(hints []string) []string {
+			out := make([]string, len(hints))
 			for i, hint := range hints {
 				hint = strings.Replace(hint, "New/Quick", "New", 1)
 				hint = strings.Replace(hint, "Restart Fresh", "Fresh", 1)
 				hint = strings.Replace(hint, "Enter", "⏎", 1)
 				hint = strings.Replace(hint, "Import", "Add", 1)
 				hint = strings.Replace(hint, "Group", "Grp", 1)
-				hints[i] = hint
+				out[i] = hint
 			}
+			return out
 		}
-		shorten(primaryHints)
-		shorten(secondaryHints)
-		parts.nav += sep + droppableGlobal[len(droppableGlobal)-1]
-		parts.droppable = droppableGlobal[:len(droppableGlobal)-1]
-		parts.primary = primaryHints
-		parts.secondary = secondaryHints
+		parts.primary = shorten(primaryHints)
+		parts.secondary = shorten(secondaryHints)
 		helpContent = h.fitFullFooter(parts)
 	}
 
 	raw := lipgloss.JoinVertical(lipgloss.Left, border, helpContent)
 	return lipgloss.NewStyle().MaxWidth(h.width).Render(raw)
+}
+
+// lastDroppableGlobal returns the index of the last compact-footer global hint
+// that may be dropped: never index 0 (Nav) or helpIdx (Help). 0 means none.
+func lastDroppableGlobal(n, helpIdx int) int {
+	for i := n - 1; i > 0; i-- {
+		if i != helpIdx {
+			return i
+		}
+	}
+	return 0
 }
 
 // fullFooterParts is the raw material of the full-tier footer line: the left
@@ -21773,6 +22385,7 @@ type fullFooterParts struct {
 	sep        string
 	nav        string   // pinned: never dropped
 	droppable  []string // global hints, dropped from the end when space is tight
+	help       string   // pinned: never dropped
 	quit       string   // pinned: never dropped
 }
 
@@ -21791,10 +22404,13 @@ type fullFooterParts struct {
 // ellipsis. nav and quit are never dropped; leftPrefix never is either.
 func (h *Home) fitFullFooter(p fullFooterParts) string {
 	// buildRight renders the global block keeping the n highest-priority
-	// droppable hints, always framed by the pinned nav and quit hints.
+	// droppable hints, framed by the pinned nav, help and quit hints.
 	buildRight := func(n int) string {
 		parts := []string{p.nav}
 		parts = append(parts, p.droppable[:n]...)
+		if p.help != "" {
+			parts = append(parts, p.help)
+		}
 		if p.quit != "" {
 			parts = append(parts, p.quit)
 		}
@@ -22699,7 +23315,7 @@ func (h *Home) renderSessionItem(
 	// status (plus the Honest-Status-v2 error substates) to a glyph, and forces
 	// the stopped glyph for archived sessions whose snapshot still carries a
 	// stale live status.
-	statusIcon, statusStyle := rowStatusGlyph(instStatus, instSubstate, inst.IsArchived())
+	statusIcon, statusStyle := rowAttentionGlyph(instStatus, instSubstate, inst.IsArchived(), instState.askKind)
 
 	status := statusStyle.Render(statusIcon)
 
@@ -24178,13 +24794,61 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		statusColor = ColorTextDim
 	}
 
-	// Header with session name and status
+	// Header line: session name, status, tool/group pills, and activity time all
+	// on ONE line to conserve vertical space. Activity is computed first so it can
+	// join the line; sessionActivityTime is the SAME formula as the row badge
+	// (issue #1846: the preview once read DisplayLastActivityTime while the badge
+	// used pickBadgeTime, so the two surfaces showed a different age for one
+	// session).
 	statusBadge := lipgloss.NewStyle().Foreground(statusColor).Render(statusIcon + " " + processExitLabel(string(selectedStatus), selected.CachedSubstate(), selected.ExitCode()))
 	nameStyle := lipgloss.NewStyle().Bold(true).Foreground(ColorAccent)
-	b.WriteString(nameStyle.Render(selected.Title))
-	b.WriteString("  ")
-	b.WriteString(statusBadge)
-	b.WriteString("\n")
+	infoStyle := lipgloss.NewStyle().Foreground(ColorText)
+	toolBadge := lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorPurple).
+		Padding(0, 1).
+		Render(selected.Tool)
+	groupBadge := lipgloss.NewStyle().
+		Foreground(ColorBg).
+		Background(ColorCyan).
+		Padding(0, 1).
+		Render(selected.GroupPath)
+
+	var previewHookStatus *session.HookStatus
+	if h.hookWatcher != nil {
+		previewHookStatus = h.hookWatcher.GetHookStatus(selected.ID)
+	}
+	confirmedTs, confirmedObserved := selected.LastObservedActivity()
+	activityTime := sessionActivityTime(selected.CreatedAt, selected.LastStartedAt, selected.LastActivityAt(), selected.LastAccessedAt, confirmedTs, confirmedObserved, previewHookStatus)
+	activityStr := formatRelativeTime(activityTime)
+	if selectedStatus == session.StatusRunning {
+		activityStr = "active now"
+	}
+
+	if h.compact {
+		// Compact: name, status, tool/group pills, activity, and viewers on ONE line.
+		b.WriteString(nameStyle.Render(selected.Title))
+		b.WriteString("  ")
+		b.WriteString(statusBadge)
+		b.WriteString("  ")
+		b.WriteString(toolBadge)
+		b.WriteString(" ")
+		b.WriteString(groupBadge)
+		b.WriteString("  ")
+		b.WriteString(infoStyle.Render("⏱ " + activityStr))
+		if selectedStatus != session.StatusStopped {
+			previewViewers, previewViewersKnown := selected.ViewersCached()
+			b.WriteString("  ")
+			b.WriteString(infoStyle.Render(viewersLine(previewViewers, previewViewersKnown, time.Now())))
+		}
+		b.WriteString("\n")
+	} else {
+		// Classic: name and status on their own line.
+		b.WriteString(nameStyle.Render(selected.Title))
+		b.WriteString("  ")
+		b.WriteString(statusBadge)
+		b.WriteString("\n")
+	}
 
 	// Issue #2473: a session running because of background work (a Workflow,
 	// background agents, shells, a Monitor) at an empty prompt says what is
@@ -24197,60 +24861,42 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	// Auth hold banner. A session whose agent exited on a 401 shows a bare
 	// "error" status that no amount of restarting will clear, and during a
 	// fleet-wide credential failure that reads as unexplained mass death (the
-	// 2026-07-26 incident). Say what happened and what to do, right under the
-	// status, before anything else in the preview. Reads the in-memory mirror so
-	// the render path never touches the filesystem.
+	// 2026-07-26 incident). Say what happened and what to do right under the
+	// header. Reads the in-memory mirror so the render path never touches the
+	// filesystem.
 	if selected.AuthHeldCached() {
 		b.WriteString(authHoldBannerLines(width))
 	}
 
-	// Info lines: path and activity time
-	infoStyle := lipgloss.NewStyle().Foreground(ColorText)
+	// Path.
 	pathStr := truncatePath(selected.ProjectPath, width-4)
 	b.WriteString(infoStyle.Render("📁 " + pathStr))
 	b.WriteString("\n")
 
-	// Activity time - shows when session was last active. Composed with
-	// sessionActivityTime — the SAME formula as the row badge (issue #1846:
-	// the preview used to read DisplayLastActivityTime while the badge used
-	// pickBadgeTime, so the two surfaces showed different ages for the same
-	// session; both were stale once the underlying evidence was destroyed).
-	var previewHookStatus *session.HookStatus
-	if h.hookWatcher != nil {
-		previewHookStatus = h.hookWatcher.GetHookStatus(selected.ID)
+	if !h.compact {
+		// Classic: activity time on its own line (compact folds it into the header).
+		b.WriteString(infoStyle.Render("⏱ " + activityStr))
+		b.WriteString("\n")
 	}
-	confirmedTs, confirmedObserved := selected.LastObservedActivity()
-	activityTime := sessionActivityTime(selected.CreatedAt, selected.LastStartedAt, selected.LastActivityAt(), selected.LastAccessedAt, confirmedTs, confirmedObserved, previewHookStatus)
-	activityStr := formatRelativeTime(activityTime)
-	if selectedStatus == session.StatusRunning {
-		activityStr = "active now"
-	}
-	b.WriteString(infoStyle.Render("⏱ " + activityStr))
-	b.WriteString("\n")
 
 	// Who else has this session open (shared attach), from the per-socket
 	// viewer cache so the render path never spawns tmux. A stopped session
-	// has no tmux to view, so the line is for live ones.
-	if selectedStatus != session.StatusStopped {
+	// has no tmux to view, so the line is for live ones. Compact puts it on the
+	// header line instead.
+	if !h.compact && selectedStatus != session.StatusStopped {
 		previewViewers, previewViewersKnown := selected.ViewersCached()
 		b.WriteString(infoStyle.Render(viewersLine(previewViewers, previewViewersKnown, time.Now())))
 		b.WriteString("\n")
 	}
 
-	toolBadge := lipgloss.NewStyle().
-		Foreground(ColorBg).
-		Background(ColorPurple).
-		Padding(0, 1).
-		Render(selected.Tool)
-	groupBadge := lipgloss.NewStyle().
-		Foreground(ColorBg).
-		Background(ColorCyan).
-		Padding(0, 1).
-		Render(selected.GroupPath)
-	b.WriteString(toolBadge)
-	b.WriteString(" ")
-	b.WriteString(groupBadge)
-	b.WriteString("\n")
+	if !h.compact {
+		// Classic: tool/group pills on their own line (compact folds them into
+		// the header).
+		b.WriteString(toolBadge)
+		b.WriteString(" ")
+		b.WriteString(groupBadge)
+		b.WriteString("\n")
+	}
 
 	// Agent card. When the selected session belongs to an adopted agent, its
 	// role, triggers, connector health and recent ledger entries render here
@@ -24261,8 +24907,13 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(h.renderAgentCard(agentRow, width))
 	}
 
-	// Worktree info section (for sessions running in git worktrees)
-	if selected.IsWorktree() {
+	// Worktree info section (for sessions running in git worktrees). Hidden when
+	// previewHideWorktree is set (config [preview] hide_worktree / runtime toggle).
+	// Output-only preview mode (the v key) gives the pane to session output, so
+	// the per-session info sections below are skipped in that mode.
+	infoSections := h.previewMode != PreviewModeOutput
+
+	if infoSections && selected.IsWorktree() && !h.previewHideWorktree {
 		wtHeader := renderSectionDivider("Worktree", width-4)
 		b.WriteString(wtHeader)
 		b.WriteString("\n")
@@ -24334,7 +24985,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Multi-repo info section
-	if selected.IsMultiRepo() {
+	if infoSections && selected.IsMultiRepo() {
 		mrHeader := renderSectionDivider("Multi-Repo", width-4)
 		b.WriteString(mrHeader)
 		b.WriteString("\n")
@@ -24357,8 +25008,9 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		}
 	}
 
-	// Claude-specific info (session ID and MCPs)
-	if session.IsClaudeCompatible(selected.Tool) {
+	// Claude-specific info (session ID and MCPs). Hidden when previewHideClaude
+	// is set (config [preview] hide_claude / runtime toggle).
+	if infoSections && session.IsClaudeCompatible(selected.Tool) && !h.previewHideClaude {
 		// Section divider for Claude info
 		claudeHeader := renderSectionDivider("Claude", width-4)
 		b.WriteString(claudeHeader)
@@ -24556,7 +25208,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Gemini-specific info (session ID)
-	if selected.Tool == "gemini" {
+	if infoSections && selected.Tool == "gemini" {
 		geminiHeader := renderSectionDivider("Gemini", width-4)
 		b.WriteString(geminiHeader)
 		b.WriteString("\n")
@@ -24588,7 +25240,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Cursor Agent CLI — MCP configuration for `cursor agent`
-	if selected.Tool == "cursor" {
+	if infoSections && selected.Tool == "cursor" {
 		cursorHeader := renderSectionDivider("Cursor", width-4)
 		b.WriteString(cursorHeader)
 		b.WriteString("\n")
@@ -24605,7 +25257,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// OpenCode-specific info (session ID)
-	if selected.Tool == "opencode" {
+	if infoSections && selected.Tool == "opencode" {
 		opencodeHeader := renderSectionDivider("OpenCode", width-4)
 		b.WriteString(opencodeHeader)
 		b.WriteString("\n")
@@ -24665,7 +25317,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Codex-specific info (session ID, detection)
-	if selected.Tool == "codex" {
+	if infoSections && selected.Tool == "codex" {
 		codexHeader := renderSectionDivider("Codex", width-4)
 		b.WriteString(codexHeader)
 		b.WriteString("\n")
@@ -24678,7 +25330,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Custom tool info (tools defined in config.toml that aren't built-in)
-	if !session.IsClaudeCompatible(selected.Tool) && selected.Tool != "gemini" && selected.Tool != "opencode" &&
+	if infoSections && !session.IsClaudeCompatible(selected.Tool) && selected.Tool != "gemini" && selected.Tool != "opencode" &&
 		selected.Tool != "codex" {
 		if toolDef := session.GetToolDef(selected.Tool); toolDef != nil {
 			toolName := selected.Tool
@@ -25095,14 +25747,40 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		// Calculate maxLines dynamically based on how many header lines we've already written
 		// This accounts for Claude sessions having more header lines than other sessions
 		currentContent := b.String()
-		headerLines := strings.Count(currentContent, "\n") + 1 // +1 for the current line
+		// Rows already used: one per newline, plus the current line if the
+		// header did not end with one.
+		headerLines := strings.Count(currentContent, "\n")
+		if !strings.HasSuffix(currentContent, "\n") {
+			headerLines++
+		}
 		lines := strings.Split(preview, "\n")
 
 		// Strip trailing empty lines BEFORE truncation
 		// This ensures we show actual content, not empty trailing lines when space is limited
 		// (Terminal output often ends with empty lines at cursor position)
-		for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		for len(lines) > 0 && strings.TrimSpace(ansi.Strip(lines[len(lines)-1])) == "" {
 			lines = lines[:len(lines)-1]
+		}
+
+		// Collapse runs of blank lines to at most two BEFORE choosing the
+		// visible window. The render loop below collapses them too; doing it
+		// only there freed rows after the window was sized, which left a blank
+		// band at the bottom of the pane while older output stayed hidden.
+		{
+			collapsed := lines[:0:0]
+			blankRun := 0
+			for _, line := range lines {
+				if strings.TrimSpace(ansi.Strip(stripControlCharsPreserveANSI(line))) == "" {
+					blankRun++
+					if blankRun > 2 {
+						continue
+					}
+				} else {
+					blankRun = 0
+				}
+				collapsed = append(collapsed, line)
+			}
+			lines = collapsed
 		}
 
 		// If all lines were empty, show empty indicator
@@ -25115,7 +25793,10 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			return b.String()
 		}
 
-		maxLines := height - headerLines - 1 // -1 for potential truncation indicator
+		// The "more lines above" indicator reserves its row below, only when it
+		// is shown. Each output row ends in "\n"; the empty element after the
+		// last one falls past the pane height and is trimmed by ensureExactHeight.
+		maxLines := height - headerLines
 		if maxLines < 1 {
 			maxLines = 1
 		}

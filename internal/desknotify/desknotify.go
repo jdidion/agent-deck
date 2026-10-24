@@ -26,6 +26,7 @@ package desknotify
 
 import (
 	"context"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -115,13 +116,34 @@ func (cmuxBackend) Available() bool {
 }
 
 func (cmuxBackend) Notify(ctx context.Context, title, body string) error {
+	args := cmuxNotifyArgs(title, body, os.Getenv("CMUX_WORKSPACE_ID"))
 	// #nosec G204 -- title/body are session metadata passed as separate argv
 	// elements, never interpolated into a shell string. No shell is involved.
-	return exec.CommandContext(ctx, "cmux", "notify",
+	return exec.CommandContext(ctx, "cmux", args...).Run()
+}
+
+// cmuxNotifyArgs builds the `cmux` argv, targeting a workspace when one is
+// known.
+//
+// `cmux notify` with no target bubbles the CALLER's / focused workspace, but
+// the notify daemon runs headless with no caller context, so an untargeted
+// notify never reaches the workspace the deck lives in — the reported
+// "notifications don't bubble up to the agent-deck workspace". workspaceID is
+// CMUX_WORKSPACE_ID, the UUID cmux exports into the TUI's environment, which
+// the daemon inherits when the TUI auto-starts it. A UUID resolves globally, so
+// it bubbles the right workspace whatever is focused. When it is empty (daemon
+// not launched from a cmux surface, or cmux not in use) the untargeted notify
+// is left as-is; it still raises a macOS banner via cmux.
+func cmuxNotifyArgs(title, body, workspaceID string) []string {
+	args := []string{"notify",
 		"--title", deflagged(title),
 		"--subtitle", "agent-deck",
 		"--body", deflagged(body),
-	).Run()
+	}
+	if ws := strings.TrimSpace(workspaceID); ws != "" {
+		args = append(args, "--workspace", ws)
+	}
+	return args
 }
 
 // deflagged neutralizes a value that a CLI would read as a flag rather than as

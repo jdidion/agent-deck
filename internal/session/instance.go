@@ -648,6 +648,8 @@ type Instance struct {
 	// Hook-based status detection (set by StatusFileWatcher from Claude Code hooks)
 	hookStatus    string // running, idle, waiting, dead (empty = no hook data)
 	hookEvent     string // Hook event name that caused the last status (e.g. "PermissionRequest")
+	hookMatcher   string // Notification matcher of the last hook (permission_prompt, elicitation_dialog)
+	hookToolName  string // tool_name of the last hook (PreToolUse, PermissionRequest)
 	hookSessionID string // Session ID from hook payload
 	// claudeSupersededIDs holds Claude session ids this instance moved away
 	// from by following a continued-in handoff (#2683). A late hook still
@@ -7022,6 +7024,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		if hs := readHookStatusFile(i.ID); hs != nil && !i.codexHookFromForeignThread(hs) {
 			i.hookStatus = hs.Status
 			i.hookEvent = hs.Event
+			i.hookMatcher, i.hookToolName = hs.Matcher, hs.ToolName
 			i.hookLastUpdate = hs.UpdatedAt
 			i.hookSessionID = hs.SessionID
 			// #1846: a disk-read hook sample is activity evidence too.
@@ -7044,6 +7047,7 @@ func (i *Instance) updateStatus(pass *StatusUpdatePass, syncMetadata bool) error
 		(i.shouldRejectCodexSubagentRebind(i.hookSessionID) ||
 			i.shouldRejectCodexUnbackedTurnEnd(i.hookSessionID, i.hookEvent)) {
 		i.hookStatus, i.hookEvent, i.hookSessionID = "", "", ""
+		i.hookMatcher, i.hookToolName = "", ""
 		i.hookLastUpdate = time.Time{}
 	}
 
@@ -7614,6 +7618,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 	// it carried had already been written here and stuck, flipping this
 	// instance's status. See the candidate_has_no_conversation_data branch.
 	prevHookStatus, prevHookEvent, prevHookLastUpdate := i.hookStatus, i.hookEvent, i.hookLastUpdate
+	prevHookMatcher, prevHookToolName := i.hookMatcher, i.hookToolName
 	prevStartedGen, prevCompletedGen := i.codexStartedGeneration, i.codexCompletedGeneration
 	prevStartedSID, prevCompletedSID := i.codexStartedSessionID, i.codexCompletedSessionID
 	// rejected tracks whether this event was rolled back by restoreHook below.
@@ -7624,6 +7629,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 	restoreHook := func() {
 		rejected = true
 		i.hookStatus, i.hookEvent, i.hookLastUpdate = prevHookStatus, prevHookEvent, prevHookLastUpdate
+		i.hookMatcher, i.hookToolName = prevHookMatcher, prevHookToolName
 		i.codexStartedGeneration, i.codexCompletedGeneration = prevStartedGen, prevCompletedGen
 		i.codexStartedSessionID, i.codexCompletedSessionID = prevStartedSID, prevCompletedSID
 		i.codexInvalidatingGeneration = prevInvalidatingGen
@@ -7636,6 +7642,7 @@ func (i *Instance) UpdateHookStatus(status *HookStatus) {
 
 	i.hookStatus = status.Status
 	i.hookEvent = status.Event
+	i.hookMatcher, i.hookToolName = status.Matcher, status.ToolName
 	i.hookLastUpdate = status.UpdatedAt
 	i.setCodexGenerationEvidence(status)
 
@@ -7975,6 +7982,22 @@ func (i *Instance) StatusEvidence() StatusEvidence {
 	}
 }
 
+// AskKind classifies the instance as an ask from the given live status, the
+// cached hook record and the cached substate, using the ask queue
+// classification. Empty when the session is not asking. Reads only cached
+// fields, so it is safe on the render path.
+func (i *Instance) AskKind(status Status) AskKind {
+	return DeriveAskKind(i.AskHookRecord(), string(status), i.CachedSubstate())
+}
+
+// AskHookRecord returns the cached hook record fields the ask classification
+// reads (event, matcher, tool name).
+func (i *Instance) AskHookRecord() *HookStatus {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return &HookStatus{Event: i.hookEvent, Matcher: i.hookMatcher, ToolName: i.hookToolName}
+}
+
 func (i *Instance) GetHookStatus() (string, bool) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -8053,6 +8076,7 @@ func (i *Instance) ClearHookStatus() {
 	// after. Fold it into the durable last-activity record first.
 	i.noteAgentActivityLocked(i.hookLastUpdate)
 	i.hookStatus = ""
+	i.hookMatcher, i.hookToolName = "", ""
 	i.hookLastUpdate = time.Time{}
 	i.mu.Unlock()
 	// Flush BEFORE removing the file below, bypassing the write throttle —

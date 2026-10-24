@@ -105,6 +105,19 @@ type TransitionDaemon struct {
 	// means "never run" — the first SyncOnce pass will perform it.
 	lastInboxTTLSweep time.Time
 
+	// lastAskPrune tracks, per profile, the most recent PruneResolvedAskItems
+	// call so the ask store is pruned at most once per askPruneInterval rather
+	// than every poll. Without this the resolved rows the producer accumulates
+	// would grow the table without bound. Accessed only from the single-threaded
+	// Run loop.
+	lastAskPrune map[string]time.Time
+
+	// askCaptures holds, per (profile, instance), syncAsks' last successful
+	// pane capture of a waiting instance and its run of consecutive captures
+	// without a menu. See observeAskSubstates. Accessed only from the
+	// single-threaded Run loop.
+	askCaptures map[string]map[string]askCaptureEntry
+
 	// selfheal holds the per-profile observe-only self-heal engines (lazily
 	// created). Driven by this poll loop — NOT a new daemon (F3: no watchdog
 	// stacking). nil until the first enabled pass.
@@ -199,12 +212,40 @@ func NewTransitionDaemon() *TransitionDaemon {
 		lastProbeStall: map[string]time.Time{},
 		journalWriters: map[string]*health.AsyncWriter{},
 		lastJournaled:  map[string]map[string]string{},
+		lastAskPrune:   map[string]time.Time{},
+		askCaptures:    map[string]map[string]askCaptureEntry{},
 
 		lastDesktopNotify: map[string]string{},
 	}
 }
 
 func (d *TransitionDaemon) Run(ctx context.Context) error {
+	// A daemon started under a throwaway HOME (tests, scripted runs) exits
+	// once that HOME is gone rather than lingering detached. HOME's identity
+	// is recorded before anything here creates directories under it, because
+	// a pass writes under HOME and its MkdirAll can recreate the path: a
+	// directory recreated at the same path is not the HOME the daemon started
+	// with.
+	home, _ := os.UserHomeDir()
+	var homeInfo os.FileInfo
+	if home != "" {
+		fi, err := os.Stat(home)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		homeInfo = fi
+	}
+	homeGone := func() bool {
+		if homeInfo == nil {
+			return false
+		}
+		fi, err := os.Stat(home)
+		if err != nil {
+			return os.IsNotExist(err)
+		}
+		return !os.SameFile(homeInfo, fi)
+	}
+
 	d.ensureHookWatcher()
 	defer d.shutdown()
 
@@ -218,9 +259,15 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 	// a background goroutine it has no way to let finish.
 	d.maybeStartInitialRecallBackfill(ctx)
 
+	if homeGone() {
+		return nil
+	}
 	// Prime baseline once, then run adaptive loop.
 	interval := d.SyncOnce(ctx)
 	d.tickRemoteTalkback(ctx)
+	if homeGone() {
+		return nil
+	}
 	if interval <= 0 {
 		interval = notifyPollSlow
 	}
@@ -230,9 +277,15 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(interval):
+			if homeGone() {
+				return nil
+			}
 			d.maybeStartInitialRecallBackfill(ctx)
 			interval = d.SyncOnce(ctx)
 			d.tickRemoteTalkback(ctx)
+			if homeGone() {
+				return nil
+			}
 			if interval <= 0 {
 				interval = notifyPollSlow
 			}
@@ -645,6 +698,11 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	// immediately. Reuses the instances/hookStatuses already loaded above — no
 	// extra capture, no new goroutine (F3). Disabled-by-config → cheap no-op.
 	d.runSelfHealObservePass(profile, instances, statuses, hookStatuses, db, time.Now().UTC())
+
+	// Reconcile the human ask queue once per pass (level-triggered, idempotent;
+	// see ask_queue.go). Placed here so it runs on both the first-init and the
+	// steady-state paths, and sees the freshest statuses.
+	d.syncAsks(profile, db, byID, statuses, hookStatuses)
 
 	// Issue #2481: a child seen running starts a new run, so the next observed
 	// flip is a new turn unless a path journals one for it first.
@@ -1343,6 +1401,9 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		CodexCompletedSequence   uint64 `json:"codex_completed_sequence"`
 		HookGeneration           string `json:"hook_generation"`
 		Sequence                 uint64 `json:"sequence"`
+		Matcher                  string `json:"matcher"`
+		Message                  string `json:"message"`
+		ToolName                 string `json:"tool_name"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil
@@ -1375,6 +1436,9 @@ func readHookStatusFile(instanceID string) *HookStatus {
 		CodexCompletedSequence:   raw.CodexCompletedSequence,
 		HookGeneration:           raw.HookGeneration,
 		Sequence:                 raw.Sequence,
+		Matcher:                  raw.Matcher,
+		Message:                  raw.Message,
+		ToolName:                 raw.ToolName,
 	}
 	maskConsumedCodexCompletion(instanceID, hookStatus)
 	return hookStatus

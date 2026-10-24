@@ -228,9 +228,15 @@ func TestRecallHookTrigger_QueuesAndIndexesOnlyThatFile(t *testing.T) {
 	if sources != 1 || sessions != 1 || msgs != 3 {
 		t.Fatalf("indexed sources=%d sessions=%d msgs=%d: the hook must index only its own file", sources, sessions, msgs)
 	}
+	// The reader stores the symlink-resolved path (on macOS the temp dir is
+	// under /var -> /private/var).
+	wantPath, err := filepath.EvalSymlinks(mine)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var path string
-	if err := db.QueryRow(`SELECT path FROM source`).Scan(&path); err != nil || path != mine {
-		t.Fatalf("source path %q (%v) want %q", path, err, mine)
+	if err := db.QueryRow(`SELECT path FROM source`).Scan(&path); err != nil || path != wantPath {
+		t.Fatalf("source path %q (%v) want %q", path, err, wantPath)
 	}
 	// Repeating the hook is a no-op on the index and one more queue line.
 	recallHookTrigger("inst-1", "SessionEnd", []byte(`{"hook_event_name":"SessionEnd","transcript_path":`+fmt.Sprintf("%q", mine)+`}`))
