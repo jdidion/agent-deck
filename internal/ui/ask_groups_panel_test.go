@@ -9,7 +9,7 @@ package ui
 //   - (*AskPanel).GroupItems(kind session.AskKind) []*statedb.AskItemRow
 //   - (*AskPanel).Selected() returns nil while the cursor is on a header
 //   - Home.askRestartSink func(inst *session.Instance) error  (replaces restartSession)
-//   - approve/deny go through the package seams askPaneHasMenu, askSendApprove
+//   - approve/deny go through the package seams askPaneCheck, askSendApprove
 //     and askSendDeny inside a tea.Cmd (spec "Dispatching keys"); see
 //     ask_dispatch_test.go. askGroupsPress runs the returned cmds.
 
@@ -393,8 +393,9 @@ func askGroupsMixed() []askGroupsSeed {
 
 // Spec: "on an approval item `y` approve (sends `1` + Enter, the same as
 // quick-approve)" and "Per-item actions do not confirm." Sent through
-// askSendApprove (spec "Dispatching keys").
-func TestAskGroups_ItemY_ApprovesImmediatelyViaQuickApprove(t *testing.T) {
+// askSendApprove inside the dispatch cmd (spec "Dispatching keys"), not
+// quickApprove.
+func TestAskGroups_ItemY_ApprovesImmediatelyViaDispatch(t *testing.T) {
 	h, _, c := newAskGroupsHome(t, askGroupsMixed()...)
 	askGroupsMoveToItem(t, h, "ask-ap2")
 	askGroupsPress(h, "y")

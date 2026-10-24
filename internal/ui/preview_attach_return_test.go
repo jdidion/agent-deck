@@ -18,6 +18,14 @@ package ui
 // obtained from an older cmd stays stale after its content is replaced here.
 // "Expired" means previewCacheTime[key] is absent or older than the tick
 // handler's 2s previewCacheTTL.
+//
+// Second review round, bullet "Remote preview" (finding f20): "Remote preview
+// fetches carry a generation too". Assumed: fetchRemotePreview(remoteName,
+// sessionID, key string) tea.Cmd stamps previewFetchedMsg.gen from
+// previewFetchGen[key] when it builds the cmd, as fetchPreview does, so the
+// existing gen check in the previewFetchedMsg handler drops an older remote
+// result. With no remotes configured the cmd returns at once with an error,
+// so the tests overwrite content/err as the local tests do and no ssh runs.
 
 import (
 	"strings"
@@ -228,7 +236,10 @@ func TestAttachReturn_StaleFetchResultArrivingLateIsIgnored(t *testing.T) {
 	}
 }
 
-// Guard for the same rule: results in issue order both apply, the newer last.
+// Guard for the same rule with results in issue order: the newest capture is
+// what the cache holds. refetchSelectedPreviewNow has already issued the
+// newer generation, so the older result is dropped on arrival, not applied
+// and then overwritten (finding f14).
 func TestAttachReturn_FetchResultsInOrderApplyNewest(t *testing.T) {
 	h, instances := homeWithInstances(t, 3)
 	sel := instances[0]
@@ -244,5 +255,27 @@ func TestAttachReturn_FetchResultsInOrderApplyNewest(t *testing.T) {
 
 	if got, _ := previewCached(h, sel.ID); got != "FRESH-POST-ATTACH-CAPTURE" {
 		t.Fatalf("cached preview = %q, want the newest capture", got)
+	}
+}
+
+// Second review round, bullet "Remote preview": "an in-flight pre-attach
+// remote capture cannot overwrite the post-attach one" (finding f20: remote
+// results carried gen 0 and always applied).
+func TestRemotePreview_OlderResultArrivingLateIsDropped(t *testing.T) {
+	setXDGTestHome(t)
+	h, _ := homeWithInstances(t, 1)
+	const remote, sid = "box", "remote-sess-1"
+	key := remotePreviewCacheKey(remote, sid)
+
+	older := fetchedMsgFrom(t, h.fetchRemotePreview(remote, sid, key), key)
+	newer := fetchedMsgFrom(t, h.fetchRemotePreview(remote, sid, key), key)
+	older.content, older.err = "OLD-REMOTE-CAPTURE", nil
+	newer.content, newer.err = "FRESH-REMOTE-CAPTURE", nil
+
+	_, _ = h.Update(newer)
+	_, _ = h.Update(older)
+
+	if got, _ := previewCached(h, key); got != "FRESH-REMOTE-CAPTURE" {
+		t.Fatalf("cached remote preview = %q after an older result arrived late, want the newer capture", got)
 	}
 }

@@ -6,8 +6,15 @@ package ui
 // waiting+PreToolUse sessions showed no dialog).
 //
 // Seams these tests assume (package-level vars the implementer adds):
-//   - askPaneHasMenu func(inst *session.Instance) bool
-//       fresh pane capture + tmux.HasOpenInteractiveMenu.
+//   - askPaneCheck func(inst *session.Instance) (hasPrompt bool, err error)
+//       fresh pane capture + tmux.PaneShowsPermissionPrompt (second review
+//       round: "Approve answers only a permission prompt"). It replaces
+//       askPaneHasMenu. A capture error (including no tmux session) is
+//       returned as err, and dispatch counts it as failed and names the
+//       session ("Capture errors are failures").
+//   - askSendTimeout time.Duration, package var: the bound on one send; a
+//       send that has not returned by then counts as failed ("each send has a
+//       timeout, so a dispatch result always arrives").
 //   - askSendApprove func(inst *session.Instance) error   sends "1"+Enter.
 //   - askSendDeny    func(inst *session.Instance) error   sends Escape.
 //   - uiCachedSubstate func(inst *session.Instance) session.Substate
@@ -50,6 +57,7 @@ type askSeamRecorder struct {
 	paneChecks []string
 	hasMenu    func(id string) bool
 	failSend   map[string]error
+	failCheck  map[string]error
 }
 
 func (r *askSeamRecorder) snapshot() (approved, denied, checks []string) {
@@ -64,20 +72,24 @@ func (r *askSeamRecorder) sends() int {
 	return len(r.approved) + len(r.denied)
 }
 
-// installAskDispatchSeams replaces askPaneHasMenu/askSendApprove/askSendDeny
-// for one test. hasMenu nil means every pane shows the menu.
+// installAskDispatchSeams replaces askPaneCheck/askSendApprove/askSendDeny
+// for one test. hasMenu nil means every pane shows a permission prompt; an
+// entry in failCheck makes that pane's capture fail.
 func installAskDispatchSeams(t *testing.T, hasMenu func(id string) bool) *askSeamRecorder {
 	t.Helper()
-	r := &askSeamRecorder{hasMenu: hasMenu, failSend: map[string]error{}}
-	prevMenu, prevApprove, prevDeny := askPaneHasMenu, askSendApprove, askSendDeny
-	askPaneHasMenu = func(inst *session.Instance) bool {
+	r := &askSeamRecorder{hasMenu: hasMenu, failSend: map[string]error{}, failCheck: map[string]error{}}
+	prevCheck, prevApprove, prevDeny := askPaneCheck, askSendApprove, askSendDeny
+	askPaneCheck = func(inst *session.Instance) (bool, error) {
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		r.paneChecks = append(r.paneChecks, inst.ID)
-		if r.hasMenu == nil {
-			return true
+		if err := r.failCheck[inst.ID]; err != nil {
+			return false, err
 		}
-		return r.hasMenu(inst.ID)
+		if r.hasMenu == nil {
+			return true, nil
+		}
+		return r.hasMenu(inst.ID), nil
 	}
 	askSendApprove = func(inst *session.Instance) error {
 		r.mu.Lock()
@@ -97,7 +109,7 @@ func installAskDispatchSeams(t *testing.T, hasMenu func(id string) bool) *askSea
 		r.denied = append(r.denied, inst.ID)
 		return nil
 	}
-	t.Cleanup(func() { askPaneHasMenu, askSendApprove, askSendDeny = prevMenu, prevApprove, prevDeny })
+	t.Cleanup(func() { askPaneCheck, askSendApprove, askSendDeny = prevCheck, prevApprove, prevDeny })
 	return r
 }
 
@@ -491,5 +503,123 @@ func TestAskDispatch_ConfirmationCountAllStillApprovals(t *testing.T) {
 	want := fmt.Sprintf("Deny %d pending tool calls? (y/n)", 5)
 	if p := askGroupsPromptLine(h); !strings.Contains(p, want) {
 		t.Errorf("prompt = %q, want %q", p, want)
+	}
+}
+
+// ---------- second review round ----------
+
+// defaultAskPaneCheckForTest is the production askPaneCheck, saved at package
+// init before any test replaces it.
+var defaultAskPaneCheckForTest = askPaneCheck
+
+// Spec "Second review round", bullet "Capture errors are failures": "A pane
+// capture that errors or times out at dispatch counts as failed and names the
+// session; skipped means the capture succeeded and showed no permission
+// prompt" (finding f8).
+func TestAskDispatch_PaneCheckErrorCountsAsFailedAndNamed(t *testing.T) {
+	h, r := askMixHome(t)
+	r.failCheck["ap1"] = errors.New("tmux capture-pane: timeout")
+	askGroupsMoveToItem(t, h, "ask-ap1")
+	askKeyCmd(h, "Y")
+	res := askOneResult(t, askKeyCmd(h, "y"))
+	if res.Sent != 1 || res.Skipped != 3 || res.Failed != 1 {
+		t.Fatalf("result = %+v, want Sent=1 (ap2) Skipped=3 (ap3..ap5) Failed=1 (ap1)", res)
+	}
+	if len(res.FailedTitles) != 1 || res.FailedTitles[0] != "title-ap1" {
+		t.Errorf("FailedTitles = %v, want [title-ap1]", res.FailedTitles)
+	}
+}
+
+// Same bullet: a session whose capture failed is never sent to.
+func TestAskDispatch_PaneCheckErrorSendsNothing(t *testing.T) {
+	h, r := askMixHome(t)
+	r.failCheck["ap1"] = errors.New("tmux capture-pane: no such session")
+	askGroupsMoveToItem(t, h, "ask-ap1")
+	askOneResult(t, askKeyCmd(h, "y"))
+	if n := r.sends(); n != 0 {
+		t.Fatalf("sent %d keys to a session whose capture failed", n)
+	}
+}
+
+// Same bullet, through the production askPaneCheck: an instance with no tmux
+// session cannot be captured, so it is a named failure and gets no keys
+// (before the second round it passed the check and failed only at send).
+func TestAskDispatch_DefaultPaneCheckWithoutTmuxIsFailure(t *testing.T) {
+	h, r := askMixHome(t)
+	askPaneCheck = defaultAskPaneCheckForTest
+	askGroupsMoveToItem(t, h, "ask-ap3")
+	res := askOneResult(t, askKeyCmd(h, "y"))
+	if res.Failed != 1 || res.Skipped != 0 || res.Sent != 0 {
+		t.Fatalf("result = %+v, want Failed=1 Skipped=0 Sent=0 for a session with no tmux pane", res)
+	}
+	if len(res.FailedTitles) != 1 || res.FailedTitles[0] != "title-ap3" {
+		t.Errorf("FailedTitles = %v, want [title-ap3]", res.FailedTitles)
+	}
+	if n := r.sends(); n != 0 {
+		t.Errorf("sent %d keys to a session with no tmux pane", n)
+	}
+}
+
+// Spec "Second review round", bullet "Panel status": "Showing the panel
+// clears any old status line" (finding f5).
+func TestAskPanel_ShowClearsStaleStatus(t *testing.T) {
+	ap := NewAskPanel()
+	ap.SetSize(120, 40)
+	ap.SetRows([]askRow{askGroupsRow("ap1", "approval", "t1", time.Minute)})
+	ap.SetStatus("Approved 2, skipped 19 (no prompt on screen), failed 0")
+	ap.Show()
+	if v := askGroupsPlain(ap.View()); strings.Contains(v, "Approved 2") {
+		t.Fatalf("panel shows a stale status line after Show:\n%s", v)
+	}
+}
+
+// Same bullet (f5): a dispatch result delivered while the panel is hidden
+// does not appear when the panel is next shown.
+func TestAskDispatch_ResultAfterHideNotShownOnNextShow(t *testing.T) {
+	h, _, _ := newAskGroupsHome(t, askGroupsMixed()...)
+	h.askPanel.Hide()
+	_, _ = h.Update(askDispatchResultMsg{Action: "approve", Sent: 2, Skipped: 19, Failed: 0})
+	h.refreshAskPanel()
+	h.askPanel.Show()
+	if v := askGroupsPlain(h.askPanel.View()); strings.Contains(v, "Approved 2") {
+		t.Fatalf("result of a dispatch that finished while hidden shows on the next open:\n%s", v)
+	}
+}
+
+// Same bullet (f5): "each send has a timeout, so a dispatch result always
+// arrives and the in-flight guard always clears". A send that never returns
+// counts as failed once askSendTimeout passes.
+func TestAskDispatch_HungSendStillYieldsResultAfterTimeout(t *testing.T) {
+	h, _ := askMixHome(t)
+	prevTimeout := askSendTimeout
+	askSendTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { askSendTimeout = prevTimeout })
+	release := make(chan struct{})
+	askSendApprove = func(*session.Instance) error { <-release; return nil }
+	// Registered after askMixHome restores the seams, so it runs first: the
+	// hung send is unblocked before the seams are put back.
+	t.Cleanup(func() { close(release) })
+
+	askGroupsMoveToItem(t, h, "ask-ap1")
+	cmd := askKeyCmd(h, "y")
+	if cmd == nil {
+		t.Fatal("per-item y returned a nil cmd")
+	}
+	got := make(chan []askDispatchResultMsg, 1)
+	go func() { got <- askRunCmd(cmd) }()
+	select {
+	case res := <-got:
+		if len(res) != 1 {
+			t.Fatalf("dispatch yielded %d results, want 1", len(res))
+		}
+		if res[0].Failed != 1 || res[0].Sent != 0 {
+			t.Errorf("result = %+v, want the hung send counted as Failed=1", res[0])
+		}
+		_, _ = h.Update(res[0])
+		if h.askDispatchInFlight {
+			t.Error("in-flight guard still set after the timed-out result was handled")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no dispatch result 3s after a send hung; askSendTimeout is 50ms")
 	}
 }

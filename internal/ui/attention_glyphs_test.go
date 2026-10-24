@@ -292,3 +292,39 @@ func TestFilterBar_ArchivedSessionsNotCountedAsAsks(t *testing.T) {
 		t.Errorf("decision count should stay 1 with an archived decision present: %q", bar)
 	}
 }
+
+// Spec "Second review round", bullet "Counts": "Archived sessions count in
+// none of the ●/?/✎/◐ pills' ask arithmetic" (finding f19: an archived
+// session on a menu dropped out of ? and landed in ◐). attentionFleet has one
+// your-turn session, so ◐ must stay 1.
+func TestFilterBar_ArchivedApprovalNotCountedAsWaiting(t *testing.T) {
+	fleet := attentionFleet(t)
+	now := time.Now()
+	arch := &session.Instance{ID: "arch-ap", Title: "arch-ap", Tool: "claude", Status: session.StatusWaiting}
+	arch.UpdateHookStatus(&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: now})
+	arch.SetArchivedAtThreadSafe(now.Add(-time.Hour))
+	fleet = append(fleet, arch)
+	setUICachedSubstate(t, uiMenuFor("ap1", "ap2", "de1", "arch-ap"))
+	h := NewGateHome(GateHomeOptions{Width: 200, Instances: fleet}).home
+	h.refreshSessionRenderSnapshot(nil)
+	bar := tmux.StripANSI(h.renderFilterBar())
+	if !regexp.MustCompile(`◐\s*1\b`).MatchString(bar) {
+		t.Errorf("◐ should stay 1 with an archived approval present (it is in neither ◐ nor ?): %q", bar)
+	}
+}
+
+// Same bullet: "an archived waiting session is not "your turn" either".
+func TestFilterBar_ArchivedYourTurnNotCountedAsWaiting(t *testing.T) {
+	fleet := attentionFleet(t)
+	now := time.Now()
+	arch := &session.Instance{ID: "arch-wt", Title: "arch-wt", Tool: "claude", Status: session.StatusWaiting}
+	arch.UpdateHookStatus(&session.HookStatus{Status: "waiting", Event: "Stop", UpdatedAt: now})
+	arch.SetArchivedAtThreadSafe(now.Add(-time.Hour))
+	fleet = append(fleet, arch)
+	h := NewGateHome(GateHomeOptions{Width: 200, Instances: fleet}).home
+	h.refreshSessionRenderSnapshot(nil)
+	bar := tmux.StripANSI(h.renderFilterBar())
+	if !regexp.MustCompile(`◐\s*1\b`).MatchString(bar) {
+		t.Errorf("◐ should stay 1 with an archived your-turn session present: %q", bar)
+	}
+}

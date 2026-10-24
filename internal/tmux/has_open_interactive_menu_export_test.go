@@ -8,9 +8,11 @@ import (
 
 // Spec docs/design/2026-10-23-ask-groups.md "Dispatching keys": dispatch
 // "requires `hasOpenInteractiveMenu` to hold for it (exported for the UI as
-// `tmux.HasOpenInteractiveMenu`)". The export must agree with the internal
-// predicate on realistic panes; the fixtures are the ones the internal
-// predicate is already pinned against (#2473).
+// `tmux.HasOpenInteractiveMenu`)". Expected values are pinned per fixture;
+// the fixtures are the ones the internal predicate is already pinned against
+// (#2473). The second review round narrows the approve gate to
+// PaneShowsPermissionPrompt (permission_prompt_test.go); this predicate still
+// answers "any open menu".
 func TestHasOpenInteractiveMenu_ExportMatchesInternalOnFixtures(t *testing.T) {
 	cases := []struct {
 		file string
@@ -31,9 +33,6 @@ func TestHasOpenInteractiveMenu_ExportMatchesInternalOnFixtures(t *testing.T) {
 			content := StripANSI(string(b))
 			if got := HasOpenInteractiveMenu(content); got != c.want {
 				t.Errorf("HasOpenInteractiveMenu = %v, want %v", got, c.want)
-			}
-			if HasOpenInteractiveMenu(content) != hasOpenInteractiveMenu(content) {
-				t.Error("export disagrees with hasOpenInteractiveMenu")
 			}
 		})
 	}
