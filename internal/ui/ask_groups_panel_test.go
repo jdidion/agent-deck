@@ -8,9 +8,10 @@ package ui
 //   - (*AskPanel).CursorGroup() session.AskKind
 //   - (*AskPanel).GroupItems(kind session.AskKind) []*statedb.AskItemRow
 //   - (*AskPanel).Selected() returns nil while the cursor is on a header
-//   - Home.askDenySink    func(inst *session.Instance) error  (replaces sending Escape)
 //   - Home.askRestartSink func(inst *session.Instance) error  (replaces restartSession)
-//   - Home.quickApproveSink (exists) receives the per-item and group approve.
+//   - approve/deny go through the package seams askPaneHasMenu, askSendApprove
+//     and askSendDeny inside a tea.Cmd (spec "Dispatching keys"); see
+//     ask_dispatch_test.go. askGroupsPress runs the returned cmds.
 
 import (
 	"regexp"
@@ -219,27 +220,28 @@ func TestAskGroups_SelectedIsNilOnHeader(t *testing.T) {
 
 // ---------- Home fixture for key actions ----------
 
+// askGroupsCapture mirrors the dispatch seams' recorder (approve/deny) plus
+// the restart sink, so the panel tests read one place.
 type askGroupsCapture struct {
+	rec       *askSeamRecorder
 	approved  []string
-	approvedW []int
 	denied    []string
 	restarted []string
 }
 
-func (c *askGroupsCapture) approve(inst *session.Instance, windowIndex int) error {
-	c.approved = append(c.approved, inst.ID)
-	c.approvedW = append(c.approvedW, windowIndex)
-	return nil
-}
-func (c *askGroupsCapture) deny(inst *session.Instance) error {
-	c.denied = append(c.denied, inst.ID)
-	return nil
-}
 func (c *askGroupsCapture) restart(inst *session.Instance) error {
 	c.restarted = append(c.restarted, inst.ID)
 	return nil
 }
-func (c *askGroupsCapture) total() int { return len(c.approved) + len(c.denied) + len(c.restarted) }
+
+// sync copies the recorder's approve/deny log into the capture.
+func (c *askGroupsCapture) sync() {
+	c.approved, c.denied, _ = c.rec.snapshot()
+}
+func (c *askGroupsCapture) total() int {
+	c.sync()
+	return len(c.approved) + len(c.denied) + len(c.restarted)
+}
 
 type askGroupsSeed struct {
 	id     string // instance id == ask id suffix
@@ -266,7 +268,16 @@ func newAskGroupsHome(t *testing.T, seeds ...askGroupsSeed) (*Home, *statedb.Sta
 	insts := make([]*session.Instance, 0, len(seeds))
 	now := time.Now()
 	for _, s := range seeds {
-		insts = append(insts, &session.Instance{ID: s.id, Title: "title-" + s.id, Tool: "claude", Status: s.status})
+		inst := &session.Instance{ID: s.id, Title: "title-" + s.id, Tool: "claude", Status: s.status}
+		// A hook record that classifies as the seeded kind once the pane shows
+		// the menu (spec "Kinds").
+		switch s.kind {
+		case "approval", "permission":
+			inst.UpdateHookStatus(&session.HookStatus{Status: "waiting", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: now})
+		case "decision", "question":
+			inst.UpdateHookStatus(&session.HookStatus{Status: "waiting", Event: "PreToolUse", ToolName: "AskUserQuestion", UpdatedAt: now})
+		}
+		insts = append(insts, inst)
 		if err := db.UpsertAskItem(&statedb.AskItemRow{
 			ID:         "ask-" + s.id,
 			InstanceID: s.id,
@@ -283,10 +294,12 @@ func newAskGroupsHome(t *testing.T, seeds ...askGroupsSeed) (*Home, *statedb.Sta
 	h.storage = storage
 	h.askPanel = NewAskPanel()
 
-	c := &askGroupsCapture{}
-	h.quickApproveSink = c.approve
-	h.askDenySink = c.deny
+	// Every pane shows its menu, both in the cached substate and on a fresh
+	// capture, unless a test overrides it.
+	c := &askGroupsCapture{rec: installAskDispatchSeams(t, nil)}
+	setUICachedSubstate(t, func(*session.Instance) session.Substate { return session.SubstateInteractiveMenu })
 	h.askRestartSink = c.restart
+	h.refreshSessionRenderSnapshot(nil)
 
 	h.refreshAskPanel()
 	h.askPanel.SetSize(h.width, h.height)
@@ -304,9 +317,14 @@ func askGroupsKey(k string) tea.KeyMsg {
 	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
 }
 
+// askGroupsPress delivers keys and runs each returned cmd, feeding any
+// askDispatchResultMsg back into Update, as the Bubble Tea runtime would.
 func askGroupsPress(h *Home, keys ...string) {
 	for _, k := range keys {
-		h.handleAskPanelKey(askGroupsKey(k))
+		_, cmd := h.handleAskPanelKey(askGroupsKey(k))
+		for _, res := range askRunCmd(cmd) {
+			_, _ = h.Update(res)
+		}
 	}
 }
 
@@ -374,16 +392,15 @@ func askGroupsMixed() []askGroupsSeed {
 // ---------- per-item keys ----------
 
 // Spec: "on an approval item `y` approve (sends `1` + Enter, the same as
-// quick-approve)" and "Per-item actions do not confirm."
+// quick-approve)" and "Per-item actions do not confirm." Sent through
+// askSendApprove (spec "Dispatching keys").
 func TestAskGroups_ItemY_ApprovesImmediatelyViaQuickApprove(t *testing.T) {
 	h, _, c := newAskGroupsHome(t, askGroupsMixed()...)
 	askGroupsMoveToItem(t, h, "ask-ap2")
 	askGroupsPress(h, "y")
+	c.sync()
 	if len(c.approved) != 1 || c.approved[0] != "ap2" {
 		t.Fatalf("approve dispatches = %v, want [ap2]", c.approved)
-	}
-	if c.approvedW[0] != -1 {
-		t.Errorf("approve window index = %d, want -1 (session's active window, as quick-approve)", c.approvedW[0])
 	}
 	if p := askGroupsPromptLine(h); p != "" {
 		t.Errorf("per-item approve must not confirm, got prompt %q", p)
@@ -395,6 +412,7 @@ func TestAskGroups_ItemN_DeniesImmediately(t *testing.T) {
 	h, _, c := newAskGroupsHome(t, askGroupsMixed()...)
 	askGroupsMoveToItem(t, h, "ask-ap1")
 	askGroupsPress(h, "n")
+	c.sync()
 	if len(c.denied) != 1 || c.denied[0] != "ap1" {
 		t.Fatalf("deny dispatches = %v, want [ap1]", c.denied)
 	}
@@ -478,14 +496,10 @@ func TestAskGroups_GroupY_ConfirmedApprovesWholeGroup(t *testing.T) {
 	h, _, c := newAskGroupsHome(t, askGroupsMixed()...)
 	askGroupsMoveToItem(t, h, "ask-ap2")
 	askGroupsPress(h, "Y", "y")
+	c.sync()
 	got := strings.Join(sortedCopy(c.approved), ",")
 	if got != "ap1,ap2" {
 		t.Errorf("approved = %v, want [ap1 ap2]", c.approved)
-	}
-	for _, w := range c.approvedW {
-		if w != -1 {
-			t.Errorf("group approve window index = %d, want -1", w)
-		}
 	}
 	if len(c.denied)+len(c.restarted) != 0 {
 		t.Errorf("approve-all dispatched other actions: %+v", c)
@@ -528,6 +542,7 @@ func TestAskGroups_HeaderY_ActsOnWholeGroup(t *testing.T) {
 		t.Fatalf("y on the approval header: prompt = %q, want the approve-all confirmation", p)
 	}
 	askGroupsPress(h, "y")
+	c.sync()
 	if got := strings.Join(sortedCopy(c.approved), ","); got != "ap1,ap2" {
 		t.Errorf("approved = %v, want [ap1 ap2]", c.approved)
 	}
@@ -565,6 +580,7 @@ func TestAskGroups_GroupN_ConfirmedDeniesWholeGroup(t *testing.T) {
 		t.Fatalf("deny-all ran before confirmation: %+v", c)
 	}
 	askGroupsPress(h, "y")
+	c.sync()
 	if got := strings.Join(sortedCopy(c.denied), ","); got != "ap1,ap2" {
 		t.Errorf("denied = %v, want [ap1 ap2]", c.denied)
 	}

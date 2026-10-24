@@ -5,7 +5,9 @@ package ui
 // Seams these tests assume (the implementer adds them):
 //   - sessionRenderState.askKind session.AskKind, filled by
 //     refreshSessionRenderSnapshot from the instance's status and its cached
-//     hook record (Instance.UpdateHookStatus must retain Matcher/ToolName).
+//     hook record (Instance.UpdateHookStatus must retain Matcher/ToolName)
+//     and, per the revised spec "Kinds", the cached substate read through
+//     uiCachedSubstate (see ask_dispatch_test.go).
 //   - rowAttentionGlyph(status session.Status, substate session.Substate,
 //     archived bool, kind session.AskKind) (icon string, style lipgloss.Style)
 //     used by renderSessionItem.
@@ -119,31 +121,41 @@ func TestRenderSessionItem_DrawsAttentionGlyph(t *testing.T) {
 
 // Spec "Session row icons": "The row uses the same classification as the ask
 // queue, computed from the session's status and cached hook record at render
-// time". The snapshot carries the classification.
+// time". The snapshot carries the classification. Revised spec "Kinds": an
+// approval or decision also needs the cached substate interactive-menu.
 func TestRenderSnapshot_ClassifiesFromCachedHookRecord(t *testing.T) {
 	now := time.Now()
+	menu, none := session.SubstateInteractiveMenu, session.SubstateNone
 	tests := []struct {
 		name   string
 		status session.Status
 		hs     *session.HookStatus
+		sub    session.Substate
 		want   session.AskKind
 	}{
-		{"PreToolUse Bash while waiting -> approval", session.StatusWaiting,
-			&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: now}, session.AskApproval},
-		{"PreToolUse AskUserQuestion while waiting -> decision", session.StatusWaiting,
-			&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "AskUserQuestion", UpdatedAt: now}, session.AskDecision},
-		{"permission_prompt notification -> approval", session.StatusWaiting,
-			&session.HookStatus{Status: "waiting", Event: "Notification", Matcher: "permission_prompt", UpdatedAt: now}, session.AskApproval},
-		{"elicitation_dialog notification -> decision", session.StatusWaiting,
-			&session.HookStatus{Status: "waiting", Event: "Notification", Matcher: "elicitation_dialog", UpdatedAt: now}, session.AskDecision},
-		{"Stop while waiting -> not an ask", session.StatusWaiting,
-			&session.HookStatus{Status: "waiting", Event: "Stop", UpdatedAt: now}, ""},
+		{"PreToolUse Bash while waiting with menu -> approval", session.StatusWaiting,
+			&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: now}, menu, session.AskApproval},
+		// Live check: 19 of 21 such sessions were at their normal prompt.
+		{"REGRESSION PreToolUse Bash while waiting, no menu -> not an ask", session.StatusWaiting,
+			&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: now}, none, ""},
+		{"PreToolUse AskUserQuestion while waiting with menu -> decision", session.StatusWaiting,
+			&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "AskUserQuestion", UpdatedAt: now}, menu, session.AskDecision},
+		{"permission_prompt notification with menu -> approval", session.StatusWaiting,
+			&session.HookStatus{Status: "waiting", Event: "Notification", Matcher: "permission_prompt", UpdatedAt: now}, menu, session.AskApproval},
+		{"permission_prompt notification, no menu -> not an ask", session.StatusWaiting,
+			&session.HookStatus{Status: "waiting", Event: "Notification", Matcher: "permission_prompt", UpdatedAt: now}, none, ""},
+		{"elicitation_dialog notification with menu -> decision", session.StatusWaiting,
+			&session.HookStatus{Status: "waiting", Event: "Notification", Matcher: "elicitation_dialog", UpdatedAt: now}, menu, session.AskDecision},
+		{"Stop while waiting, no menu -> not an ask", session.StatusWaiting,
+			&session.HookStatus{Status: "waiting", Event: "Stop", UpdatedAt: now}, none, ""},
 		{"PreToolUse while running -> not an ask", session.StatusRunning,
-			&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: now}, ""},
-		{"error status -> error", session.StatusError, nil, session.AskError},
+			&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: now}, menu, ""},
+		{"error status -> error", session.StatusError, nil, none, session.AskError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			sub := tt.sub
+			setUICachedSubstate(t, func(*session.Instance) session.Substate { return sub })
 			inst := &session.Instance{ID: "snap", Title: "snap", Tool: "claude", Status: tt.status}
 			if tt.hs != nil {
 				inst.UpdateHookStatus(tt.hs)
@@ -161,8 +173,11 @@ func TestRenderSnapshot_ClassifiesFromCachedHookRecord(t *testing.T) {
 	}
 }
 
-// attentionFleet: 2 approval, 1 decision, 1 plain waiting, 1 running.
-func attentionFleet() []*session.Instance {
+// attentionFleet: 2 approval, 1 decision, 1 plain waiting, 1 running. The
+// cached substate shows a menu for ap1, ap2 and de1 only (spec "Kinds").
+func attentionFleet(t *testing.T) []*session.Instance {
+	t.Helper()
+	setUICachedSubstate(t, uiMenuFor("ap1", "ap2", "de1"))
 	now := time.Now()
 	mk := func(id string, st session.Status, hs *session.HookStatus) *session.Instance {
 		inst := &session.Instance{ID: id, Title: id, Tool: "claude", Status: st}
@@ -183,7 +198,7 @@ func attentionFleet() []*session.Instance {
 // Spec "Session row icons": "Header counts (`● 13 ◐ 6`) gain separate counts
 // for `?` and `✎` when non-zero."
 func TestFilterBar_ShowsApprovalAndDecisionCounts(t *testing.T) {
-	h := NewGateHome(GateHomeOptions{Width: 200, Instances: attentionFleet()}).home
+	h := NewGateHome(GateHomeOptions{Width: 200, Instances: attentionFleet(t)}).home
 	bar := tmux.StripANSI(h.renderFilterBar())
 	if !regexp.MustCompile(`\?\s*2\b`).MatchString(bar) {
 		t.Errorf("filter bar missing approval count \"? 2\": %q", bar)
@@ -199,7 +214,7 @@ func TestFilterBar_ShowsApprovalAndDecisionCounts(t *testing.T) {
 // Spec "Session row icons": the counts are "separate", and ◐ now means only
 // "waiting, your turn (not an ask)", so asks are not double-counted under ◐.
 func TestFilterBar_WaitingCountExcludesAsks(t *testing.T) {
-	h := NewGateHome(GateHomeOptions{Width: 200, Instances: attentionFleet()}).home
+	h := NewGateHome(GateHomeOptions{Width: 200, Instances: attentionFleet(t)}).home
 	bar := tmux.StripANSI(h.renderFilterBar())
 	if !regexp.MustCompile(`◐\s*1\b`).MatchString(bar) {
 		t.Errorf("◐ count should be 1 (only the finished-turn session): %q", bar)
@@ -234,5 +249,46 @@ func TestHelpOverlay_ListsAttentionGlyphs(t *testing.T) {
 	}
 	if !strings.Contains(lower, "decision") {
 		t.Error("help does not describe the ✎ (needs decision) glyph")
+	}
+}
+
+// Live check (spec "Kinds" revision): a waiting session whose last hook is
+// PreToolUse but whose pane shows no menu is "your turn" (◐), not ?.
+func TestFilterBar_StalePreToolUseWithoutMenuCountsAsWaiting(t *testing.T) {
+	setUICachedSubstate(t, uiMenuFor())
+	inst := &session.Instance{ID: "st1", Title: "st1", Tool: "claude", Status: session.StatusWaiting}
+	inst.UpdateHookStatus(&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: "Bash", UpdatedAt: time.Now()})
+	h := NewGateHome(GateHomeOptions{Width: 200, Instances: []*session.Instance{inst}}).home
+	bar := tmux.StripANSI(h.renderFilterBar())
+	if regexp.MustCompile(`\?\s*\d`).MatchString(bar) {
+		t.Errorf("stale PreToolUse with no menu counted as an approval: %q", bar)
+	}
+	if !regexp.MustCompile(`◐\s*1\b`).MatchString(bar) {
+		t.Errorf("◐ count should be 1 for the stale PreToolUse session: %q", bar)
+	}
+}
+
+// Spec "Other fixes from review": "The filter bar does not count archived
+// sessions as `?` or `✎`." The archived sessions are not superseded, so the
+// existing archivedSuperseded exclusion does not cover them.
+func TestFilterBar_ArchivedSessionsNotCountedAsAsks(t *testing.T) {
+	fleet := attentionFleet(t)
+	now := time.Now()
+	mk := func(id, tool string) *session.Instance {
+		inst := &session.Instance{ID: id, Title: id, Tool: "claude", Status: session.StatusWaiting}
+		inst.UpdateHookStatus(&session.HookStatus{Status: "running", Event: "PreToolUse", ToolName: tool, UpdatedAt: now})
+		inst.SetArchivedAtThreadSafe(now.Add(-time.Hour))
+		return inst
+	}
+	fleet = append(fleet, mk("arch-ap", "Bash"), mk("arch-de", "AskUserQuestion"))
+	setUICachedSubstate(t, uiMenuFor("ap1", "ap2", "de1", "arch-ap", "arch-de"))
+	h := NewGateHome(GateHomeOptions{Width: 200, Instances: fleet}).home
+	h.refreshSessionRenderSnapshot(nil)
+	bar := tmux.StripANSI(h.renderFilterBar())
+	if !regexp.MustCompile(`\?\s*2\b`).MatchString(bar) {
+		t.Errorf("approval count should stay 2 with an archived approval present: %q", bar)
+	}
+	if !regexp.MustCompile(`✎\s*1\b`).MatchString(bar) {
+		t.Errorf("decision count should stay 1 with an archived decision present: %q", bar)
 	}
 }

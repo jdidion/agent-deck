@@ -42,12 +42,13 @@ func TestAcquireNotifyDaemonLock_SingleInstance(t *testing.T) {
 	release3()
 }
 
-func TestAutostartDaemon_DefaultsOff(t *testing.T) {
-	// A TUI under a throwaway HOME must not leak a detached daemon, so the
-	// default when the key is absent is not to auto-start one.
+// Spec docs/design/2026-10-23-ask-groups.md "Daemon autostart" (revised):
+// the default is on again; the throwaway-HOME leak is fixed by the daemon
+// exiting once its HOME is gone (TestTransitionDaemonRun_ExitsWhenHomeRemoved).
+func TestAutostartDaemon_DefaultsOn(t *testing.T) {
 	writeDesktopNotifyConfig(t, "desktop = true")
-	if GetNotificationsSettings().GetAutostartDaemonEnabled() {
-		t.Error("autostart defaulted on with no autostart_daemon key; want off")
+	if !GetNotificationsSettings().GetAutostartDaemonEnabled() {
+		t.Error("autostart defaulted off with no autostart_daemon key; want on")
 	}
 }
 

@@ -9,6 +9,9 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
+// Spec docs/design/2026-10-23-ask-groups.md "Kinds" (revised): approval and
+// decision need the pane to show an open menu, so every waiting case here
+// runs with substate interactive-menu except the two not-an-ask rows.
 func TestDeriveAsk(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -23,14 +26,13 @@ func TestDeriveAsk(t *testing.T) {
 		{"elicitation matcher", &HookStatus{Event: "notification", Matcher: "elicitation_dialog"}, "waiting", true, AskDecision, "is asking a question"},
 		{"error status, no hook", nil, "error", true, AskError, "hit an error"},
 		{"error status with message", &HookStatus{Message: "push rejected"}, "error", true, AskError, "push rejected"},
-		{"plain waiting, no matcher, is not an ask", nil, "waiting", false, "", ""},
-		{"finished turn (stop) is not an ask", &HookStatus{Event: "stop"}, "waiting", false, "", ""},
+		{"plain waiting with menu is an approval", nil, "waiting", true, AskApproval, "wants permission to run a command"},
 		{"stale permission matcher while running is not an ask", &HookStatus{Matcher: "permission_prompt"}, "running", false, "", ""},
 		{"idle is not an ask", nil, "idle", false, "", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			k, sum, ok := deriveAsk(tt.hs, tt.status)
+			k, sum, ok := deriveAsk(tt.hs, tt.status, SubstateInteractiveMenu)
 			if ok != tt.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
 			}
@@ -80,6 +82,7 @@ func TestSyncAsks_IdempotentOpen(t *testing.T) {
 	byID := map[string]*Instance{"a": inst}
 	statuses := map[string]string{"a": "waiting"}
 	hooks := map[string]*HookStatus{"a": {Event: "notification", Matcher: "permission_prompt"}}
+	setAskSubstate(t, askMenuAll) // spec "Kinds": the pane shows the dialog
 
 	for i := 0; i < 5; i++ {
 		d.syncAsks(profile, db, byID, statuses, hooks)
@@ -110,6 +113,7 @@ func TestSyncAsks_ResolvesOnStatusLeave(t *testing.T) {
 	inst := &Instance{ID: "a"}
 	byID := map[string]*Instance{"a": inst}
 	hooks := map[string]*HookStatus{"a": {Event: "permissionrequest"}}
+	setAskSubstate(t, askMenuAll)
 
 	d.syncAsks(profile, db, byID, map[string]string{"a": "waiting"}, hooks)
 	if n := openAskCount(t, d, profile); n != 1 {
@@ -169,6 +173,9 @@ func TestSyncAsks_ContentSigMismatchStaysOpenWhileWaiting(t *testing.T) {
 
 	byID := map[string]*Instance{"stale": {ID: "stale"}, "fresh": {ID: "fresh"}}
 	statuses := map[string]string{"stale": "waiting", "fresh": "waiting"}
+	// Both panes still show the dialog, so both still derive an approval
+	// (spec "Kinds"); only the ContentSig differs.
+	setAskSubstate(t, askMenuAll)
 
 	d.syncAsks(profile, db, byID, statuses, nil)
 
@@ -195,6 +202,7 @@ func TestSyncAsks_ReopensAfterResolveWithEmptySignal(t *testing.T) {
 	inst := &Instance{ID: "x", Title: "flow"} // Tool "" -> no transcript -> sig ""
 	byID := map[string]*Instance{"x": inst}
 	hooks := map[string]*HookStatus{"x": {Event: "permissionrequest"}}
+	setAskSubstate(t, askMenuAll)
 
 	// 1. Open.
 	d.syncAsks(profile, db, byID, map[string]string{"x": "waiting"}, hooks)
@@ -315,6 +323,7 @@ func TestSyncAsks_RealTranscript_ResolveThenReopen(t *testing.T) {
 	}
 	byID := map[string]*Instance{"wh": inst}
 	perm := map[string]*HookStatus{"wh": {Event: "notification", Matcher: "permission_prompt", Message: "Run the build?"}}
+	setAskSubstate(t, askMenuAll)
 
 	writeAskTranscript(t, inst, "line one\n")
 	sig1 := transitionEventOutputHash(inst)
@@ -387,6 +396,7 @@ func TestSyncAsks_SustainedWaitGrowingTranscriptStaysSingleOpen(t *testing.T) {
 	byID := map[string]*Instance{"wh": inst}
 	perm := map[string]*HookStatus{"wh": {Event: "notification", Matcher: "permission_prompt", Message: "Run the build?"}}
 	statuses := map[string]string{"wh": "waiting"}
+	setAskSubstate(t, askMenuAll)
 
 	var firstID string
 	content := "line one\n"

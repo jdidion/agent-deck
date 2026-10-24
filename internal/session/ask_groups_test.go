@@ -28,62 +28,11 @@ func TestAskKindNames_RenamedToApprovalDecisionError(t *testing.T) {
 	}
 }
 
-// Spec "Kinds" table. One subtest per row condition.
-func TestDeriveAsk_ClassificationTable(t *testing.T) {
-	tests := []struct {
-		name    string
-		hs      *HookStatus
-		status  string
-		wantOK  bool
-		wantK   AskKind
-		wantSum string // "" = do not check
-	}{
-		// approval row: event PermissionRequest
-		{"permissionrequest is approval", &HookStatus{Event: "PermissionRequest"}, "waiting", true, AskApproval, ""},
-		// approval row: matcher permission_prompt
-		{"permission_prompt matcher is approval", &HookStatus{Event: "Notification", Matcher: "permission_prompt", Message: "Run npm test?"}, "waiting", true, AskApproval, "Run npm test?"},
-		// approval row: event PreToolUse with a tool other than AskUserQuestion
-		{"pretooluse with Bash is approval", &HookStatus{Event: "PreToolUse", ToolName: "Bash"}, "waiting", true, AskApproval, ""},
-		{"pretooluse with Edit is approval", &HookStatus{Event: "PreToolUse", ToolName: "Edit"}, "waiting", true, AskApproval, ""},
-		// "ExitPlanMode (plan approval) is an approval."
-		{"pretooluse ExitPlanMode is approval", &HookStatus{Event: "PreToolUse", ToolName: "ExitPlanMode"}, "waiting", true, AskApproval, ""},
-		// decision row: matcher elicitation_dialog
-		{"elicitation_dialog matcher is decision", &HookStatus{Event: "Notification", Matcher: "elicitation_dialog"}, "waiting", true, AskDecision, ""},
-		// decision row: event PreToolUse with tool AskUserQuestion
-		{"pretooluse AskUserQuestion is decision", &HookStatus{Event: "PreToolUse", ToolName: "AskUserQuestion"}, "waiting", true, AskDecision, ""},
-		// error row: status error
-		{"error status is error", nil, "error", true, AskError, ""},
-		{"error status ignores a permission-shaped hook", &HookStatus{Event: "PermissionRequest"}, "error", true, AskError, ""},
-		// "(not an ask)": any other waiting (e.g. after Stop)
-		{"stop while waiting is not an ask", &HookStatus{Event: "Stop"}, "waiting", false, "", ""},
-		{"plain waiting with no hook is not an ask", nil, "waiting", false, "", ""},
-		// "A PreToolUse record while the status is running is not an ask"
-		{"pretooluse while running is not an ask", &HookStatus{Event: "PreToolUse", ToolName: "Bash"}, "running", false, "", ""},
-		{"pretooluse AskUserQuestion while running is not an ask", &HookStatus{Event: "PreToolUse", ToolName: "AskUserQuestion"}, "running", false, "", ""},
-		// "(not an ask)": every other status
-		{"idle is not an ask", &HookStatus{Event: "PermissionRequest"}, "idle", false, "", ""},
-		{"stopped is not an ask", &HookStatus{Event: "PreToolUse", ToolName: "Bash"}, "stopped", false, "", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			k, sum, ok := deriveAsk(tt.hs, tt.status)
-			if ok != tt.wantOK {
-				t.Fatalf("ok = %v (kind %q), want %v", ok, k, tt.wantOK)
-			}
-			if !ok {
-				return
-			}
-			if k != tt.wantK {
-				t.Errorf("kind = %q, want %q", k, tt.wantK)
-			}
-			if tt.wantSum != "" && sum != tt.wantSum {
-				t.Errorf("summary = %q, want %q", sum, tt.wantSum)
-			}
-		})
-	}
-}
+// The pre-revision classification table (hook event alone made an approval)
+// is superseded by TestDeriveAsk_RevisedKindsTable in ask_pane_truth_test.go:
+// spec "Kinds" now requires substate interactive-menu for approval/decision.
 
-// Spec "Kinds": "Event and matcher comparisons are case-insensitive, as today."
+// Spec "Kinds": "Comparisons are case-insensitive." (pane shows the menu)
 func TestDeriveAsk_EventAndMatcherCaseInsensitive(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -99,7 +48,7 @@ func TestDeriveAsk_EventAndMatcherCaseInsensitive(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			k, _, ok := deriveAsk(tt.hs, "waiting")
+			k, _, ok := deriveAsk(tt.hs, "waiting", SubstateInteractiveMenu)
 			if !ok {
 				t.Fatalf("not classified as an ask; want %q", tt.wantK)
 			}
@@ -113,9 +62,9 @@ func TestDeriveAsk_EventAndMatcherCaseInsensitive(t *testing.T) {
 // Spec "Hook content": "Summary for an `approval` from `PreToolUse`:
 // `wants to run <ToolName>` when the message is empty."
 func TestDeriveAsk_PreToolUseApprovalSummaryNamesTool(t *testing.T) {
-	_, sum, ok := deriveAsk(&HookStatus{Event: "PreToolUse", ToolName: "Bash"}, "waiting")
+	_, sum, ok := deriveAsk(&HookStatus{Event: "PreToolUse", ToolName: "Bash"}, "waiting", SubstateInteractiveMenu)
 	if !ok {
-		t.Fatal("PreToolUse+Bash while waiting must be an ask")
+		t.Fatal("PreToolUse+Bash while waiting with the menu open must be an ask")
 	}
 	if sum != "wants to run Bash" {
 		t.Errorf("summary = %q, want %q", sum, "wants to run Bash")
@@ -125,19 +74,20 @@ func TestDeriveAsk_PreToolUseApprovalSummaryNamesTool(t *testing.T) {
 // Spec "Hook content": the tool-name summary applies only "when the message is
 // empty", so a non-empty message wins.
 func TestDeriveAsk_PreToolUseApprovalSummaryPrefersMessage(t *testing.T) {
-	_, sum, ok := deriveAsk(&HookStatus{Event: "PreToolUse", ToolName: "Bash", Message: "Run the build?"}, "waiting")
+	_, sum, ok := deriveAsk(&HookStatus{Event: "PreToolUse", ToolName: "Bash", Message: "Run the build?"}, "waiting", SubstateInteractiveMenu)
 	if !ok {
-		t.Fatal("PreToolUse+Bash while waiting must be an ask")
+		t.Fatal("PreToolUse+Bash while waiting with the menu open must be an ask")
 	}
 	if sum != "Run the build?" {
 		t.Errorf("summary = %q, want the hook message", sum)
 	}
 }
 
-// Spec "Kinds" (PreToolUse approval) through the producer: syncAsks opens one
-// row with the new kind name and the tool summary.
+// Spec "Kinds" (approval = waiting + interactive-menu) through the producer:
+// syncAsks opens one row with the new kind name and the tool summary.
 func TestSyncAsks_PreToolUseWaitingOpensApproval(t *testing.T) {
 	d, db, profile := newAskDaemon(t)
+	setAskSubstate(t, askMenuAll)
 	byID := map[string]*Instance{"a": {ID: "a"}}
 	hooks := map[string]*HookStatus{"a": {Event: "PreToolUse", ToolName: "Bash"}}
 
@@ -148,7 +98,7 @@ func TestSyncAsks_PreToolUseWaitingOpensApproval(t *testing.T) {
 		t.Fatalf("ListOpenAskItems: %v", err)
 	}
 	if len(open) != 1 {
-		t.Fatalf("open = %d, want 1 (spec Problem 1: PreToolUse-waiting sessions must reach the queue)", len(open))
+		t.Fatalf("open = %d, want 1 (a waiting session with an open menu must reach the queue)", len(open))
 	}
 	if open[0].Kind != "approval" {
 		t.Errorf("stored kind = %q, want %q", open[0].Kind, "approval")
@@ -158,9 +108,10 @@ func TestSyncAsks_PreToolUseWaitingOpensApproval(t *testing.T) {
 	}
 }
 
-// Spec "Kinds": PreToolUse+AskUserQuestion is a decision, stored as "decision".
+// Spec "Kinds": menu + AskUserQuestion is a decision, stored as "decision".
 func TestSyncAsks_AskUserQuestionWaitingOpensDecision(t *testing.T) {
 	d, db, profile := newAskDaemon(t)
+	setAskSubstate(t, askMenuAll)
 	byID := map[string]*Instance{"q": {ID: "q"}}
 	hooks := map[string]*HookStatus{"q": {Event: "PreToolUse", ToolName: "AskUserQuestion"}}
 
@@ -178,9 +129,10 @@ func TestSyncAsks_AskUserQuestionWaitingOpensDecision(t *testing.T) {
 	}
 }
 
-// Spec "Kinds": "A PreToolUse record while the status is running is not an ask."
+// Spec "Kinds": a running session is not an ask, even with a menu substate.
 func TestSyncAsks_PreToolUseRunningOpensNothing(t *testing.T) {
 	d, db, profile := newAskDaemon(t)
+	setAskSubstate(t, askMenuAll)
 	byID := map[string]*Instance{"r": {ID: "r"}}
 	hooks := map[string]*HookStatus{"r": {Event: "PreToolUse", ToolName: "Bash"}}
 
