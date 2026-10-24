@@ -11025,10 +11025,14 @@ func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		h.askPanel.Hide()
 		return h, nil
-	case "y", "n":
-		if group != session.AskApproval {
-			return h, nil
+	case "y", "n", "Y", "N":
+		if group == session.AskApproval {
+			// Approve/deny are disabled: approval rows are not confirmed against the
+			// pane, so these keys typed "1" into sessions at their normal prompt.
+			h.setError(fmt.Errorf("approve/deny from the Asks panel is disabled until it verifies the prompt on screen; open the session (enter) to answer"))
 		}
+		return h, nil
+	case "_disabled_yn":
 		if onHeader {
 			h.confirmAskGroupAction(key == "y", group)
 			return h, nil
@@ -11044,7 +11048,7 @@ func (h *Home) handleAskPanelKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		h.refreshAskPanel()
 		return h, nil
-	case "Y", "N":
+	case "_disabled_YN":
 		if group == session.AskApproval {
 			h.confirmAskGroupAction(key == "Y", group)
 		}
