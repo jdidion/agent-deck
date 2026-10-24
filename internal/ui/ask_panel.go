@@ -120,9 +120,11 @@ func NewAskPanel() *AskPanel {
 }
 
 // Show makes the panel visible. Rows are populated separately via SetRows
-// (Home refreshes from the store right before showing).
+// (Home refreshes from the store right before showing). A status line set
+// while the panel was hidden (a dispatch result that arrived late) is cleared.
 func (ap *AskPanel) Show() {
 	ap.visible = true
+	ap.status = ""
 }
 
 // Hide hides the panel and drops any pending confirmation.

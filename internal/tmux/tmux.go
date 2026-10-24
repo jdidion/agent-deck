@@ -5883,6 +5883,13 @@ func (s *Session) GetSubstate() Substate {
 	return sub
 }
 
+// CaptureSubstate is GetSubstate that reports a failed capture as an error
+// instead of returning the last cached substate.
+func (s *Session) CaptureSubstate() (Substate, error) {
+	sub, _, err := s.getSubstate()
+	return sub, err
+}
+
 // GetSubstateWithLiveSpinner returns status and foreground evidence from the
 // same successful capture. A failed read is unknown, not cached evidence that
 // can promote a newly waiting session back to running.

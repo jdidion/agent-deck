@@ -112,6 +112,12 @@ type TransitionDaemon struct {
 	// Run loop.
 	lastAskPrune map[string]time.Time
 
+	// askCaptures holds, per (profile, instance), syncAsks' last successful
+	// pane capture of a waiting instance and its run of consecutive captures
+	// without a menu. See observeAskSubstates. Accessed only from the
+	// single-threaded Run loop.
+	askCaptures map[string]map[string]askCaptureEntry
+
 	// selfheal holds the per-profile observe-only self-heal engines (lazily
 	// created). Driven by this poll loop — NOT a new daemon (F3: no watchdog
 	// stacking). nil until the first enabled pass.
@@ -207,12 +213,39 @@ func NewTransitionDaemon() *TransitionDaemon {
 		journalWriters: map[string]*health.AsyncWriter{},
 		lastJournaled:  map[string]map[string]string{},
 		lastAskPrune:   map[string]time.Time{},
+		askCaptures:    map[string]map[string]askCaptureEntry{},
 
 		lastDesktopNotify: map[string]string{},
 	}
 }
 
 func (d *TransitionDaemon) Run(ctx context.Context) error {
+	// A daemon started under a throwaway HOME (tests, scripted runs) exits
+	// once that HOME is gone rather than lingering detached. HOME's identity
+	// is recorded before anything here creates directories under it, because
+	// a pass writes under HOME and its MkdirAll can recreate the path: a
+	// directory recreated at the same path is not the HOME the daemon started
+	// with.
+	home, _ := os.UserHomeDir()
+	var homeInfo os.FileInfo
+	if home != "" {
+		fi, err := os.Stat(home)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		homeInfo = fi
+	}
+	homeGone := func() bool {
+		if homeInfo == nil {
+			return false
+		}
+		fi, err := os.Stat(home)
+		if err != nil {
+			return os.IsNotExist(err)
+		}
+		return !os.SameFile(homeInfo, fi)
+	}
+
 	d.ensureHookWatcher()
 	defer d.shutdown()
 
@@ -226,21 +259,15 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 	// a background goroutine it has no way to let finish.
 	d.maybeStartInitialRecallBackfill(ctx)
 
-	// A daemon started under a throwaway HOME (tests, scripted runs) exits
-	// once that HOME is gone rather than lingering detached. Checked before
-	// each pass, since a pass writes under HOME and would recreate it.
-	home, _ := os.UserHomeDir()
-	homeGone := func() bool {
-		if home == "" {
-			return false
-		}
-		_, err := os.Stat(home)
-		return os.IsNotExist(err)
+	if homeGone() {
+		return nil
 	}
-
 	// Prime baseline once, then run adaptive loop.
 	interval := d.SyncOnce(ctx)
 	d.tickRemoteTalkback(ctx)
+	if homeGone() {
+		return nil
+	}
 	if interval <= 0 {
 		interval = notifyPollSlow
 	}
@@ -256,6 +283,9 @@ func (d *TransitionDaemon) Run(ctx context.Context) error {
 			d.maybeStartInitialRecallBackfill(ctx)
 			interval = d.SyncOnce(ctx)
 			d.tickRemoteTalkback(ctx)
+			if homeGone() {
+				return nil
+			}
 			if interval <= 0 {
 				interval = notifyPollSlow
 			}

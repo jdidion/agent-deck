@@ -407,7 +407,7 @@ type Home struct {
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
 	previewCache     map[string]string    // previewKey -> cached preview content
 	previewCacheTime map[string]time.Time // previewKey -> when cached (for expiration)
-	previewFetchGen  map[string]uint64    // previewKey -> latest local fetch generation issued
+	previewFetchGen  map[string]uint64    // previewKey -> latest fetch generation issued
 	// previewFetchGenMu guards previewFetchGen. Separate from previewCacheMu
 	// because fetchPreview is called with previewCacheMu held. Lock order:
 	// previewCacheMu, then previewFetchGenMu.
@@ -1741,7 +1741,6 @@ type previewFetchedMsg struct {
 	err        error
 	// gen is the fetch generation for previewKey, stamped when the fetch cmd
 	// is built. A result older than previewFetchGen[previewKey] is dropped.
-	// Zero for fetches that do not stamp one (remote previews).
 	gen uint64
 }
 
@@ -5784,20 +5783,31 @@ func (h *Home) fetchRemotePreviewDebounced(remoteName, sessionID string) tea.Cmd
 	}
 }
 
+// fetchRemotePreview returns a command that fetches a remote session's preview
+// over ssh. Like fetchPreview it stamps the result with a new generation for
+// key, so an older fetch still in flight cannot overwrite a newer one. Callers
+// may hold previewCacheMu.
 func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
+	h.previewFetchGenMu.Lock()
+	if h.previewFetchGen == nil {
+		h.previewFetchGen = make(map[string]uint64)
+	}
+	h.previewFetchGen[key]++
+	gen := h.previewFetchGen[key]
+	h.previewFetchGenMu.Unlock()
 	return func() tea.Msg {
 		config, err := session.LoadUserConfig()
 		if err != nil || config == nil || config.Remotes == nil {
-			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("failed to load remote config")}
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("failed to load remote config"), gen: gen}
 		}
 
 		rc, ok := config.Remotes[remoteName]
 		if !ok {
-			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("remote '%s' not found", remoteName)}
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("remote '%s' not found", remoteName), gen: gen}
 		}
 
 		if h.remoteAuthBlocked(remoteName, rc) {
-			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("auth failed; run agent-deck remote list --retry")}
+			return previewFetchedMsg{previewKey: key, err: fmt.Errorf("auth failed; run agent-deck remote list --retry"), gen: gen}
 		}
 		runner := session.NewSSHRunner(remoteName, rc)
 		ctx, cancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
@@ -5826,7 +5836,7 @@ func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
 			}
 		}
 		content = truncateRemotePreviewContent(content)
-		return previewFetchedMsg{previewKey: key, content: content, err: fetchErr}
+		return previewFetchedMsg{previewKey: key, content: content, err: fetchErr, gen: gen}
 	}
 }
 
@@ -6034,12 +6044,22 @@ func (h *Home) refetchSelectedPreviewNow() tea.Cmd {
 	}
 	inst, key, winIdx := h.selectedPreviewTarget()
 	if inst == nil {
-		if _, _, remoteKey, ok := h.selectedRemotePreviewTarget(); ok {
-			h.previewCacheMu.Lock()
-			h.previewCacheTime[remoteKey] = time.Time{}
-			h.previewCacheMu.Unlock()
+		remoteName, remoteSessionID, remoteKey, ok := h.selectedRemotePreviewTarget()
+		if !ok {
+			return h.fetchSelectedPreview()
 		}
-		return h.fetchSelectedPreview()
+		h.previewCacheMu.Lock()
+		h.previewCacheTime[remoteKey] = time.Time{}
+		h.previewCacheMu.Unlock()
+		if remotePaneWatchActive(remoteName, remoteSessionID) {
+			return h.fetchSelectedPreview()
+		}
+		// Fetch now even if a poll is in flight: its newer generation makes
+		// the pre-attach result drop on arrival.
+		h.previewCacheMu.Lock()
+		h.previewFetchingID = remoteKey
+		h.previewCacheMu.Unlock()
+		return tea.Batch(h.fetchSelectedPreview(), h.fetchRemotePreview(remoteName, remoteSessionID, remoteKey))
 	}
 	h.previewCacheMu.Lock()
 	h.previewCacheTime[key] = time.Time{}
@@ -11151,19 +11171,33 @@ func (h *Home) confirmAskGroupAction(approve bool, group session.AskKind) {
 // classification without capturing the pane.
 var uiCachedSubstate = (*session.Instance).CachedSubstate
 
-// askPaneHasMenu takes a fresh capture of the session's pane and reports
-// whether it shows an open interactive menu. Dispatch sends only when it does.
-// A session with no tmux pane passes, so the send reports it as a failure
-// rather than a skip.
-var askPaneHasMenu = func(inst *session.Instance) bool {
-	if inst.GetTmuxSession() == nil {
-		return true
-	}
+// askPaneCheck takes a fresh capture of the session's pane and reports whether
+// it shows a permission dialog. Dispatch sends approve or deny only when it
+// does, so "1" never answers a question picker or lands in an idle prompt. A
+// session with no tmux pane, or a failed capture, is an error.
+var askPaneCheck = func(inst *session.Instance) (bool, error) {
 	content, err := captureVisiblePane(inst)
 	if err != nil {
-		return false
+		return false, err
 	}
-	return tmux.HasOpenInteractiveMenu(tmux.StripANSI(content))
+	return tmux.PaneShowsPermissionPrompt(tmux.StripANSI(content)), nil
+}
+
+// askSendTimeout bounds each pane check and each send of a dispatch, so the
+// result message always arrives and askDispatchInFlight always clears.
+var askSendTimeout = 5 * time.Second
+
+// askWithTimeout runs fn under askSendTimeout. On timeout fn is abandoned and
+// an error is returned; fn's goroutine finishes on its own.
+func askWithTimeout(fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(askSendTimeout):
+		return fmt.Errorf("timed out after %s", askSendTimeout)
+	}
 }
 
 // askSendApprove answers the open menu with "1"+Enter, as quick-approve does.
@@ -11185,7 +11219,8 @@ var askSendDeny = func(inst *session.Instance) error {
 }
 
 // askDispatchResultMsg reports one approve/deny dispatch. Action is "approve"
-// or "deny"; Skipped counts sessions whose pane showed no menu.
+// or "deny"; Skipped counts sessions whose pane, captured successfully,
+// showed no permission dialog.
 type askDispatchResultMsg struct {
 	Action       string
 	Sent         int
@@ -11195,7 +11230,8 @@ type askDispatchResultMsg struct {
 }
 
 // askDispatch returns a cmd that approves (or denies) each item's session in
-// parallel, sending only to panes that show an open menu on a fresh capture.
+// parallel, sending only to panes that show a permission dialog on a fresh
+// capture.
 // The key handler only resolves instances; captures and sends run in the cmd.
 func (h *Home) askDispatch(approve bool, items []*statedb.AskItemRow) tea.Cmd {
 	type target struct {
@@ -11233,10 +11269,18 @@ func (h *Home) askDispatch(approve bool, items []*statedb.AskItemRow) tea.Cmd {
 				skipped := false
 				if t.inst == nil {
 					err = fmt.Errorf("session not found")
-				} else if !askPaneHasMenu(t.inst) {
-					skipped = true
 				} else {
-					err = send(t.inst)
+					var hasPrompt bool
+					err = askWithTimeout(func() error {
+						var checkErr error
+						hasPrompt, checkErr = askPaneCheck(t.inst)
+						return checkErr
+					})
+					if err == nil && !hasPrompt {
+						skipped = true
+					} else if err == nil {
+						err = askWithTimeout(func() error { return send(t.inst) })
+					}
 				}
 				mu.Lock()
 				defer mu.Unlock()
@@ -19754,10 +19798,18 @@ func (h *Home) countSessionStatuses() (running, waiting, idle, stopped, errored 
 // Format: [All] [● Running 2] [◐ Waiting 1] [○ Idle 5] [■ Stopped 1] [✕ Error 1]
 // countAskKinds counts local, unarchived waiting sessions the render snapshot
 // classifies as an approval or a decision ask. Those are drawn ? and ✎ rather
-// than ◐.
-func (h *Home) countAskKinds() (approval, decision int) {
+// than ◐. archivedWaiting counts the archived waiting sessions that
+// countSessionStatuses includes in its waiting total; they are in none of ◐,
+// ? or ✎.
+func (h *Home) countAskKinds() (approval, decision, archivedWaiting int) {
 	for _, state := range h.getSessionRenderSnapshot() {
-		if state.archived || statusBucket(state.status) != session.StatusWaiting {
+		if statusBucket(state.status) != session.StatusWaiting {
+			continue
+		}
+		if state.archived {
+			if !state.archivedSuperseded {
+				archivedWaiting++
+			}
 			continue
 		}
 		switch state.askKind {
@@ -19767,15 +19819,15 @@ func (h *Home) countAskKinds() (approval, decision int) {
 			decision++
 		}
 	}
-	return approval, decision
+	return approval, decision, archivedWaiting
 }
 
 func (h *Home) renderFilterBar() string {
 	running, waiting, idle, stopped, errored := h.countSessionStatuses()
-	// ◐ counts only waiting sessions that are not asks; approvals and
-	// decisions get their own ? and ✎ pills.
-	approvals, decisions := h.countAskKinds()
-	if waiting -= approvals + decisions; waiting < 0 {
+	// ◐ counts only unarchived waiting sessions that are not asks; approvals
+	// and decisions get their own ? and ✎ pills.
+	approvals, decisions, archivedWaiting := h.countAskKinds()
+	if waiting -= approvals + decisions + archivedWaiting; waiting < 0 {
 		waiting = 0
 	}
 

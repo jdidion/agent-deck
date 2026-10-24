@@ -49,9 +49,9 @@ is an `approval`. Summary: the hook message when present, else `wants to run
 ## Dispatching keys
 
 Approve (`1` + Enter) and deny (Escape) are sent only to a session whose pane
-shows the open menu at the moment of sending: dispatch takes a fresh pane
-capture and requires `hasOpenInteractiveMenu` to hold for it (exported for the
-UI as `tmux.HasOpenInteractiveMenu`). A session that fails the check is
+shows a permission prompt at the moment of sending: dispatch takes a fresh
+pane capture and requires `tmux.PaneShowsPermissionPrompt` to hold for it (see
+"Second review round"). A session that fails the check is
 skipped and counted, never sent to. Dispatch runs off the Bubble Tea event loop
 (a `tea.Cmd`), sessions in parallel, and reports one result message:
 `Approved 2, skipped 19 (no prompt on screen), failed 0` (or `Denied ...`).

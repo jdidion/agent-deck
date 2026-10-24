@@ -44,20 +44,113 @@ func DeriveAskKind(hs *HookStatus, status string, substate Substate) AskKind {
 	return kind
 }
 
-// askSubstateOf reads a waiting instance's substate for syncAsks. The cached
-// value is used when the status pass recorded one; otherwise the pane is
-// captured. The cache is empty whenever the pass did not capture: the daemon
-// loads fresh instances every pass and probes none while a TUI is alive, and
-// hook-driven statuses skip the capture.
-var askSubstateOf = func(inst *Instance) Substate {
-	if sub := inst.CachedSubstate(); sub != SubstateNone {
-		return sub
-	}
+// askCapture captures a waiting instance's pane for syncAsks and classifies
+// it. A non-nil error means the substate is unknown. An instance without a
+// tmux session has no menu.
+var askCapture = func(inst *Instance) (Substate, error) {
 	tmuxSess := inst.GetTmuxSession()
 	if tmuxSess == nil {
-		return SubstateNone
+		return SubstateNone, nil
 	}
-	return tmuxSess.GetSubstate()
+	return tmuxSess.CaptureSubstate()
+}
+
+// askNow is the clock the ask capture cache reads.
+var askNow = time.Now
+
+// askCaptureTTL is how long syncAsks reuses an instance's last capture before
+// taking a new one.
+const askCaptureTTL = 5 * time.Second
+
+// askResolveMisses is how many consecutive fresh captures without a menu
+// resolve an open approval or decision. One missed frame (a redraw caught
+// mid-capture) must not close the row and reopen it under a new id.
+const askResolveMisses = 2
+
+// askCaptureEntry is the last successful capture of one waiting instance.
+type askCaptureEntry struct {
+	sub    Substate
+	at     time.Time
+	misses int // consecutive fresh captures without a menu
+}
+
+// askObservation is what one syncAsks pass knows about a waiting instance's
+// pane. known is false when the capture errored, timed out or was skipped for
+// the pass budget.
+type askObservation struct {
+	sub    Substate
+	known  bool
+	misses int
+}
+
+// observeAskSubstates reads the substate of every waiting instance in byID,
+// sequentially. A capture younger than askCaptureTTL is reused; otherwise the
+// pane is captured under statusProbeBudget, and once syncPassBudget (measured
+// from start) is spent the remaining instances are left unknown. Captures run
+// on the daemon's single-threaded poll loop, so both budgets keep a wedged
+// tmux server from stalling every profile. Instances that are not waiting
+// drop their cache entry, so a later wait starts from a fresh capture.
+func (d *TransitionDaemon) observeAskSubstates(profile string, byID map[string]*Instance, statuses map[string]string, start time.Time) map[string]askObservation {
+	prev := d.askCaptures[profile]
+	next := make(map[string]askCaptureEntry)
+	obs := make(map[string]askObservation)
+	for id, inst := range byID {
+		if inst == nil || normalizeStatusString(statuses[id]) != string(StatusWaiting) {
+			continue
+		}
+		entry, cached := prev[id]
+		if cached && askNow().Sub(entry.at) < askCaptureTTL {
+			next[id] = entry
+			obs[id] = askObservation{sub: entry.sub, known: true, misses: entry.misses}
+			continue
+		}
+		if cached {
+			// Expired, but its miss run carries over to the next capture.
+			next[id] = entry
+		}
+		if time.Since(start) > syncPassBudget {
+			d.logProbeStall(profile, "", "ask_pass_budget")
+			continue
+		}
+		sub, timedOut, err := askCaptureBounded(inst)
+		if timedOut {
+			d.logProbeStall(profile, id, "ask_probe_budget")
+			continue
+		}
+		if err != nil {
+			askLog.Debug("ask_capture_failed",
+				slog.String("instance_id", id), slog.String("error", err.Error()))
+			continue
+		}
+		misses := 0
+		if sub != SubstateInteractiveMenu {
+			misses = entry.misses + 1
+		}
+		next[id] = askCaptureEntry{sub: sub, at: askNow(), misses: misses}
+		obs[id] = askObservation{sub: sub, known: true, misses: misses}
+	}
+	d.askCaptures[profile] = next
+	return obs
+}
+
+// askCaptureBounded runs askCapture under statusProbeBudget. On timeout the
+// capture is abandoned; its goroutine finishes on its own.
+func askCaptureBounded(inst *Instance) (sub Substate, timedOut bool, err error) {
+	type result struct {
+		sub Substate
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		sub, err := askCapture(inst)
+		done <- result{sub, err}
+	}()
+	select {
+	case r := <-done:
+		return r.sub, false, r.err
+	case <-time.After(statusProbeBudget):
+		return SubstateNone, true, nil
+	}
 }
 
 const (
@@ -175,8 +268,12 @@ func (d *TransitionDaemon) syncAsks(
 	statuses map[string]string,
 	hookStatuses map[string]*HookStatus,
 ) {
+	start := time.Now()
 	if db == nil {
 		return
+	}
+	if d.askCaptures == nil {
+		d.askCaptures = map[string]map[string]askCaptureEntry{}
 	}
 
 	open, err := db.ListOpenAskItems()
@@ -185,6 +282,13 @@ func (d *TransitionDaemon) syncAsks(
 		return
 	}
 	now := time.Now()
+	obs := d.observeAskSubstates(profile, byID, statuses, start)
+	waiting := func(id string) bool {
+		return normalizeStatusString(statuses[id]) == string(StatusWaiting)
+	}
+	derive := func(id string) (AskKind, string, bool) {
+		return deriveAsk(hookStatuses[id], statuses[id], obs[id].sub)
+	}
 
 	// Resolve. An open item closes when its session is gone from the live set,
 	// or is no longer in an attention status (the ask was answered and the agent
@@ -192,35 +296,37 @@ func (d *TransitionDaemon) syncAsks(
 	// pass, so the open phase below does not create a duplicate for them.
 	//
 	// An open approval or decision also closes when its instance no longer
-	// derives that kind: the menu left the pane, or the request changed kind
-	// (the open phase then opens the new kind in the same pass).
-	derive := func(id string) (AskKind, string, bool) {
-		var sub Substate
-		if inst := byID[id]; inst != nil && normalizeStatusString(statuses[id]) == string(StatusWaiting) {
-			sub = askSubstateOf(inst)
-		}
-		return deriveAsk(hookStatuses[id], statuses[id], sub)
-	}
+	// derives that kind: the request changed kind (the open phase then opens
+	// the new kind in the same pass), or the menu left the pane, which counts
+	// only after askResolveMisses consecutive captures without it. A waiting
+	// instance whose substate is unknown this pass keeps its row.
 	hasOpen := make(map[string]bool, len(open))
 	for _, item := range open {
-		if _, live := byID[item.InstanceID]; !live || !isAttentionStatus(statuses[item.InstanceID]) {
+		id := item.InstanceID
+		if _, live := byID[id]; !live || !isAttentionStatus(statuses[id]) {
 			d.resolveAsk(db, item.ID, now)
 			continue
 		}
 		if stored := NormalizeAskKind(item.Kind); stored != AskError {
-			if kind, _, ok := derive(item.InstanceID); !ok || kind != stored {
+			o := obs[id]
+			if waiting(id) && (!o.known || (o.sub != SubstateInteractiveMenu && o.misses < askResolveMisses)) {
+				hasOpen[id] = true
+				continue
+			}
+			if kind, _, ok := derive(id); !ok || kind != stored {
 				d.resolveAsk(db, item.ID, now)
 				continue
 			}
 		}
-		hasOpen[item.InstanceID] = true
+		hasOpen[id] = true
 	}
 
 	// Open. One ask per instance: skip any that already has one open. A pending
 	// ask is re-derived every pass, so this gate — not the transcript signal — is
-	// what makes a sustained wait collapse to a single row.
+	// what makes a sustained wait collapse to a single row. A waiting instance
+	// whose substate is unknown opens nothing.
 	for id, inst := range byID {
-		if inst == nil || hasOpen[id] {
+		if inst == nil || hasOpen[id] || (waiting(id) && !obs[id].known) {
 			continue
 		}
 		kind, summary, ok := derive(id)
