@@ -20,20 +20,45 @@ Status: accepted 2026-10-23. Extends `2026-08-14-human-ask-queue.md`.
 
 ## Kinds
 
-Every attention state classifies into exactly one kind. Classification uses the
-live status plus the latest hook record (event, matcher, message, and the new
-tool name).
+Revised 2026-10-23 after a live check and review: "waiting with last hook
+`PreToolUse`" is mostly a finished turn whose last hook record is stale (19 of
+21 such sessions were at their normal prompt; only 2 showed a permission
+dialog). Treating it as an approval made approve-all type `1` + Enter into 39
+idle prompts. The pane is the ground truth, so an approval or decision now
+requires the pane to show an open menu: the session's substate is
+`interactive-menu` (`tmux.SubstateInteractiveMenu`, set from
+`hasOpenInteractiveMenu` on the pane capture the status pass already takes).
+
+Every attention state classifies into exactly one kind, from the live status,
+the cached substate, and the latest hook record (event, matcher, message, tool
+name):
 
 | Kind | Condition | Group |
 |---|---|---|
-| `approval` | status `waiting` and (event `PermissionRequest`, or matcher `permission_prompt`, or event `PreToolUse` with a tool other than `AskUserQuestion`) | Needs approval |
-| `decision` | status `waiting` and (matcher `elicitation_dialog`, or event `PreToolUse` with tool `AskUserQuestion`) | Needs decision |
+| `decision` | status `waiting`, substate `interactive-menu`, and the hook record says a question: matcher `elicitation_dialog`, or tool `AskUserQuestion` (any event) | Needs decision |
+| `approval` | status `waiting`, substate `interactive-menu`, and not a decision | Needs approval |
 | `error` | status `error` | Error |
-| (not an ask) | any other `waiting` (e.g. after `Stop`), and every other status | none |
+| (not an ask) | `waiting` without substate `interactive-menu` (your turn), and every other status | none |
 
-Event and matcher comparisons are case-insensitive, as today. `ExitPlanMode`
-(plan approval) is an `approval`. A `PreToolUse` record while the status is
-`running` is not an ask (the tool is executing).
+Hook events alone never make an approval or decision, because the hook record
+can be stale. Comparisons are case-insensitive. `ExitPlanMode` (plan approval)
+is an `approval`. Summary: the hook message when present, else `wants to run
+<ToolName>` when a tool is known, else `wants permission to run a command`
+(approval) or `is asking a question` (decision).
+
+## Dispatching keys
+
+Approve (`1` + Enter) and deny (Escape) are sent only to a session whose pane
+shows the open menu at the moment of sending: dispatch takes a fresh pane
+capture and requires `hasOpenInteractiveMenu` to hold for it (exported for the
+UI as `tmux.HasOpenInteractiveMenu`). A session that fails the check is
+skipped and counted, never sent to. Dispatch runs off the Bubble Tea event loop
+(a `tea.Cmd`), sessions in parallel, and reports one result message:
+`Approved 2, skipped 19 (no prompt on screen), failed 0` (or `Denied ...`).
+Failures (send error, no tmux session) are counted and named, not swallowed.
+While a group dispatch is in flight, further approve/deny keys are ignored, so
+repeated presses do not send extra rounds. The per-item `y`/`n` follow the same
+check. The confirmation prompt counts only rows still classified as approvals.
 
 The existing `permission` kind is renamed `approval` and `question` is renamed
 `decision`. Rows already stored with the old names are read as the new names.
@@ -93,7 +118,22 @@ current output rather than the pre-attach capture.
 
 ## Daemon autostart
 
-`[notifications] autostart_daemon` defaults to false. A TUI launched under a
-throwaway HOME (upstream's TUI tests) leaked a detached notify daemon per run.
-Users who want the TUI to start the daemon set it to true; the recommended
-setup is launchd/systemd.
+Revised: `[notifications] autostart_daemon` defaults to **true** again (nil =
+true). Defaulting it off silently disabled notifications and the ask producer
+for every user without launchd/systemd. The leak it was meant to stop (a TUI
+under a throwaway HOME, as in upstream's TUI tests, leaving a detached daemon
+behind) is fixed at the source: the notify daemon exits cleanly on its next
+poll once the HOME it started with no longer exists.
+
+## Other fixes from review
+
+- Clearing a session's hook evidence (`ClearHookStatus`, the Codex reject
+  path, the Hermes spawn seed) also clears the cached matcher and tool name, so
+  a stale record cannot keep a row on `?`.
+- The Asks panel scrolls: it renders only the rows that fit its height, keeps
+  the cursor in view, and always shows the footer and any confirmation prompt.
+- Attach-return preview refresh keeps the old capture on screen until the new
+  one lands (it expires the cache time instead of deleting the entry), and a
+  fetch result is applied only if it belongs to the latest fetch for that
+  session, so an in-flight pre-attach capture cannot overwrite the fresh one.
+- The filter bar does not count archived sessions as `?` or `✎`.
